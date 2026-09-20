@@ -104,6 +104,10 @@ Return ONLY a JSON object:
     }}
   ]
 }}
+
+Rules: if verdict is "request_changes", comments MUST contain at least one
+entry with "severity": "blocking".  If verdict is "approve", comments must be
+an empty list.
 """
 
 IMPLEMENT_REVIEW_PROMPT = """\

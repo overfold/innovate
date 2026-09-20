@@ -363,15 +363,14 @@ def phase_review_loop(
             return REVIEW_APPROVED
 
         if not blocking:
-            # request_changes with no blocking comments (all optional) — nothing
-            # actionable to implement; treat as approved to avoid a wasted Codex
-            # call that would produce no changes and then fail.
-            LOG.info(
-                "  %s with no blocking comments — treating as approved",
+            # request_changes with no blocking comments is an inconsistent
+            # schema response — fail-closed rather than silently approve.
+            LOG.error(
+                "  %s with no blocking comments — inconsistent review (fail-closed)",
                 verdict,
             )
             db.update_pr(pr_id, review_rounds=rnd)
-            return REVIEW_APPROVED
+            return REVIEW_FAILED_ERROR
 
         for c in blocking:
             LOG.info("  Blocking: [%s] %s", c.get("file", "general"), c["description"])

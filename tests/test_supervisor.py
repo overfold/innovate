@@ -1306,7 +1306,7 @@ class TestRejectedHeadPinning:
 
         assert is_new
         assert db.get_finding(f["id"])["status"] == "open"
-        assert db.get_finding(f["id"])["repair_attempts"] == 0
+        assert db.get_finding(f["id"])["repair_attempts"] == 1  # preserved across HEAD change
         assert db.get_finding(f["id"])["rejected_at_head"] is None
 
     def test_rejected_null_head_is_reopened(self):
@@ -1325,14 +1325,14 @@ class TestRejectedHeadPinning:
         f = _open_finding(db, "stubborn bug")
         db.mark_finding(f["id"], "rejected", reason="no changes", head="h1")
         assert db.get_finding(f["id"])["repair_attempts"] == 1
-        # Reopening at a new HEAD resets the counter (fresh code, worth retrying).
+        # Reopening at a new HEAD preserves the counter so the blocked cap is reachable.
         from supervisor.db import _fingerprint
         fp = _fingerprint(f["area"], f["file_path"], f["title"])
         db.upsert_finding({**f, "fingerprint": fp, "commit_hash": "h2"})
-        assert db.get_finding(f["id"])["repair_attempts"] == 0
-        # Rejecting at the new HEAD increments from 0 to 1.
+        assert db.get_finding(f["id"])["repair_attempts"] == 1  # preserved
+        # Rejecting at the new HEAD increments from 1 to 2.
         db.mark_finding(f["id"], "rejected", reason="no changes", head="h2")
-        assert db.get_finding(f["id"])["repair_attempts"] == 1
+        assert db.get_finding(f["id"])["repair_attempts"] == 2
 
     def test_repair_no_changes_increments_consecutive_failures(self, tmp_path):
         from supervisor.phases import phase_repair
@@ -1396,9 +1396,9 @@ class TestReviewLoopProtocol:
         db.update_pr(pr_id, pr_number=1, pr_url="u")
         return db, pr_id, _cfg()
 
-    def test_request_changes_no_blocking_treated_as_approved(self):
-        """request_changes with zero blocking comments must not call the implement step."""
-        from supervisor.phases import phase_review_loop
+    def test_request_changes_no_blocking_is_fail_closed(self):
+        """request_changes with zero blocking comments is an inconsistent response — fail-closed."""
+        from supervisor.phases import phase_review_loop, REVIEW_FAILED_ERROR
 
         db, pr_id, cfg = self._db_and_cfg()
         f = _open_finding(db)
@@ -1414,7 +1414,7 @@ class TestReviewLoopProtocol:
              patch("supervisor.phases.full_diff", return_value="diff"):
             outcome = phase_review_loop(cfg, db, pr_id, [f], "branch", ctr)
 
-        assert outcome == REVIEW_APPROVED
+        assert outcome == REVIEW_FAILED_ERROR
         # Only one Codex call: the review itself; no implement call.
         assert mock_codex.call_count == 1
 

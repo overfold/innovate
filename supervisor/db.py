@@ -97,8 +97,9 @@ class DB:
             try:
                 self._conn.execute(_migration)
                 self._conn.commit()
-            except sqlite3.OperationalError:
-                pass  # column already exists
+            except sqlite3.OperationalError as exc:
+                if "duplicate column name" not in str(exc):
+                    raise
 
     # ── key/value state ──────────────────────────────────────────────────────
 
@@ -129,7 +130,8 @@ class DB:
             (f["fingerprint"],),
         ).fetchone()
         if row:
-            if row["status"] == "rejected":
+            was_rejected = row["status"] == "rejected"
+            if was_rejected:
                 # Rejection is terminal for that HEAD: only reopen once HEAD changes.
                 rah = row["rejected_at_head"]
                 fch = f.get("commit_hash")
@@ -139,24 +141,40 @@ class DB:
             elif row["status"] not in ("fixed", "stale"):
                 return row["id"], False
             # Reopen: fixed/stale regression, or rejected finding at a new HEAD.
-            self._conn.execute(
-                """UPDATE findings
-                   SET status='open', resolved=NULL, pr_id=NULL,
-                       reject_reason=NULL, commit_hash=?,
-                       severity=?, confidence=?, file_path=?,
-                       line_range=?, description=?,
-                       rejected_at_head=NULL, repair_attempts=0
-                   WHERE id=?""",
-                (
-                    f.get("commit_hash"),
-                    f.get("severity"),
-                    f.get("confidence"),
-                    f.get("file_path"),
-                    f.get("line_range"),
-                    f.get("description"),
-                    row["id"],
-                ),
+            common_args = (
+                f.get("commit_hash"),
+                f.get("severity"),
+                f.get("confidence"),
+                f.get("file_path"),
+                f.get("line_range"),
+                f.get("description"),
+                row["id"],
             )
+            if was_rejected:
+                # Preserve repair_attempts: HEAD changed but the counter accumulates
+                # across HEADs so the blocked cap is eventually reachable.
+                self._conn.execute(
+                    """UPDATE findings
+                       SET status='open', resolved=NULL, pr_id=NULL,
+                           reject_reason=NULL, commit_hash=?,
+                           severity=?, confidence=?, file_path=?,
+                           line_range=?, description=?,
+                           rejected_at_head=NULL
+                       WHERE id=?""",
+                    common_args,
+                )
+            else:
+                # Genuine fixed/stale regression: fresh repair slate.
+                self._conn.execute(
+                    """UPDATE findings
+                       SET status='open', resolved=NULL, pr_id=NULL,
+                           reject_reason=NULL, commit_hash=?,
+                           severity=?, confidence=?, file_path=?,
+                           line_range=?, description=?,
+                           rejected_at_head=NULL, repair_attempts=0
+                       WHERE id=?""",
+                    common_args,
+                )
             self._conn.commit()
             return row["id"], True
         cur = self._conn.execute(

@@ -26,11 +26,13 @@ from __future__ import annotations
 
 import argparse
 import logging
-import os
+import re
+import shutil
 import subprocess
 import sys
 import time
 from pathlib import Path
+
 
 from supervisor.config import load_config
 from supervisor.db import DB
@@ -38,6 +40,20 @@ from supervisor.phases import phase_audit
 from supervisor.runner import Supervisor, cmd_findings, cmd_status
 
 _MUTATING_CMDS = {"run", "run-continuous", "audit"}
+
+
+def _parse_remote_owner_repo(remote_url: str) -> str | None:
+    """Normalize an SSH or HTTPS remote URL to lowercase 'owner/repo'."""
+    url = remote_url.strip()
+    # SSH: git@host:owner/repo[.git]
+    m = re.match(r"^git@[^:]+:(.+?)(?:\.git)?$", url)
+    if m:
+        return m.group(1).lower()
+    # HTTPS: https://host/owner/repo[.git]
+    m = re.match(r"^https?://[^/]+/(.+?)(?:\.git)?/?$", url)
+    if m:
+        return m.group(1).lower()
+    return None
 
 
 def _validate_config(cfg: dict, config_path: str) -> None:
@@ -90,11 +106,13 @@ def _validate_config(cfg: dict, config_path: str) -> None:
                 errors.append("Git remote 'origin' is not configured")
             else:
                 remote_url = r2.stdout.strip()
-                expected = f"{owner}/{name}"
-                if expected.lower() not in remote_url.lower():
+                extracted = _parse_remote_owner_repo(remote_url)
+                expected = f"{owner}/{name}".lower()
+                if extracted != expected:
                     errors.append(
-                        f"Git remote 'origin' ({remote_url!r}) does not contain "
-                        f"'{expected}' — check repo.owner and repo.name"
+                        f"Git remote 'origin' ({remote_url!r}) resolves to "
+                        f"'{extracted}', expected '{expected}' — "
+                        f"check repo.owner and repo.name"
                     )
 
     if not cfg.get("audit_areas"):
@@ -102,7 +120,7 @@ def _validate_config(cfg: dict, config_path: str) -> None:
 
     for key in (
         "max_audits_per_area", "max_fixes_per_run", "max_review_rounds",
-        "max_consecutive_failures", "codex_call_budget",
+        "max_consecutive_failures", "codex_call_budget", "max_repair_attempts",
     ):
         val = cfg["budget"].get(key)
         if not isinstance(val, int) or val <= 0:
@@ -110,12 +128,12 @@ def _validate_config(cfg: dict, config_path: str) -> None:
                 f"budget.{key} must be a positive integer (got {val!r})"
             )
 
-    path_dirs = os.environ.get("PATH", "").split(os.pathsep)
     for binary, hint in [
+        ("git", "Install Git from: https://git-scm.com"),
         (cfg["codex"]["cmd"], "Install with: npm install -g @openai/codex"),
         ("gh", "Install from: https://cli.github.com"),
     ]:
-        if not any((Path(d) / binary).is_file() for d in path_dirs):
+        if not shutil.which(binary):
             errors.append(
                 f"Required binary not found in PATH: '{binary}'. {hint}"
             )
