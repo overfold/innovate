@@ -288,6 +288,7 @@ class TestFixFinding:
              patch(f"{RUNNER_MODULE}.phase_review_loop",
                    return_value=REVIEW_APPROVED), \
              patch(f"{RUNNER_MODULE}.wait_for_ci", return_value="no_checks"), \
+             patch(f"{RUNNER_MODULE}.gh_pr_base_sha", return_value="abc1234"), \
              patch(f"{RUNNER_MODULE}.gh_merge_pr"):
 
             result = sup._fix_finding(db.get_finding(f["id"]), "abc1234")
@@ -343,6 +344,7 @@ class TestFixFinding:
              patch(f"{RUNNER_MODULE}.phase_review_loop",
                    return_value=REVIEW_APPROVED), \
              patch(f"{RUNNER_MODULE}.wait_for_ci", return_value="no_checks"), \
+             patch(f"{RUNNER_MODULE}.gh_pr_base_sha", return_value="abc1234"), \
              patch(f"{RUNNER_MODULE}.gh_merge_pr"):
 
             sup._fix_finding(db.get_finding(f["id"]), "abc1234")
@@ -397,6 +399,7 @@ class TestFixFinding:
              patch(f"{RUNNER_MODULE}.phase_review_loop",
                    return_value=REVIEW_APPROVED), \
              patch(f"{RUNNER_MODULE}.wait_for_ci", return_value="no_checks"), \
+             patch(f"{RUNNER_MODULE}.gh_pr_base_sha", return_value="abc1234"), \
              patch(f"{RUNNER_MODULE}.gh_merge_pr"):
 
             sup._fix_finding(db.get_finding(f["id"]), "abc1234")
@@ -498,12 +501,60 @@ class TestFixFinding:
              patch(f"{RUNNER_MODULE}.phase_review_loop",
                    return_value=REVIEW_APPROVED), \
              patch(f"{RUNNER_MODULE}.wait_for_ci", return_value="no_checks"), \
+             patch(f"{RUNNER_MODULE}.gh_pr_base_sha", return_value="abc1234"), \
              patch(f"{RUNNER_MODULE}.gh_merge_pr",
                    side_effect=Exception("merge conflict")):
 
             result = sup._fix_finding(db.get_finding(f["id"]), "abc1234")
 
         assert result is False
+        assert db.get_finding(f["id"])["status"] == "open"
+
+    def test_freshness_api_error_leaves_in_progress(self, tmp_path):
+        """gh_pr_base_sha API error → leave finding in_progress for startup_reconcile."""
+        sup, db, f, wt = self._setup(tmp_path)
+
+        with patch(f"{RUNNER_MODULE}.create_worktree", return_value=wt), \
+             patch(f"{RUNNER_MODULE}.remove_worktree"), \
+             patch(f"{RUNNER_MODULE}.phase_repair", return_value=True), \
+             patch(f"{RUNNER_MODULE}.phase_verify", return_value=True), \
+             patch(f"{RUNNER_MODULE}.push_branch"), \
+             patch(f"{RUNNER_MODULE}.gh_create_pr",
+                   return_value=(42, "https://gh/42")), \
+             patch(f"{RUNNER_MODULE}.phase_review_loop",
+                   return_value=REVIEW_APPROVED), \
+             patch(f"{RUNNER_MODULE}.wait_for_ci", return_value="no_checks"), \
+             patch(f"{RUNNER_MODULE}.gh_pr_base_sha",
+                   side_effect=GitHubAPIError("network error")):
+
+            result = sup._fix_finding(db.get_finding(f["id"]), "abc1234")
+
+        assert result is False
+        assert db.get_finding(f["id"])["status"] == "in_progress"
+        assert sup.ctr["consecutive_failures"] == 1
+
+    def test_freshness_base_advanced_closes_and_requeues(self, tmp_path):
+        """Base branch advanced since audit → close PR and requeue finding."""
+        sup, db, f, wt = self._setup(tmp_path)
+
+        with patch(f"{RUNNER_MODULE}.create_worktree", return_value=wt), \
+             patch(f"{RUNNER_MODULE}.remove_worktree"), \
+             patch(f"{RUNNER_MODULE}.phase_repair", return_value=True), \
+             patch(f"{RUNNER_MODULE}.phase_verify", return_value=True), \
+             patch(f"{RUNNER_MODULE}.push_branch"), \
+             patch(f"{RUNNER_MODULE}.gh_create_pr",
+                   return_value=(42, "https://gh/42")), \
+             patch(f"{RUNNER_MODULE}.phase_review_loop",
+                   return_value=REVIEW_APPROVED), \
+             patch(f"{RUNNER_MODULE}.wait_for_ci", return_value="no_checks"), \
+             patch(f"{RUNNER_MODULE}.gh_pr_base_sha",
+                   return_value="newhead999"), \
+             patch(f"{RUNNER_MODULE}.gh_close_pr") as mock_close:
+
+            result = sup._fix_finding(db.get_finding(f["id"]), "abc1234")
+
+        assert result is False
+        mock_close.assert_called_once_with("org", "repo", 42)
         assert db.get_finding(f["id"])["status"] == "open"
 
     def test_stale_finding_on_revalidation(self, tmp_path):
@@ -1022,6 +1073,7 @@ class TestRunOnceReturnValues:
              patch(f"{RUNNER_MODULE}.phase_review_loop",
                    return_value=REVIEW_APPROVED), \
              patch(f"{RUNNER_MODULE}.wait_for_ci", return_value="no_checks"), \
+             patch(f"{RUNNER_MODULE}.gh_pr_base_sha", return_value="abc1234"), \
              patch(f"{RUNNER_MODULE}.gh_merge_pr"):
             # Record 3 clean audits for the second pass to hit exhaustion
             for _ in range(3):

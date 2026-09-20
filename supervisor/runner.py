@@ -387,9 +387,11 @@ class Supervisor:
             try:
                 base_oid = gh_pr_base_sha(owner, repo_name, pr_number)
             except GitHubAPIError as exc:
-                LOG.error("  Cannot verify base freshness: %s — re-queuing", exc)
-                db.update_pr(pr_id, status="failed")
-                db.mark_finding(f["id"], "open")
+                LOG.error(
+                    "  Cannot verify base freshness: %s"
+                    " — leaving in_progress for startup_reconcile",
+                    exc,
+                )
                 self.ctr["consecutive_failures"] += 1
                 return False
 

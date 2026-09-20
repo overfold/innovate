@@ -274,7 +274,9 @@ def gh_ci_status(owner: str, repo_name: str, pr_number: int) -> str:
         return "failure"
     if "pending" in buckets:
         return "pending"
-    return "success"
+    if buckets <= {"pass", "skipping"}:
+        return "success"
+    return "api_error"
 
 
 def gh_merge_pr(owner: str, repo_name: str, pr_number: int) -> None:
