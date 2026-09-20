@@ -372,14 +372,35 @@ class Supervisor:
             LOG.info("  CI status: %s", ci)
 
             if not ci_permits_merge(ci, allow_no_ci):
-                LOG.error(
-                    "  CI result '%s' blocks merge (allow_no_ci=%s)"
-                    " — re-queuing finding",
-                    ci, allow_no_ci,
-                )
-                db.update_pr(pr_id, status="failed")
-                db.mark_finding(f["id"], "open")
-                self.ctr["consecutive_failures"] += 1
+                if ci in ("failure",):
+                    # Definite CI failure: close the PR so it can't be merged
+                    # accidentally, then requeue the finding for a fresh attempt.
+                    LOG.error(
+                        "  CI failed — closing PR #%d and re-queuing finding",
+                        pr_number,
+                    )
+                    try:
+                        gh_close_pr(owner, repo_name, pr_number)
+                    except GitHubAPIError as exc:
+                        LOG.error(
+                            "  Failed to close PR #%d: %s"
+                            " — leaving in_progress for startup_reconcile",
+                            pr_number, exc,
+                        )
+                        self.ctr["consecutive_failures"] += 1
+                        return False
+                    db.update_pr(pr_id, status="closed")
+                    db.mark_finding(f["id"], "open")
+                    self.ctr["consecutive_failures"] += 1
+                else:
+                    # Uncertain outcome (timeout, api_error): leave in_progress
+                    # so startup_reconcile can retry safely on the next run.
+                    LOG.error(
+                        "  CI result '%s' is uncertain (allow_no_ci=%s)"
+                        " — leaving in_progress for startup_reconcile",
+                        ci, allow_no_ci,
+                    )
+                    self.ctr["consecutive_failures"] += 1
                 return False
 
             # Freshness gate: reject if the base branch has advanced since we

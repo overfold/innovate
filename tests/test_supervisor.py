@@ -469,7 +469,8 @@ class TestFixFinding:
         # Blocked should NOT be retried
         assert db.open_findings() == []
 
-    def test_ci_failure_requeues_finding(self, tmp_path):
+    def test_ci_failure_closes_pr_and_requeues(self, tmp_path):
+        """Definite CI failure → close the PR, then requeue finding."""
         sup, db, f, wt = self._setup(tmp_path)
 
         with patch(f"{RUNNER_MODULE}.create_worktree", return_value=wt), \
@@ -481,12 +482,56 @@ class TestFixFinding:
                    return_value=(13, "https://gh/13")), \
              patch(f"{RUNNER_MODULE}.phase_review_loop",
                    return_value=REVIEW_APPROVED), \
-             patch(f"{RUNNER_MODULE}.wait_for_ci", return_value="failure"):
+             patch(f"{RUNNER_MODULE}.wait_for_ci", return_value="failure"), \
+             patch(f"{RUNNER_MODULE}.gh_close_pr") as mock_close:
 
             result = sup._fix_finding(db.get_finding(f["id"]), "abc1234")
 
         assert result is False
+        mock_close.assert_called_once_with("org", "repo", 13)
         assert db.get_finding(f["id"])["status"] == "open"
+
+    def test_ci_timeout_leaves_in_progress(self, tmp_path):
+        """CI timeout → leave finding/PR in_progress for startup_reconcile."""
+        sup, db, f, wt = self._setup(tmp_path)
+
+        with patch(f"{RUNNER_MODULE}.create_worktree", return_value=wt), \
+             patch(f"{RUNNER_MODULE}.remove_worktree"), \
+             patch(f"{RUNNER_MODULE}.phase_repair", return_value=True), \
+             patch(f"{RUNNER_MODULE}.phase_verify", return_value=True), \
+             patch(f"{RUNNER_MODULE}.push_branch"), \
+             patch(f"{RUNNER_MODULE}.gh_create_pr",
+                   return_value=(13, "https://gh/13")), \
+             patch(f"{RUNNER_MODULE}.phase_review_loop",
+                   return_value=REVIEW_APPROVED), \
+             patch(f"{RUNNER_MODULE}.wait_for_ci", return_value="timeout"):
+
+            result = sup._fix_finding(db.get_finding(f["id"]), "abc1234")
+
+        assert result is False
+        assert db.get_finding(f["id"])["status"] == "in_progress"
+        assert sup.ctr["consecutive_failures"] == 1
+
+    def test_ci_api_error_leaves_in_progress(self, tmp_path):
+        """CI api_error → leave finding/PR in_progress for startup_reconcile."""
+        sup, db, f, wt = self._setup(tmp_path)
+
+        with patch(f"{RUNNER_MODULE}.create_worktree", return_value=wt), \
+             patch(f"{RUNNER_MODULE}.remove_worktree"), \
+             patch(f"{RUNNER_MODULE}.phase_repair", return_value=True), \
+             patch(f"{RUNNER_MODULE}.phase_verify", return_value=True), \
+             patch(f"{RUNNER_MODULE}.push_branch"), \
+             patch(f"{RUNNER_MODULE}.gh_create_pr",
+                   return_value=(13, "https://gh/13")), \
+             patch(f"{RUNNER_MODULE}.phase_review_loop",
+                   return_value=REVIEW_APPROVED), \
+             patch(f"{RUNNER_MODULE}.wait_for_ci", return_value="api_error"):
+
+            result = sup._fix_finding(db.get_finding(f["id"]), "abc1234")
+
+        assert result is False
+        assert db.get_finding(f["id"])["status"] == "in_progress"
+        assert sup.ctr["consecutive_failures"] == 1
 
     def test_merge_failure_requeues_finding(self, tmp_path):
         sup, db, f, wt = self._setup(tmp_path)
@@ -867,6 +912,61 @@ class TestGitHubAPIFailures:
 
         assert result is False
         assert db.get_finding(f["id"])["status"] == "in_progress"
+
+
+# ── gh_ci_status unit tests ────────────────────────────────────────────────────
+
+class TestGhCiStatus:
+    """Unit tests for gh_ci_status() exit-code and bucket handling."""
+
+    def _run(self, returncode: int, stdout: str) -> str:
+        from supervisor.git import gh_ci_status
+        import subprocess
+        mock_result = MagicMock()
+        mock_result.returncode = returncode
+        mock_result.stdout = stdout
+        with patch("supervisor.git.subprocess.run", return_value=mock_result):
+            return gh_ci_status("org", "repo", 42)
+
+    def test_returncode_8_with_pending_bucket_returns_pending(self):
+        """Exit code 8 means checks still pending; should not return api_error."""
+        status = self._run(8, '[{"bucket":"pending"}]')
+        assert status == "pending"
+
+    def test_returncode_8_with_pass_bucket_returns_success(self):
+        """Exit code 8 with all-pass buckets is treated as success."""
+        status = self._run(8, '[{"bucket":"pass"}]')
+        assert status == "success"
+
+    def test_nonzero_exit_other_than_8_returns_api_error(self):
+        status = self._run(1, "")
+        assert status == "api_error"
+
+    def test_unknown_bucket_returns_api_error(self):
+        """An unknown bucket value must not silently become success."""
+        status = self._run(0, '[{"bucket":"unknown_future_value"}]')
+        assert status == "api_error"
+
+    def test_null_bucket_returns_api_error(self):
+        """A null/missing bucket must not silently become success."""
+        status = self._run(0, '[{"bucket":null}]')
+        assert status == "api_error"
+
+    def test_fail_bucket_returns_failure(self):
+        status = self._run(0, '[{"bucket":"fail"}]')
+        assert status == "failure"
+
+    def test_cancel_bucket_returns_failure(self):
+        status = self._run(0, '[{"bucket":"cancel"}]')
+        assert status == "failure"
+
+    def test_empty_checks_returns_no_checks(self):
+        status = self._run(0, "[]")
+        assert status == "no_checks"
+
+    def test_mixed_pass_skipping_returns_success(self):
+        status = self._run(0, '[{"bucket":"pass"},{"bucket":"skipping"}]')
+        assert status == "success"
 
 
 # ── deferred reconciliation ───────────────────────────────────────────────────
