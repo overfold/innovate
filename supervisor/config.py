@@ -18,8 +18,8 @@ DEFAULT_CONFIG: dict[str, Any] = {
         "cmd": "codex",
         "model": "o4-mini",
         "timeout": 300,
-        "audit_flags": ["exec", "--quiet"],
-        "repair_flags": ["exec", "--quiet", "--sandbox", "workspace-write"],
+        "audit_flags": ["exec"],
+        "repair_flags": ["exec", "--sandbox", "workspace-write"],
     },
     "verify": {
         "test_cmd": "",

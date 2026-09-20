@@ -5,7 +5,15 @@ import subprocess
 from datetime import datetime, timezone
 from pathlib import Path
 
-from .codex import CodexError, extract_json, run_codex
+from .codex import (
+    AUDIT_SCHEMA,
+    REVALIDATE_SCHEMA,
+    REVIEW_SCHEMA,
+    VERIFY_SCHEMA,
+    CodexError,
+    parse_json,
+    run_codex,
+)
 from .db import DB, _fingerprint
 from .git import (
     _git,
@@ -74,8 +82,9 @@ def verify_diff(cfg: dict, findings: list, ctr: dict) -> bool:
             cmd=cfg["codex"]["cmd"],
             model=cfg["codex"]["model"],
             timeout=cfg["codex"]["timeout"],
+            output_schema=VERIFY_SCHEMA,
         )
-        result = extract_json(output)
+        result = parse_json(output)
     except (CodexError, ValueError) as exc:
         LOG.error(
             "  Diff verification failed: %s — treating as rejected (fail-closed)", exc
@@ -110,8 +119,9 @@ def phase_audit(cfg: dict, db: DB, area: dict, ctr: dict) -> int:
             cmd=cfg["codex"]["cmd"],
             model=cfg["codex"]["model"],
             timeout=cfg["codex"]["timeout"],
+            output_schema=AUDIT_SCHEMA,
         )
-        raw_findings = extract_json(output)
+        raw_findings = parse_json(output)
     except (CodexError, ValueError) as exc:
         LOG.error("Audit failed for %s: %s", area["name"], exc)
         db.finish_audit(run_id, 0, 0, "failed")
@@ -119,7 +129,13 @@ def phase_audit(cfg: dict, db: DB, area: dict, ctr: dict) -> int:
         return 0
 
     if not isinstance(raw_findings, list):
-        raw_findings = []
+        LOG.error(
+            "Audit %s: unexpected output structure (expected list, got %s) — treating as failed",
+            area["name"], type(raw_findings).__name__,
+        )
+        db.finish_audit(run_id, 0, 0, "failed")
+        ctr["consecutive_failures"] += 1
+        return 0
 
     new_count = 0
     for raw in raw_findings:
@@ -185,8 +201,9 @@ def phase_revalidate(cfg: dict, finding: dict, ctr: dict) -> str:
             cmd=cfg["codex"]["cmd"],
             model=cfg["codex"]["model"],
             timeout=cfg["codex"]["timeout"],
+            output_schema=REVALIDATE_SCHEMA,
         )
-        result = extract_json(output)
+        result = parse_json(output)
     except (CodexError, ValueError) as exc:
         LOG.warning("  Revalidation call failed: %s", exc)
         return "error"
@@ -313,8 +330,9 @@ def phase_review_loop(
                 cmd=cfg["codex"]["cmd"],
                 model=cfg["codex"]["model"],
                 timeout=cfg["codex"]["timeout"],
+                output_schema=REVIEW_SCHEMA,
             )
-            review = extract_json(output)
+            review = parse_json(output)
         except (CodexError, ValueError) as exc:
             LOG.error("  Review call failed: %s — fail-closed", exc)
             db.update_pr(pr_id, review_rounds=rnd)
