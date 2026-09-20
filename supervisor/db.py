@@ -197,24 +197,35 @@ class DB:
         )
         self._conn.commit()
 
-    def clean_audit_streak(self, area: str, window: int, current_head: str) -> int:
-        """Count consecutive recent clean audits (0 new findings) for *area*.
+    def get_finding(self, fid: int) -> sqlite3.Row | None:
+        return self._conn.execute(
+            "SELECT * FROM findings WHERE id=?", (fid,)
+        ).fetchone()
 
-        Exhaustion is HEAD-tied: the streak is only non-zero when the MOST
-        RECENT audit for this area was performed at *current_head*.  If HEAD
-        has moved since the last audit, the streak resets to 0.
+    def clean_audit_streak(self, area: str, window: int, current_head: str) -> int:
+        """Count recent clean audits (total_found == 0) for *area* at *current_head*.
+
+        An area is not exhausted while any finding for it is open, in_progress,
+        or paused.  All audits counted must be at exactly *current_head*: audits
+        from older commits do not contribute to the streak.
         """
+        active = self._conn.execute(
+            """SELECT COUNT(*) AS n FROM findings
+               WHERE area=? AND status IN ('open', 'in_progress', 'paused')""",
+            (area,),
+        ).fetchone()
+        if active["n"] > 0:
+            return 0
+
         rows = self._conn.execute(
-            """SELECT new_findings, commit_hash FROM audit_runs
-               WHERE area=? AND status='completed'
+            """SELECT total_found FROM audit_runs
+               WHERE area=? AND status='completed' AND commit_hash=?
                ORDER BY id DESC LIMIT ?""",
-            (area, window),
+            (area, current_head, window),
         ).fetchall()
         if not rows:
             return 0
-        if rows[0]["commit_hash"] != current_head:
-            return 0
-        return sum(1 for r in rows if r["new_findings"] == 0)
+        return sum(1 for r in rows if r["total_found"] == 0)
 
     # ── summary queries ───────────────────────────────────────────────────────
 

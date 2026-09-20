@@ -110,7 +110,11 @@ class Supervisor:
         # Repair.
         ok, branch = phase_repair(cfg, db, [f], self.ctr)
         if not ok:
-            db.mark_finding(f["id"], "open")
+            # phase_repair marks the finding rejected when no changes were produced.
+            # Re-read to avoid overwriting that with 'open'.
+            current = db.get_finding(f["id"])
+            if not current or current["status"] != "rejected":
+                db.mark_finding(f["id"], "open")
             return False
 
         # Verify.

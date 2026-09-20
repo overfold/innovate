@@ -37,11 +37,11 @@ timeout = 300
 # Flags passed to Codex for READ-ONLY operations (audit, diff-review,
 # revalidation).  "exec" is the Codex non-interactive subcommand.
 # --model is inserted automatically after the subcommand.
-audit_flags = ["exec", "--quiet"]
+audit_flags = ["exec"]
 
 # Flags passed to Codex for FILE-EDITING operations (repair, implement review
 # feedback).  workspace-write sandbox allows Codex to modify files in the repo.
-repair_flags = ["exec", "--quiet", "--sandbox", "workspace-write"]
+repair_flags = ["exec", "--sandbox", "workspace-write"]
 
 
 [verify]
