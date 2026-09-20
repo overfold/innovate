@@ -12,7 +12,7 @@ Usage:
     python maintain.py run-continuous     # loop until exhausted
     python maintain.py status             # show queue and progress
     python maintain.py audit <area>       # manual single-area audit
-    python maintain.py findings           # list open/paused findings
+    python maintain.py findings           # list open, deferred, and blocked findings
     python maintain.py reset              # clear all state (asks for confirmation)
 
 Prerequisites:

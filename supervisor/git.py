@@ -184,7 +184,46 @@ def gh_pr_state(owner: str, repo_name: str, pr_number: int) -> str:
     if data.get("mergedAt"):
         return "merged"
     state = data.get("state", "").lower()
-    return state if state in ("open", "merged", "closed") else "closed"
+    if state not in ("open", "merged", "closed"):
+        raise GitHubAPIError(
+            f"gh pr view #{pr_number}: unexpected state {state!r}"
+        )
+    return state
+
+
+def gh_pr_base_sha(owner: str, repo_name: str, pr_number: int) -> str:
+    """Return the current base-branch OID for the PR.
+
+    Raises GitHubAPIError on CLI failure, unparseable output, or missing field.
+    Used as a freshness gate immediately before merge: if the base has advanced
+    since the audit, the patch was never tested against the new commits.
+    """
+    r = subprocess.run(
+        [
+            "gh", "pr", "view", str(pr_number),
+            "--repo", f"{owner}/{repo_name}",
+            "--json", "baseRefOid",
+        ],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    if r.returncode != 0:
+        raise GitHubAPIError(
+            f"gh pr view #{pr_number} failed (exit {r.returncode}): {r.stderr.strip()}"
+        )
+    try:
+        data = json.loads(r.stdout)
+    except json.JSONDecodeError as exc:
+        raise GitHubAPIError(
+            f"gh pr view #{pr_number} returned non-JSON: {r.stdout!r}"
+        ) from exc
+    oid = data.get("baseRefOid", "")
+    if not oid:
+        raise GitHubAPIError(
+            f"gh pr view #{pr_number}: baseRefOid missing or empty"
+        )
+    return oid
 
 
 def gh_close_pr(owner: str, repo_name: str, pr_number: int) -> None:
@@ -208,17 +247,24 @@ def gh_ci_status(owner: str, repo_name: str, pr_number: int) -> str:
 
     Both are blocking by default; set verify.allow_no_ci=true to permit
     merging when there are no checks.
+
+    Uses the `bucket` field that `gh pr checks` normalises into one of:
+    pass, fail, pending, skipping, cancel.
     """
     r = subprocess.run(
         [
             "gh", "pr", "checks", str(pr_number),
             "--repo", f"{owner}/{repo_name}",
-            "--json", "conclusion,status",
+            "--json", "bucket",
         ],
         capture_output=True,
         text=True,
         check=False,
     )
+    # Exit code 8 is authoritative: checks are still pending.
+    # Any other non-zero code is a genuine CLI/API failure.
+    if r.returncode == 8:
+        return "pending"
     if r.returncode != 0:
         return "api_error"
     try:
@@ -227,16 +273,14 @@ def gh_ci_status(owner: str, repo_name: str, pr_number: int) -> str:
         return "api_error"
     if not checks:
         return "no_checks"
-    if any(c.get("conclusion") == "failure" for c in checks):
+    buckets = {c.get("bucket") for c in checks}
+    if "fail" in buckets or "cancel" in buckets:
         return "failure"
-    if any(c.get("status") == "in_progress" for c in checks):
+    if "pending" in buckets:
         return "pending"
-    if all(c.get("conclusion") in ("success", "skipped", None) for c in checks):
-        statuses = {c.get("status") for c in checks}
-        if "completed" in statuses:
-            return "success"
-        return "pending"
-    return "pending"
+    if buckets <= {"pass", "skipping"}:
+        return "success"
+    return "api_error"
 
 
 def gh_merge_pr(owner: str, repo_name: str, pr_number: int) -> None:
