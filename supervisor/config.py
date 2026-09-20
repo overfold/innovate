@@ -91,6 +91,14 @@ DEFAULT_CONFIG: dict[str, Any] = {
                 "that makes future changes error-prone"
             ),
         },
+        {
+            "name": "documentation",
+            "description": (
+                "missing or inaccurate docstrings, incorrect README claims, "
+                "undocumented public APIs, stale usage examples, "
+                "misleading inline comments"
+            ),
+        },
     ],
 }
 

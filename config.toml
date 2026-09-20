@@ -130,3 +130,7 @@ codex_call_budget = 100
 # [[audit_areas]]
 # name        = "maintainability"
 # description = "confusing naming, duplicated logic, excessive complexity that makes future changes error-prone"
+
+# [[audit_areas]]
+# name        = "documentation"
+# description = "missing or inaccurate docstrings, incorrect README claims, undocumented public APIs, stale usage examples, misleading inline comments"

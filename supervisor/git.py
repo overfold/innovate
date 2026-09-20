@@ -4,6 +4,7 @@ import json
 import logging
 import re
 import subprocess
+import tempfile
 import time
 from pathlib import Path
 
@@ -34,6 +35,24 @@ def create_branch(repo: Path, name: str, base: str) -> None:
     _git(repo, "checkout", "-b", name)
 
 
+def create_worktree(repo: Path, branch: str, base: str) -> Path:
+    """Create a git worktree on a new branch and return its path.
+
+    The worktree is an isolated checkout — crashes here leave the main repo
+    untouched. Always pair with remove_worktree() in a finally block.
+    """
+    _git(repo, "fetch", "origin", base, check=False)
+    wt_dir = Path(tempfile.mkdtemp(prefix="maintain-wt-"))
+    _git(repo, "worktree", "add", "-b", branch, str(wt_dir), f"origin/{base}")
+    return wt_dir
+
+
+def remove_worktree(repo: Path, branch: str, wt_path: Path) -> None:
+    """Remove a worktree and delete its local branch."""
+    _git(repo, "worktree", "remove", "--force", str(wt_path), check=False)
+    _git(repo, "branch", "-D", branch, check=False)
+
+
 def push_branch(repo: Path, branch: str) -> None:
     """Push with up to 5 attempts and exponential back-off."""
     for attempt, delay in enumerate([0, 2, 4, 8, 16], start=1):
@@ -52,7 +71,12 @@ def push_branch(repo: Path, branch: str) -> None:
 
 
 def gh_create_pr(
-    owner: str, repo_name: str, branch: str, title: str, body: str
+    owner: str,
+    repo_name: str,
+    branch: str,
+    title: str,
+    body: str,
+    base: str = "main",
 ) -> tuple[int, str]:
     """Returns (pr_number, pr_url)."""
     r = subprocess.run(
@@ -60,6 +84,7 @@ def gh_create_pr(
             "gh", "pr", "create",
             "--repo", f"{owner}/{repo_name}",
             "--head", branch,
+            "--base", base,
             "--title", title,
             "--body", body,
         ],
@@ -70,6 +95,40 @@ def gh_create_pr(
     url = r.stdout.strip().split()[-1]
     m = re.search(r"/pull/(\d+)", url)
     return (int(m.group(1)) if m else 0), url
+
+
+def gh_find_pr_by_branch(
+    owner: str, repo_name: str, branch: str
+) -> tuple[int, str] | None:
+    """Search for an open PR whose head branch matches *branch*.
+
+    Returns (pr_number, pr_url) or None if not found.
+    Used during crash recovery when the DB has a branch recorded but no
+    pr_number yet (process died between gh pr create and the DB update).
+    """
+    r = subprocess.run(
+        [
+            "gh", "pr", "list",
+            "--repo", f"{owner}/{repo_name}",
+            "--head", branch,
+            "--state", "open",
+            "--json", "number,url",
+            "--limit", "1",
+        ],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    if r.returncode != 0:
+        return None
+    try:
+        items = json.loads(r.stdout)
+    except json.JSONDecodeError:
+        return None
+    if not items:
+        return None
+    item = items[0]
+    return item.get("number", 0), item.get("url", "")
 
 
 def gh_pr_state(owner: str, repo_name: str, pr_number: int) -> str:

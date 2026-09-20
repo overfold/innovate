@@ -19,9 +19,10 @@ CREATE TABLE IF NOT EXISTS findings (
     line_range    TEXT,
     title         TEXT    NOT NULL,
     description   TEXT    NOT NULL,
-    -- open | in_progress | fixed | rejected | stale | paused
-    -- 'paused': PR hit the review-round limit; awaiting human review.
-    -- 'stale':  finding no longer applies at current HEAD.
+    -- open | in_progress | fixed | rejected | stale | deferred | blocked
+    -- 'deferred': per-run Codex budget hit; auto-resumes next run.
+    -- 'blocked':  review rounds exhausted without convergence; not retried.
+    -- 'stale':    finding no longer applies at current HEAD.
     status        TEXT    NOT NULL DEFAULT 'open',
     discovered    TEXT    NOT NULL DEFAULT (datetime('now')),
     commit_hash   TEXT,
@@ -47,7 +48,7 @@ CREATE TABLE IF NOT EXISTS prs (
     branch        TEXT    NOT NULL,
     pr_number     INTEGER,
     pr_url        TEXT,
-    -- open | paused | merged | closed | failed
+    -- open | deferred | merged | closed | failed
     status        TEXT    NOT NULL DEFAULT 'open',
     created       TEXT    NOT NULL DEFAULT (datetime('now')),
     merged        TEXT,
@@ -147,14 +148,15 @@ class DB:
         return cur.lastrowid, True
 
     def open_findings(self, area: str | None = None) -> list[sqlite3.Row]:
-        """Return open findings, highest-priority first."""
+        """Return actionable findings (open + deferred), highest-priority first."""
         if area:
             rows = self._conn.execute(
-                "SELECT * FROM findings WHERE status='open' AND area=?", (area,)
+                "SELECT * FROM findings WHERE status IN ('open','deferred') AND area=?",
+                (area,),
             ).fetchall()
         else:
             rows = self._conn.execute(
-                "SELECT * FROM findings WHERE status='open'"
+                "SELECT * FROM findings WHERE status IN ('open','deferred')"
             ).fetchall()
         return sorted(
             rows,
@@ -164,9 +166,9 @@ class DB:
             ),
         )
 
-    def paused_findings(self) -> list[sqlite3.Row]:
+    def blocked_findings(self) -> list[sqlite3.Row]:
         return self._conn.execute(
-            "SELECT * FROM findings WHERE status='paused' ORDER BY id"
+            "SELECT * FROM findings WHERE status='blocked' ORDER BY id"
         ).fetchall()
 
     def in_progress_findings(self) -> list[sqlite3.Row]:
@@ -208,6 +210,12 @@ class DB:
             "SELECT * FROM prs WHERE id=?", (pr_id,)
         ).fetchone()
 
+    def find_pr_by_branch(self, branch: str) -> sqlite3.Row | None:
+        """Return the most-recent PR row for *branch*, or None."""
+        return self._conn.execute(
+            "SELECT * FROM prs WHERE branch=? ORDER BY id DESC LIMIT 1", (branch,)
+        ).fetchone()
+
     # ── audit runs ───────────────────────────────────────────────────────────
 
     def start_audit(self, area: str, commit: str) -> int:
@@ -242,7 +250,7 @@ class DB:
         """
         active = self._conn.execute(
             """SELECT COUNT(*) AS n FROM findings
-               WHERE area=? AND status IN ('open', 'in_progress', 'paused')""",
+               WHERE area=? AND status IN ('open', 'in_progress', 'deferred')""",
             (area,),
         ).fetchone()
         if active["n"] > 0:
