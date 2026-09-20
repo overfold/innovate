@@ -1,0 +1,112 @@
+# maintain.py configuration
+# Copy this file, fill in [repo], and run:
+#   python maintain.py run
+
+[repo]
+# GitHub owner (user or org) and repository name.
+owner = "your-org"
+name  = "your-repo"
+
+# Absolute or relative path to the local clone of the repository.
+# The supervisor does all git operations here.
+path  = "/path/to/local/clone"
+
+# Branch to treat as the trunk.  PRs are opened against it.
+default_branch = "main"
+
+
+[codex]
+# Codex CLI binary name (must be on PATH).
+# Install: npm install -g @openai/codex
+cmd   = "codex"
+model = "o4-mini"
+
+# Seconds before a single Codex invocation is killed.
+timeout = 300
+
+# Flags passed to Codex for READ-ONLY operations (audit, diff-review, verify).
+# --approval-mode suggest means Codex will propose but not write changes.
+audit_flags = ["--quiet", "--approval-mode", "suggest"]
+
+# Flags passed to Codex for FILE-EDITING operations (repair, implement review
+# feedback).  full-auto means Codex applies every suggested change without
+# prompting.
+repair_flags = ["--quiet", "--approval-mode", "full-auto"]
+
+
+[verify]
+# Optional shell command run inside the repo before opening a PR.
+# If it exits non-zero the fix is discarded and the finding is re-queued.
+# Leave empty to skip local verification.
+#
+# Examples:
+#   test_cmd = "npm test"
+#   test_cmd = "pytest -x -q"
+#   test_cmd = "cargo test --quiet"
+#   test_cmd = "make test lint"
+test_cmd = ""
+
+# Seconds to wait for GitHub CI checks to complete before merging.
+# 0 = do not wait (skip CI gate — only use this on repos without CI).
+ci_wait_timeout = 600
+
+
+[budget]
+# How many consecutive clean audits (finding 0 new issues) before an area is
+# declared exhausted.  The repository is fully exhausted only after all areas
+# reach this threshold.
+max_audits_per_area = 3
+
+# Maximum findings fixed in a single supervisor run (prevents runaway billing).
+max_fixes_per_run = 20
+
+# Maximum Codex review→fix cycles per PR before accepting the PR as-is.
+max_review_rounds = 4
+
+# Abort the current run if this many operations fail back-to-back.
+max_consecutive_failures = 5
+
+# Total Codex CLI invocations allowed per run.
+codex_call_budget = 100
+
+
+# ── Audit areas ────────────────────────────────────────────────────────────────
+# Each [[audit_areas]] block defines one scoped audit that Codex will run.
+# The "description" is injected verbatim into the audit prompt, so be specific.
+# You can add, remove, or reorder areas; exhaustion is tracked independently.
+#
+# The eight areas below are the defaults built into maintain.py.
+# Uncomment and customise as needed (overrides the built-in defaults entirely
+# when any [[audit_areas]] entry is present in this file).
+
+# [[audit_areas]]
+# name        = "correctness"
+# description = "logic errors, off-by-one bugs, incorrect assumptions, unhandled edge cases, wrong error handling"
+
+# [[audit_areas]]
+# name        = "security"
+# description = "injection vulnerabilities, trust boundary violations, exposed secrets, auth bypass, unsafe deserialization, path traversal"
+
+# [[audit_areas]]
+# name        = "reliability"
+# description = "race conditions, resource leaks, missing error recovery, fragile assumptions about external services, missing retries"
+
+# [[audit_areas]]
+# name        = "tests"
+# description = "missing coverage for critical paths, incorrect assertions, fragile or flaky tests, untested error paths"
+
+# [[audit_areas]]
+# name        = "persistence"
+# description = "data integrity issues, unsafe migrations, missing crash recovery, silent data loss, index or transaction gaps"
+
+# [[audit_areas]]
+# name        = "api_contracts"
+# description = "inconsistent interfaces, missing input validation, undocumented breaking changes, incorrect API documentation"
+
+# [[audit_areas]]
+# name        = "dependencies"
+# description = "unused imports and packages, dead code, outdated dependencies with known vulnerabilities, shadowed or circular imports"
+
+# [[audit_areas]]
+# name        = "maintainability"
+# description = "confusing naming, duplicated logic, excessive complexity that makes future changes error-prone"
