@@ -72,7 +72,8 @@ def main() -> None:
     sub.add_parser("run", help="Run one full maintenance iteration")
 
     run_cont = sub.add_parser(
-        "run-continuous", help="Loop until exhausted or budget exceeded"
+        "run-continuous",
+        help="Loop until exhausted or blocked; resets per-run budget each iteration",
     )
     run_cont.add_argument(
         "--max-iterations", type=int, default=50,
@@ -80,7 +81,7 @@ def main() -> None:
     )
 
     sub.add_parser("status", help="Show queue, PRs, and area exhaustion")
-    sub.add_parser("findings", help="List open and paused findings")
+    sub.add_parser("findings", help="List open, deferred, and blocked findings")
 
     audit_p = sub.add_parser("audit", help="Manually audit one area")
     audit_p.add_argument("area", help="e.g. correctness, security, tests")

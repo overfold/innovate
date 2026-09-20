@@ -39,16 +39,15 @@ def create_branch(repo: Path, name: str, base: str) -> None:
     _git(repo, "checkout", "-b", name)
 
 
-def create_worktree(repo: Path, branch: str, base: str) -> Path:
-    """Create a git worktree on a new branch and return its path.
+def create_worktree(repo: Path, branch: str, start_point: str) -> Path:
+    """Create a git worktree on a new branch rooted at start_point (a commit SHA).
 
-    The worktree is an isolated checkout — crashes here leave the main repo
-    untouched. Always pair with remove_worktree() in a finally block.
-    Raises subprocess.CalledProcessError if the fetch fails.
+    The caller must ensure start_point is already in the local object store
+    (guaranteed when create_audit_worktree was called first on the same run).
+    Always pair with remove_worktree() in a finally block.
     """
-    _git(repo, "fetch", "origin", base)  # fail-closed
     wt_dir = Path(tempfile.mkdtemp(prefix="maintain-wt-"))
-    _git(repo, "worktree", "add", "-b", branch, str(wt_dir), f"origin/{base}")
+    _git(repo, "worktree", "add", "-b", branch, str(wt_dir), start_point)
     return wt_dir
 
 
@@ -189,12 +188,16 @@ def gh_pr_state(owner: str, repo_name: str, pr_number: int) -> str:
 
 
 def gh_close_pr(owner: str, repo_name: str, pr_number: int) -> None:
-    subprocess.run(
+    r = subprocess.run(
         ["gh", "pr", "close", str(pr_number), "--repo", f"{owner}/{repo_name}"],
         capture_output=True,
         text=True,
         check=False,
     )
+    if r.returncode != 0:
+        raise GitHubAPIError(
+            f"gh pr close #{pr_number} failed (exit {r.returncode}): {r.stderr.strip()}"
+        )
 
 
 def gh_ci_status(owner: str, repo_name: str, pr_number: int) -> str:
