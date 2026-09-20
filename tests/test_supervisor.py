@@ -368,6 +368,53 @@ class TestFixFinding:
         rm_wt.assert_called_once()
         assert db.get_finding(f["id"])["status"] == "open"
 
+    def test_repair_success_then_verify_fail_increments_failures(self, tmp_path):
+        """repair succeeds → verify fails: consecutive_failures must still increment."""
+        sup, db, f, wt = self._setup(tmp_path)
+
+        with patch(f"{RUNNER_MODULE}.create_worktree", return_value=wt), \
+             patch(f"{RUNNER_MODULE}.remove_worktree"), \
+             patch(f"{RUNNER_MODULE}.phase_repair", return_value=True), \
+             patch(f"{RUNNER_MODULE}.phase_verify", return_value=False):
+
+            result = sup._fix_finding(db.get_finding(f["id"]), "abc1234")
+
+        assert result is False
+        assert sup.ctr["consecutive_failures"] == 1
+
+    def test_repeated_repair_succeeds_verify_fails_trips_budget(self, tmp_path):
+        """Repeated repair-succeeds→verify-fails must trip max_consecutive_failures."""
+        db = _db()
+        cfg = _cfg()
+        cfg["budget"]["max_consecutive_failures"] = 3
+        sup = Supervisor(cfg, db)
+        wt = _make_fake_wt(tmp_path)
+
+        for _ in range(3):
+            f = _open_finding(db, title=f"bug {_}")
+
+        findings = db.open_findings()
+        assert len(findings) == 3
+
+        with patch(f"{RUNNER_MODULE}.create_worktree", return_value=wt), \
+             patch(f"{RUNNER_MODULE}.remove_worktree"), \
+             patch(f"{RUNNER_MODULE}.phase_repair", return_value=True), \
+             patch(f"{RUNNER_MODULE}.phase_verify", return_value=False):
+
+            # First two attempts: consecutive_failures 0→1→2, under budget.
+            sup._fix_finding(db.get_finding(findings[0]["id"]), "abc1234")
+            assert sup.ctr["consecutive_failures"] == 1
+            assert not sup._over_budget()
+
+            sup._fix_finding(db.get_finding(findings[1]["id"]), "abc1234")
+            assert sup.ctr["consecutive_failures"] == 2
+            assert not sup._over_budget()
+
+            # Third attempt trips the limit.
+            sup._fix_finding(db.get_finding(findings[2]["id"]), "abc1234")
+            assert sup.ctr["consecutive_failures"] == 3
+            assert sup._over_budget()
+
     def test_pr_record_created_before_push(self, tmp_path):
         """DB PR record (with branch) must exist before push_branch is called."""
         sup, db, f, wt = self._setup(tmp_path)
@@ -712,7 +759,7 @@ class TestPhaseRepair:
         f = _open_finding(db)
         cfg = _cfg()
         cfg["repo"]["path"] = str(tmp_path)
-        ctr = {"codex_calls": 0, "consecutive_failures": 0}
+        ctr = {"codex_calls": 0, "consecutive_failures": 3}
 
         with patch("supervisor.phases.run_codex"), \
              patch("supervisor.phases.current_commit", return_value="abc"), \
@@ -721,7 +768,9 @@ class TestPhaseRepair:
             ok = phase_repair(cfg, db, [f], ctr)
 
         assert ok
-        assert ctr["consecutive_failures"] == 0
+        # Repair alone must NOT reset consecutive_failures; only a full
+        # end-to-end success (merge) resets it.
+        assert ctr["consecutive_failures"] == 3
         # add -A and commit should both be called
         calls = [c.args[1] for c in mock_git.call_args_list]
         assert "add" in calls

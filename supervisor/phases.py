@@ -280,7 +280,6 @@ def phase_repair(cfg: dict, db: DB, findings: list, ctr: dict) -> bool:
     _git(repo, "add", "-A")
     _git(repo, "commit", "-m", commit_msg)
 
-    ctr["consecutive_failures"] = 0
     return True
 
 
