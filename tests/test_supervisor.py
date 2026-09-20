@@ -533,7 +533,8 @@ class TestFixFinding:
         assert db.get_finding(f["id"])["status"] == "in_progress"
         assert sup.ctr["consecutive_failures"] == 1
 
-    def test_merge_failure_requeues_finding(self, tmp_path):
+    def test_merge_failure_leaves_in_progress(self, tmp_path):
+        """Merge command failure is uncertain — leave in_progress for startup_reconcile."""
         sup, db, f, wt = self._setup(tmp_path)
 
         with patch(f"{RUNNER_MODULE}.create_worktree", return_value=wt), \
@@ -553,7 +554,8 @@ class TestFixFinding:
             result = sup._fix_finding(db.get_finding(f["id"]), "abc1234")
 
         assert result is False
-        assert db.get_finding(f["id"])["status"] == "open"
+        assert db.get_finding(f["id"])["status"] == "in_progress"
+        assert sup.ctr["consecutive_failures"] == 1
 
     def test_freshness_api_error_leaves_in_progress(self, tmp_path):
         """gh_pr_base_sha API error → leave finding in_progress for startup_reconcile."""

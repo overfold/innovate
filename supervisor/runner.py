@@ -439,9 +439,11 @@ class Supervisor:
             try:
                 gh_merge_pr(owner, repo_name, pr_number)
             except Exception as exc:
-                LOG.error("  Merge failed: %s", exc)
-                db.update_pr(pr_id, status="failed")
-                db.mark_finding(f["id"], "open")
+                LOG.error(
+                    "  Merge result uncertain: %s"
+                    " — leaving in_progress for startup_reconcile",
+                    exc,
+                )
                 self.ctr["consecutive_failures"] += 1
                 return False
 
