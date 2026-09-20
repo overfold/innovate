@@ -14,6 +14,7 @@ from .git import (
     gh_close_pr,
     gh_create_pr,
     gh_merge_pr,
+    gh_pr_state,
     push_branch,
     wait_for_ci,
 )
@@ -71,6 +72,50 @@ class Supervisor:
         if footer:
             parts += ["\n---", footer]
         return "\n".join(parts)
+
+    def startup_reconcile(self) -> None:
+        """Reconcile in_progress findings against Git/GitHub state.
+
+        Called at the start of every run_once() to recover from a previous crash
+        or unexpected termination that left findings stuck in in_progress.
+        """
+        db = self.db
+        cfg = self.cfg
+        owner = cfg["repo"]["owner"]
+        repo_name = cfg["repo"]["name"]
+
+        rows = db.in_progress_findings()
+        if not rows:
+            return
+
+        LOG.info("Reconciling %d in_progress finding(s)…", len(rows))
+        for finding in rows:
+            pr_row = db.get_pr(finding["pr_id"]) if finding["pr_id"] else None
+            pr_number = pr_row["pr_number"] if pr_row else None
+
+            if not pr_number:
+                LOG.info(
+                    "  Finding %d (%s): no PR record — requeueing",
+                    finding["id"], finding["title"],
+                )
+                db.mark_finding(finding["id"], "open")
+                continue
+
+            state = gh_pr_state(owner, repo_name, pr_number)
+            LOG.info(
+                "  Finding %d (%s): PR #%d is %s",
+                finding["id"], finding["title"], pr_number, state,
+            )
+            if state == "merged":
+                db.update_pr(pr_row["id"], status="merged")
+                db.mark_finding(finding["id"], "fixed", pr_id=pr_row["id"])
+            elif state in ("closed", "unknown"):
+                db.update_pr(pr_row["id"], status="closed")
+                db.mark_finding(finding["id"], "open")
+            else:  # open — orphan PR; close it and requeue for a clean retry
+                gh_close_pr(owner, repo_name, pr_number)
+                db.update_pr(pr_row["id"], status="closed")
+                db.mark_finding(finding["id"], "open")
 
     def _fix_finding(self, finding: sqlite3.Row, current_head: str) -> bool:
         """Full repair→verify→PR→review→CI→merge cycle for one finding.
@@ -227,6 +272,15 @@ class Supervisor:
 
         Returns 'exhausted' | 'done' | 'partial'.
         """
+        # Reset per-run counters so run-continuous can't permanently wedge
+        # once a budget limit from a previous iteration is hit.
+        self.ctr["codex_calls"] = 0
+        self.ctr["fixes_applied"] = 0
+        self.ctr["consecutive_failures"] = 0
+
+        # Recover from any crash/restart that left findings in_progress.
+        self.startup_reconcile()
+
         cfg = self.cfg
         repo = Path(cfg["repo"]["path"]).resolve()
         main = cfg["repo"]["default_branch"]
