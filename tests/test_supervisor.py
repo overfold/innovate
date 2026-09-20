@@ -928,15 +928,11 @@ class TestGhCiStatus:
         with patch("supervisor.git.subprocess.run", return_value=mock_result):
             return gh_ci_status("org", "repo", 42)
 
-    def test_returncode_8_with_pending_bucket_returns_pending(self):
-        """Exit code 8 means checks still pending; should not return api_error."""
-        status = self._run(8, '[{"bucket":"pending"}]')
-        assert status == "pending"
-
-    def test_returncode_8_with_pass_bucket_returns_success(self):
-        """Exit code 8 with all-pass buckets is treated as success."""
-        status = self._run(8, '[{"bucket":"pass"}]')
-        assert status == "success"
+    def test_returncode_8_always_returns_pending(self):
+        """Exit code 8 is authoritative for 'pending'; bucket content is ignored."""
+        assert self._run(8, '[{"bucket":"pending"}]') == "pending"
+        assert self._run(8, '[{"bucket":"pass"}]') == "pending"
+        assert self._run(8, "[]") == "pending"
 
     def test_nonzero_exit_other_than_8_returns_api_error(self):
         status = self._run(1, "")

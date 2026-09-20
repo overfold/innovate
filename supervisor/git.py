@@ -261,9 +261,11 @@ def gh_ci_status(owner: str, repo_name: str, pr_number: int) -> str:
         text=True,
         check=False,
     )
-    # Exit code 8 means checks are still pending (no terminal status yet);
-    # any other non-zero code is a genuine CLI/API failure.
-    if r.returncode not in (0, 8):
+    # Exit code 8 is authoritative: checks are still pending.
+    # Any other non-zero code is a genuine CLI/API failure.
+    if r.returncode == 8:
+        return "pending"
+    if r.returncode != 0:
         return "api_error"
     try:
         checks = json.loads(r.stdout)
