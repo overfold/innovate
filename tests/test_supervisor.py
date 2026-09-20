@@ -324,6 +324,7 @@ class TestFixFinding:
 
         with patch(f"{RUNNER_MODULE}.create_worktree", return_value=wt), \
              patch(f"{RUNNER_MODULE}.remove_worktree") as rm_wt, \
+             patch(f"{RUNNER_MODULE}.phase_validate", return_value="valid"), \
              patch(f"{RUNNER_MODULE}.phase_repair", return_value=True), \
              patch(f"{RUNNER_MODULE}.phase_verify", return_value=True), \
              patch(f"{RUNNER_MODULE}.push_branch"), \
@@ -347,6 +348,7 @@ class TestFixFinding:
 
         with patch(f"{RUNNER_MODULE}.create_worktree", return_value=wt), \
              patch(f"{RUNNER_MODULE}.remove_worktree") as rm_wt, \
+             patch(f"{RUNNER_MODULE}.phase_validate", return_value="valid"), \
              patch(f"{RUNNER_MODULE}.phase_repair", return_value=False):
 
             result = sup._fix_finding(db.get_finding(f["id"]), "abc1234")
@@ -359,6 +361,7 @@ class TestFixFinding:
 
         with patch(f"{RUNNER_MODULE}.create_worktree", return_value=wt), \
              patch(f"{RUNNER_MODULE}.remove_worktree") as rm_wt, \
+             patch(f"{RUNNER_MODULE}.phase_validate", return_value="valid"), \
              patch(f"{RUNNER_MODULE}.phase_repair", return_value=True), \
              patch(f"{RUNNER_MODULE}.phase_verify", return_value=False):
 
@@ -426,6 +429,7 @@ class TestFixFinding:
 
         with patch(f"{RUNNER_MODULE}.create_worktree", return_value=wt), \
              patch(f"{RUNNER_MODULE}.remove_worktree"), \
+             patch(f"{RUNNER_MODULE}.phase_validate", return_value="valid"), \
              patch(f"{RUNNER_MODULE}.phase_repair", return_value=True), \
              patch(f"{RUNNER_MODULE}.phase_verify", return_value=True), \
              patch(f"{RUNNER_MODULE}.push_branch",
@@ -447,6 +451,7 @@ class TestFixFinding:
 
         with patch(f"{RUNNER_MODULE}.create_worktree", return_value=wt), \
              patch(f"{RUNNER_MODULE}.remove_worktree"), \
+             patch(f"{RUNNER_MODULE}.phase_validate", return_value="valid"), \
              patch(f"{RUNNER_MODULE}.phase_repair", return_value=True), \
              patch(f"{RUNNER_MODULE}.phase_verify", return_value=True), \
              patch(f"{RUNNER_MODULE}.push_branch",
@@ -463,6 +468,7 @@ class TestFixFinding:
 
         with patch(f"{RUNNER_MODULE}.create_worktree", return_value=wt), \
              patch(f"{RUNNER_MODULE}.remove_worktree"), \
+             patch(f"{RUNNER_MODULE}.phase_validate", return_value="valid"), \
              patch(f"{RUNNER_MODULE}.phase_repair", return_value=True), \
              patch(f"{RUNNER_MODULE}.phase_verify", return_value=True), \
              patch(f"{RUNNER_MODULE}.push_branch"), \
@@ -482,6 +488,7 @@ class TestFixFinding:
 
         with patch(f"{RUNNER_MODULE}.create_worktree", return_value=wt), \
              patch(f"{RUNNER_MODULE}.remove_worktree"), \
+             patch(f"{RUNNER_MODULE}.phase_validate", return_value="valid"), \
              patch(f"{RUNNER_MODULE}.phase_repair", return_value=True), \
              patch(f"{RUNNER_MODULE}.phase_verify", return_value=True), \
              patch(f"{RUNNER_MODULE}.push_branch"), \
@@ -502,6 +509,7 @@ class TestFixFinding:
 
         with patch(f"{RUNNER_MODULE}.create_worktree", return_value=wt), \
              patch(f"{RUNNER_MODULE}.remove_worktree"), \
+             patch(f"{RUNNER_MODULE}.phase_validate", return_value="valid"), \
              patch(f"{RUNNER_MODULE}.phase_repair", return_value=True), \
              patch(f"{RUNNER_MODULE}.phase_verify", return_value=True), \
              patch(f"{RUNNER_MODULE}.push_branch"), \
@@ -523,6 +531,7 @@ class TestFixFinding:
 
         with patch(f"{RUNNER_MODULE}.create_worktree", return_value=wt), \
              patch(f"{RUNNER_MODULE}.remove_worktree"), \
+             patch(f"{RUNNER_MODULE}.phase_validate", return_value="valid"), \
              patch(f"{RUNNER_MODULE}.phase_repair", return_value=True), \
              patch(f"{RUNNER_MODULE}.phase_verify", return_value=True), \
              patch(f"{RUNNER_MODULE}.push_branch"), \
@@ -544,6 +553,7 @@ class TestFixFinding:
 
         with patch(f"{RUNNER_MODULE}.create_worktree", return_value=wt), \
              patch(f"{RUNNER_MODULE}.remove_worktree"), \
+             patch(f"{RUNNER_MODULE}.phase_validate", return_value="valid"), \
              patch(f"{RUNNER_MODULE}.phase_repair", return_value=True), \
              patch(f"{RUNNER_MODULE}.phase_verify", return_value=True), \
              patch(f"{RUNNER_MODULE}.push_branch"), \
@@ -566,6 +576,7 @@ class TestFixFinding:
 
         with patch(f"{RUNNER_MODULE}.create_worktree", return_value=wt), \
              patch(f"{RUNNER_MODULE}.remove_worktree"), \
+             patch(f"{RUNNER_MODULE}.phase_validate", return_value="valid"), \
              patch(f"{RUNNER_MODULE}.phase_repair", return_value=True), \
              patch(f"{RUNNER_MODULE}.phase_verify", return_value=True), \
              patch(f"{RUNNER_MODULE}.push_branch"), \
@@ -588,6 +599,7 @@ class TestFixFinding:
 
         with patch(f"{RUNNER_MODULE}.create_worktree", return_value=wt), \
              patch(f"{RUNNER_MODULE}.remove_worktree"), \
+             patch(f"{RUNNER_MODULE}.phase_validate", return_value="valid"), \
              patch(f"{RUNNER_MODULE}.phase_repair", return_value=True), \
              patch(f"{RUNNER_MODULE}.phase_verify", return_value=True), \
              patch(f"{RUNNER_MODULE}.push_branch"), \
@@ -609,6 +621,7 @@ class TestFixFinding:
 
         with patch(f"{RUNNER_MODULE}.create_worktree", return_value=wt), \
              patch(f"{RUNNER_MODULE}.remove_worktree"), \
+             patch(f"{RUNNER_MODULE}.phase_validate", return_value="valid"), \
              patch(f"{RUNNER_MODULE}.phase_repair", return_value=True), \
              patch(f"{RUNNER_MODULE}.phase_verify", return_value=True), \
              patch(f"{RUNNER_MODULE}.push_branch"), \
@@ -630,6 +643,7 @@ class TestFixFinding:
 
         with patch(f"{RUNNER_MODULE}.create_worktree", return_value=wt), \
              patch(f"{RUNNER_MODULE}.remove_worktree"), \
+             patch(f"{RUNNER_MODULE}.phase_validate", return_value="valid"), \
              patch(f"{RUNNER_MODULE}.phase_repair", return_value=True), \
              patch(f"{RUNNER_MODULE}.phase_verify", return_value=True), \
              patch(f"{RUNNER_MODULE}.push_branch"), \
@@ -654,6 +668,7 @@ class TestFixFinding:
 
         with patch(f"{RUNNER_MODULE}.create_worktree", return_value=wt), \
              patch(f"{RUNNER_MODULE}.remove_worktree"), \
+             patch(f"{RUNNER_MODULE}.phase_validate", return_value="valid"), \
              patch(f"{RUNNER_MODULE}.phase_repair", return_value=True), \
              patch(f"{RUNNER_MODULE}.phase_verify", return_value=True), \
              patch(f"{RUNNER_MODULE}.push_branch"), \
@@ -677,6 +692,7 @@ class TestFixFinding:
 
         with patch(f"{RUNNER_MODULE}.create_worktree", return_value=wt), \
              patch(f"{RUNNER_MODULE}.remove_worktree"), \
+             patch(f"{RUNNER_MODULE}.phase_validate", return_value="valid"), \
              patch(f"{RUNNER_MODULE}.phase_repair", return_value=True), \
              patch(f"{RUNNER_MODULE}.phase_verify", return_value=True), \
              patch(f"{RUNNER_MODULE}.push_branch"), \
@@ -970,6 +986,7 @@ class TestGitHubAPIFailures:
 
         with patch(f"{RUNNER_MODULE}.create_worktree", return_value=wt), \
              patch(f"{RUNNER_MODULE}.remove_worktree"), \
+             patch(f"{RUNNER_MODULE}.phase_validate", return_value="valid"), \
              patch(f"{RUNNER_MODULE}.phase_repair", return_value=True), \
              patch(f"{RUNNER_MODULE}.phase_verify", return_value=True), \
              patch(f"{RUNNER_MODULE}.push_branch"), \
@@ -993,6 +1010,7 @@ class TestGitHubAPIFailures:
 
         with patch(f"{RUNNER_MODULE}.create_worktree", return_value=wt), \
              patch(f"{RUNNER_MODULE}.remove_worktree"), \
+             patch(f"{RUNNER_MODULE}.phase_validate", return_value="valid"), \
              patch(f"{RUNNER_MODULE}.phase_repair", return_value=True), \
              patch(f"{RUNNER_MODULE}.phase_verify", return_value=True), \
              patch(f"{RUNNER_MODULE}.push_branch"), \
@@ -1256,6 +1274,7 @@ class TestRunOnceReturnValues:
              patch(f"{RUNNER_MODULE}.phase_audit", side_effect=fake_audit), \
              patch(f"{RUNNER_MODULE}.create_worktree", return_value=wt), \
              patch(f"{RUNNER_MODULE}.remove_worktree"), \
+             patch(f"{RUNNER_MODULE}.phase_validate", return_value="valid"), \
              patch(f"{RUNNER_MODULE}.phase_repair", return_value=True), \
              patch(f"{RUNNER_MODULE}.phase_verify", return_value=True), \
              patch(f"{RUNNER_MODULE}.push_branch"), \
@@ -1471,6 +1490,7 @@ class TestRejectedHeadPinning:
 
         with patch(f"{RUNNER_MODULE}.create_worktree", return_value=wt), \
              patch(f"{RUNNER_MODULE}.remove_worktree"), \
+             patch(f"{RUNNER_MODULE}.phase_validate", return_value="valid"), \
              patch(f"{RUNNER_MODULE}.phase_repair", side_effect=fake_repair_no_changes):
             result = sup._fix_finding(db.get_finding(f["id"]), "abc1234")
 
@@ -1585,6 +1605,7 @@ class TestRejectedAtHeadConvergence:
              patch(f"{RUNNER_MODULE}.remove_audit_worktree"), \
              patch(f"{RUNNER_MODULE}.current_commit", return_value=HEAD), \
              patch(f"{RUNNER_MODULE}.phase_audit", side_effect=fake_phase_audit), \
+             patch(f"{RUNNER_MODULE}.phase_validate", return_value="valid"), \
              patch(f"{RUNNER_MODULE}.phase_repair", side_effect=fake_repair_no_changes), \
              patch(f"{RUNNER_MODULE}.create_worktree", return_value=wt), \
              patch(f"{RUNNER_MODULE}.remove_worktree"):
@@ -1609,3 +1630,464 @@ class TestRejectedAtHeadConvergence:
             # rejected_at_head_findings returns X → must return 'blocked'.
             result3 = sup.run_once()
             assert result3 == "blocked"
+
+
+# ── phase_validate unit tests ──────────────────────────────────────────────────
+
+class TestPhaseValidate:
+    """phase_validate: state-machine and fail-closed behaviour."""
+
+    def _cfg_and_finding(self, tmp_path):
+        cfg = _cfg()
+        cfg["repo"]["path"] = str(tmp_path)
+        f = _open_finding(_db())
+        return cfg, f
+
+    def test_valid_returns_valid(self, tmp_path):
+        from supervisor.phases import phase_validate
+        cfg, f = self._cfg_and_finding(tmp_path)
+        ctr = {"codex_calls": 0, "consecutive_failures": 0}
+        valid_json = '{"verdict":"valid","reason":"issue confirmed","evidence":"line 42"}'
+        with patch("supervisor.phases.run_codex", return_value=valid_json), \
+             patch("supervisor.phases.parse_json",
+                   return_value={"verdict": "valid", "reason": "ok", "evidence": "e"}):
+            result = phase_validate(cfg, f, ctr)
+        assert result == "valid"
+        assert ctr["codex_calls"] == 1
+
+    def test_invalid_returns_invalid(self, tmp_path):
+        from supervisor.phases import phase_validate
+        cfg, f = self._cfg_and_finding(tmp_path)
+        ctr = {"codex_calls": 0, "consecutive_failures": 0}
+        with patch("supervisor.phases.run_codex", return_value=""), \
+             patch("supervisor.phases.parse_json",
+                   return_value={"verdict": "invalid", "reason": "no", "evidence": "e"}):
+            result = phase_validate(cfg, f, ctr)
+        assert result == "invalid"
+
+    def test_uncertain_returns_uncertain(self, tmp_path):
+        from supervisor.phases import phase_validate
+        cfg, f = self._cfg_and_finding(tmp_path)
+        ctr = {"codex_calls": 0, "consecutive_failures": 0}
+        with patch("supervisor.phases.run_codex", return_value=""), \
+             patch("supervisor.phases.parse_json",
+                   return_value={"verdict": "uncertain", "reason": "?", "evidence": "e"}):
+            result = phase_validate(cfg, f, ctr)
+        assert result == "uncertain"
+
+    def test_codex_error_returns_error_fail_closed(self, tmp_path):
+        from supervisor.phases import phase_validate
+        from supervisor.codex import CodexError
+        cfg, f = self._cfg_and_finding(tmp_path)
+        ctr = {"codex_calls": 0, "consecutive_failures": 0}
+        with patch("supervisor.phases.run_codex", side_effect=CodexError("boom")):
+            result = phase_validate(cfg, f, ctr)
+        assert result == "error"
+
+    def test_parse_error_returns_error_fail_closed(self, tmp_path):
+        from supervisor.phases import phase_validate
+        cfg, f = self._cfg_and_finding(tmp_path)
+        ctr = {"codex_calls": 0, "consecutive_failures": 0}
+        with patch("supervisor.phases.run_codex", return_value="not json at all"):
+            result = phase_validate(cfg, f, ctr)
+        assert result == "error"
+
+    def test_unexpected_verdict_returns_error(self, tmp_path):
+        from supervisor.phases import phase_validate
+        cfg, f = self._cfg_and_finding(tmp_path)
+        ctr = {"codex_calls": 0, "consecutive_failures": 0}
+        with patch("supervisor.phases.run_codex", return_value=""), \
+             patch("supervisor.phases.parse_json",
+                   return_value={"verdict": "maybe", "reason": "?", "evidence": "e"}):
+            result = phase_validate(cfg, f, ctr)
+        assert result == "error"
+
+    def test_budget_exhausted_raises_codex_error(self, tmp_path):
+        from supervisor.phases import phase_validate
+        from supervisor.codex import CodexError
+        cfg, f = self._cfg_and_finding(tmp_path)
+        cfg["budget"]["codex_call_budget"] = 0
+        ctr = {"codex_calls": 0, "consecutive_failures": 0}
+        with patch("supervisor.phases.run_codex") as mock_run:
+            result = phase_validate(cfg, f, ctr)
+        mock_run.assert_not_called()
+        assert result == "error"
+
+    def test_validate_does_not_propose_repair(self, tmp_path):
+        """Validate uses audit_flags (read-only), not repair_flags."""
+        from supervisor.phases import phase_validate
+        cfg, f = self._cfg_and_finding(tmp_path)
+        cfg["codex"]["audit_flags"] = ["exec", "--read-only"]
+        cfg["codex"]["repair_flags"] = ["exec"]
+        ctr = {"codex_calls": 0, "consecutive_failures": 0}
+        captured_flags = []
+        def capture_run(prompt, repo, flags, cmd, model, timeout, output_schema=None):
+            captured_flags.extend(flags)
+            return '{"verdict":"valid","reason":"r","evidence":"e"}'
+        with patch("supervisor.phases.run_codex", side_effect=capture_run):
+            phase_validate(cfg, f, ctr)
+        assert "--read-only" in captured_flags
+
+
+# ── validation state-machine tests (via _fix_finding) ─────────────────────────
+
+class TestValidationStateMachine:
+    """Validation phase gates repair; state is persisted in SQLite."""
+
+    def _setup(self, tmp_path):
+        db = _db()
+        f = _open_finding(db)
+        sup = Supervisor(_cfg(), db)
+        wt = tmp_path / "wt"
+        wt.mkdir()
+        return sup, db, f, wt
+
+    def test_valid_finding_proceeds_to_repair(self, tmp_path):
+        sup, db, f, wt = self._setup(tmp_path)
+        repair_called = []
+
+        def record_repair(cfg, db_, findings, ctr):
+            repair_called.append(True)
+            return True
+
+        with patch(f"{RUNNER_MODULE}.create_worktree", return_value=wt), \
+             patch(f"{RUNNER_MODULE}.remove_worktree"), \
+             patch(f"{RUNNER_MODULE}.phase_validate", return_value="valid"), \
+             patch(f"{RUNNER_MODULE}.phase_repair", side_effect=record_repair), \
+             patch(f"{RUNNER_MODULE}.phase_verify", return_value=True), \
+             patch(f"{RUNNER_MODULE}.push_branch"), \
+             patch(f"{RUNNER_MODULE}.gh_create_pr", return_value=(1, "u")), \
+             patch(f"{RUNNER_MODULE}.phase_review_loop", return_value=REVIEW_APPROVED), \
+             patch(f"{RUNNER_MODULE}.wait_for_ci", return_value="no_checks"), \
+             patch(f"{RUNNER_MODULE}.gh_pr_base_sha", return_value="abc1234"), \
+             patch(f"{RUNNER_MODULE}.gh_merge_pr"):
+            sup._fix_finding(db.get_finding(f["id"]), "abc1234")
+
+        assert repair_called, "phase_repair must be called for a valid finding"
+
+    def test_invalid_finding_terminates_no_repair(self, tmp_path):
+        sup, db, f, wt = self._setup(tmp_path)
+
+        with patch(f"{RUNNER_MODULE}.create_worktree", return_value=wt), \
+             patch(f"{RUNNER_MODULE}.remove_worktree"), \
+             patch(f"{RUNNER_MODULE}.phase_validate", return_value="invalid"), \
+             patch(f"{RUNNER_MODULE}.phase_repair") as mock_repair:
+            result = sup._fix_finding(db.get_finding(f["id"]), "abc1234")
+
+        assert result is False
+        mock_repair.assert_not_called()
+        row = db.get_finding(f["id"])
+        assert row["status"] == "invalid"
+        assert row["validated_at_head"] == "abc1234"
+        assert row["validation_verdict"] == "invalid"
+
+    def test_uncertain_finding_blocked_no_repair(self, tmp_path):
+        sup, db, f, wt = self._setup(tmp_path)
+
+        with patch(f"{RUNNER_MODULE}.create_worktree", return_value=wt), \
+             patch(f"{RUNNER_MODULE}.remove_worktree"), \
+             patch(f"{RUNNER_MODULE}.phase_validate", return_value="uncertain"), \
+             patch(f"{RUNNER_MODULE}.phase_repair") as mock_repair:
+            result = sup._fix_finding(db.get_finding(f["id"]), "abc1234")
+
+        assert result is False
+        mock_repair.assert_not_called()
+        assert db.get_finding(f["id"])["status"] == "blocked"
+        assert "uncertain" in db.get_finding(f["id"])["reject_reason"]
+
+    def test_validation_error_blocked_fail_closed(self, tmp_path):
+        """Codex/parse/schema error during validation → blocked (fail-closed)."""
+        sup, db, f, wt = self._setup(tmp_path)
+
+        with patch(f"{RUNNER_MODULE}.create_worktree", return_value=wt), \
+             patch(f"{RUNNER_MODULE}.remove_worktree"), \
+             patch(f"{RUNNER_MODULE}.phase_validate", return_value="error"), \
+             patch(f"{RUNNER_MODULE}.phase_repair") as mock_repair:
+            result = sup._fix_finding(db.get_finding(f["id"]), "abc1234")
+
+        assert result is False
+        mock_repair.assert_not_called()
+        assert db.get_finding(f["id"])["status"] == "blocked"
+
+    def test_valid_cached_at_head_skips_codex(self, tmp_path):
+        """Already validated as valid at current HEAD → phase_validate not called again."""
+        sup, db, f, wt = self._setup(tmp_path)
+        # Pre-seed: validated as valid at the same HEAD
+        db.set_validation(f["id"], "valid", "abc1234")
+
+        with patch(f"{RUNNER_MODULE}.create_worktree", return_value=wt), \
+             patch(f"{RUNNER_MODULE}.remove_worktree"), \
+             patch(f"{RUNNER_MODULE}.phase_validate") as mock_val, \
+             patch(f"{RUNNER_MODULE}.phase_repair", return_value=True), \
+             patch(f"{RUNNER_MODULE}.phase_verify", return_value=True), \
+             patch(f"{RUNNER_MODULE}.push_branch"), \
+             patch(f"{RUNNER_MODULE}.gh_create_pr", return_value=(1, "u")), \
+             patch(f"{RUNNER_MODULE}.phase_review_loop", return_value=REVIEW_APPROVED), \
+             patch(f"{RUNNER_MODULE}.wait_for_ci", return_value="no_checks"), \
+             patch(f"{RUNNER_MODULE}.gh_pr_base_sha", return_value="abc1234"), \
+             patch(f"{RUNNER_MODULE}.gh_merge_pr"):
+            sup._fix_finding(db.get_finding(f["id"]), "abc1234")
+
+        mock_val.assert_not_called()
+
+    def test_valid_at_different_head_not_cached(self, tmp_path):
+        """Validated as valid at a different HEAD → re-validate at current HEAD."""
+        sup, db, f, wt = self._setup(tmp_path)
+        # finding commit_hash matches current_head so revalidation is skipped,
+        # isolating the validation-cache check.
+        db._conn.execute(
+            "UPDATE findings SET commit_hash='newhead1' WHERE id=?", (f["id"],)
+        )
+        db._conn.commit()
+        db.set_validation(f["id"], "valid", "oldhead000")
+
+        with patch(f"{RUNNER_MODULE}.create_worktree", return_value=wt), \
+             patch(f"{RUNNER_MODULE}.remove_worktree"), \
+             patch(f"{RUNNER_MODULE}.phase_validate", return_value="valid") as mock_val, \
+             patch(f"{RUNNER_MODULE}.phase_repair", return_value=True), \
+             patch(f"{RUNNER_MODULE}.phase_verify", return_value=True), \
+             patch(f"{RUNNER_MODULE}.push_branch"), \
+             patch(f"{RUNNER_MODULE}.gh_create_pr", return_value=(1, "u")), \
+             patch(f"{RUNNER_MODULE}.phase_review_loop", return_value=REVIEW_APPROVED), \
+             patch(f"{RUNNER_MODULE}.wait_for_ci", return_value="no_checks"), \
+             patch(f"{RUNNER_MODULE}.gh_pr_base_sha", return_value="newhead1"), \
+             patch(f"{RUNNER_MODULE}.gh_merge_pr"):
+            sup._fix_finding(db.get_finding(f["id"]), "newhead1")
+
+        mock_val.assert_called_once()
+
+
+# ── validation DB / HEAD-pinning tests ────────────────────────────────────────
+
+class TestValidationDB:
+    """DB-level: invalid HEAD-pinning, set_validation, and exhaustion semantics."""
+
+    def _fp(self, f):
+        from supervisor.db import _fingerprint
+        return _fingerprint(f["area"], f["file_path"], f["title"])
+
+    def test_invalid_at_same_head_not_reopened(self):
+        db = _db()
+        f = _open_finding(db, "false alarm")
+        db.mark_finding(f["id"], "invalid", head="abc1234")
+        row = db.get_finding(f["id"])
+        assert row["status"] == "invalid"
+        assert row["validated_at_head"] == "abc1234"
+        assert row["validation_verdict"] == "invalid"
+
+        _, is_new = db.upsert_finding({**f, "fingerprint": self._fp(f),
+                                       "commit_hash": "abc1234"})
+        assert not is_new
+        assert db.get_finding(f["id"])["status"] == "invalid"
+
+    def test_invalid_at_different_head_reopened(self):
+        """Same finding at a new HEAD → reopen for re-validation."""
+        db = _db()
+        f = _open_finding(db, "false alarm")
+        db.mark_finding(f["id"], "invalid", head="abc1234")
+
+        _, is_new = db.upsert_finding({**f, "fingerprint": self._fp(f),
+                                       "commit_hash": "newhead9"})
+        assert is_new
+        row = db.get_finding(f["id"])
+        assert row["status"] == "open"
+        assert row["validation_verdict"] is None
+        assert row["validated_at_head"] is None
+
+    def test_invalid_null_head_reopened(self):
+        """Invalid with no HEAD recorded is always reopened (legacy safety)."""
+        db = _db()
+        f = _open_finding(db, "legacy false alarm")
+        db.mark_finding(f["id"], "invalid")  # head=None
+
+        _, is_new = db.upsert_finding({**f, "fingerprint": self._fp(f),
+                                       "commit_hash": "anyhead"})
+        assert is_new
+        assert db.get_finding(f["id"])["status"] == "open"
+
+    def test_invalid_findings_not_in_open_findings(self):
+        db = _db()
+        f = _open_finding(db)
+        db.mark_finding(f["id"], "invalid", head="abc1234")
+        assert db.open_findings() == []
+
+    def test_invalid_findings_dont_block_exhaustion_streak(self):
+        """Invalid findings don't count as active → don't reset exhaustion streak."""
+        db = _db()
+        f = _open_finding(db)
+        db.mark_finding(f["id"], "invalid", head="abc1234")
+        for _ in range(3):
+            run_id = db.start_audit("correctness", "abc1234")
+            db.finish_audit(run_id, 0, 0)
+        assert db.clean_audit_streak("correctness", 3, "abc1234") == 3
+
+    def test_invalid_findings_dont_prevent_exhausted_return(self):
+        """run_once returns 'exhausted' even with invalid findings at the same HEAD."""
+        db = _db()
+        f = _open_finding(db)
+        db.mark_finding(f["id"], "invalid", head="abc1234")
+        for _ in range(3):
+            run_id = db.start_audit("correctness", "abc1234")
+            db.finish_audit(run_id, 0, 0)
+
+        sup = Supervisor(_cfg(), db)
+        sup.startup_reconcile = lambda: None
+        with patch(f"{RUNNER_MODULE}.create_audit_worktree") as mock_wt, \
+             patch(f"{RUNNER_MODULE}.remove_audit_worktree"), \
+             patch(f"{RUNNER_MODULE}.current_commit", return_value="abc1234"), \
+             patch(f"{RUNNER_MODULE}.phase_audit", return_value=0):
+            mock_wt.return_value = "/tmp/fake-wt"
+            result = sup.run_once()
+
+        assert result == "exhausted"
+
+    def test_set_validation_stores_verdict_and_head(self):
+        db = _db()
+        f = _open_finding(db)
+        db.set_validation(f["id"], "valid", "abc1234")
+        row = db.get_finding(f["id"])
+        assert row["validation_verdict"] == "valid"
+        assert row["validated_at_head"] == "abc1234"
+        assert row["status"] == "open"  # status unchanged
+
+    def test_set_validation_overwrite(self):
+        """set_validation can be called multiple times; last value wins."""
+        db = _db()
+        f = _open_finding(db)
+        db.set_validation(f["id"], "valid", "head1")
+        db.set_validation(f["id"], "uncertain", "head2")
+        row = db.get_finding(f["id"])
+        assert row["validation_verdict"] == "uncertain"
+        assert row["validated_at_head"] == "head2"
+
+    def test_uncertain_finding_becomes_blocked_not_open(self):
+        """Uncertain validation → blocked, not open."""
+        db = _db()
+        f = _open_finding(db)
+        db.mark_finding(f["id"], "blocked",
+                        reason="validation uncertain — requires human review",
+                        head="abc1234")
+        assert db.open_findings() == []
+        assert len(db.blocked_findings()) == 1
+
+    def test_reopened_invalid_finding_clears_validation_state(self):
+        """When an invalid finding is reopened at a new HEAD, validation state is wiped."""
+        db = _db()
+        f = _open_finding(db, "clearedstate")
+        db.mark_finding(f["id"], "invalid", head="head1")
+
+        db.upsert_finding({**f, "fingerprint": self._fp(f), "commit_hash": "head2"})
+        row = db.get_finding(f["id"])
+        assert row["validation_verdict"] is None
+        assert row["validated_at_head"] is None
+
+
+# ── validation persistence / crash-restart ────────────────────────────────────
+
+class TestValidationPersistence:
+    """Crash-restart: validated findings at the same HEAD skip re-validation."""
+
+    def test_crash_after_validate_before_repair_skips_revalidation(self, tmp_path):
+        """If validated=valid at current HEAD was persisted, the next run skips
+        the Codex validation call and goes straight to repair."""
+        db = _db()
+        f = _open_finding(db)
+        # Simulate: validation was run and persisted, then process crashed before repair.
+        db.set_validation(f["id"], "valid", "abc1234")
+
+        sup = Supervisor(_cfg(), db)
+        wt = tmp_path / "wt"
+        wt.mkdir()
+
+        with patch(f"{RUNNER_MODULE}.create_worktree", return_value=wt), \
+             patch(f"{RUNNER_MODULE}.remove_worktree"), \
+             patch(f"{RUNNER_MODULE}.phase_validate") as mock_val, \
+             patch(f"{RUNNER_MODULE}.phase_repair", return_value=True), \
+             patch(f"{RUNNER_MODULE}.phase_verify", return_value=True), \
+             patch(f"{RUNNER_MODULE}.push_branch"), \
+             patch(f"{RUNNER_MODULE}.gh_create_pr", return_value=(1, "u")), \
+             patch(f"{RUNNER_MODULE}.phase_review_loop", return_value=REVIEW_APPROVED), \
+             patch(f"{RUNNER_MODULE}.wait_for_ci", return_value="no_checks"), \
+             patch(f"{RUNNER_MODULE}.gh_pr_base_sha", return_value="abc1234"), \
+             patch(f"{RUNNER_MODULE}.gh_merge_pr"):
+            result = sup._fix_finding(db.get_finding(f["id"]), "abc1234")
+
+        assert result is True
+        mock_val.assert_not_called()
+
+    def test_new_head_after_crash_reruns_validation(self, tmp_path):
+        """Cached validation at old HEAD is NOT reused when HEAD changes."""
+        db = _db()
+        f = _open_finding(db)
+        # commit_hash matches current_head so revalidation is skipped, letting
+        # us test the validation-cache logic in isolation.
+        db._conn.execute(
+            "UPDATE findings SET commit_hash='newhead2' WHERE id=?", (f["id"],)
+        )
+        db._conn.commit()
+        db.set_validation(f["id"], "valid", "oldhead1")
+
+        sup = Supervisor(_cfg(), db)
+        wt = tmp_path / "wt"
+        wt.mkdir()
+
+        with patch(f"{RUNNER_MODULE}.create_worktree", return_value=wt), \
+             patch(f"{RUNNER_MODULE}.remove_worktree"), \
+             patch(f"{RUNNER_MODULE}.phase_validate", return_value="valid") as mock_val, \
+             patch(f"{RUNNER_MODULE}.phase_repair", return_value=True), \
+             patch(f"{RUNNER_MODULE}.phase_verify", return_value=True), \
+             patch(f"{RUNNER_MODULE}.push_branch"), \
+             patch(f"{RUNNER_MODULE}.gh_create_pr", return_value=(1, "u")), \
+             patch(f"{RUNNER_MODULE}.phase_review_loop", return_value=REVIEW_APPROVED), \
+             patch(f"{RUNNER_MODULE}.wait_for_ci", return_value="no_checks"), \
+             patch(f"{RUNNER_MODULE}.gh_pr_base_sha", return_value="newhead2"), \
+             patch(f"{RUNNER_MODULE}.gh_merge_pr"):
+            result = sup._fix_finding(db.get_finding(f["id"]), "newhead2")
+
+        assert result is True
+        mock_val.assert_called_once()
+
+
+# ── validate vs revalidate vs verify distinction ──────────────────────────────
+
+class TestValidationPhaseDistinction:
+    """Confirm validation is distinct from revalidation and verification."""
+
+    def test_revalidation_stale_skips_validation(self, tmp_path):
+        """If revalidation marks a finding stale, validation is never called."""
+        db = _db()
+        f = _open_finding(db)
+        db._conn.execute(
+            "UPDATE findings SET commit_hash='oldhead' WHERE id=?", (f["id"],)
+        )
+        db._conn.commit()
+
+        sup = Supervisor(_cfg(), db)
+        wt = tmp_path / "wt"
+        wt.mkdir()
+
+        with patch(f"{RUNNER_MODULE}.create_worktree", return_value=wt), \
+             patch(f"{RUNNER_MODULE}.remove_worktree"), \
+             patch(f"{RUNNER_MODULE}.phase_revalidate", return_value="stale"), \
+             patch(f"{RUNNER_MODULE}.phase_validate") as mock_val:
+            result = sup._fix_finding(db.get_finding(f["id"]), "newhead")
+
+        assert result is False
+        mock_val.assert_not_called()
+        assert db.get_finding(f["id"])["status"] == "stale"
+
+    def test_invalid_finding_does_not_reach_verify(self, tmp_path):
+        """Invalid validation terminates before verify is called."""
+        db = _db()
+        f = _open_finding(db)
+        sup = Supervisor(_cfg(), db)
+        wt = tmp_path / "wt"
+        wt.mkdir()
+
+        with patch(f"{RUNNER_MODULE}.create_worktree", return_value=wt), \
+             patch(f"{RUNNER_MODULE}.remove_worktree"), \
+             patch(f"{RUNNER_MODULE}.phase_validate", return_value="invalid"), \
+             patch(f"{RUNNER_MODULE}.phase_verify") as mock_verify:
+            sup._fix_finding(db.get_finding(f["id"]), "abc1234")
+
+        mock_verify.assert_not_called()

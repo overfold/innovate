@@ -34,6 +34,7 @@ from .phases import (
     phase_repair,
     phase_revalidate,
     phase_review_loop,
+    phase_validate,
     phase_verify,
 )
 
@@ -266,6 +267,38 @@ class Supervisor:
                     LOG.warning("  Revalidation failed — skipping this run")
                     self.ctr["consecutive_failures"] += 1
                     return False
+
+            # Validate the finding before repair: confirm the audit claim is real.
+            # Skip if already validated as valid at this exact HEAD (crash-safe resume).
+            finding_state = db.get_finding(f["id"])
+            already_valid = (
+                finding_state["validated_at_head"] == current_head
+                and finding_state["validation_verdict"] == "valid"
+            )
+            if not already_valid:
+                LOG.info("  Validating finding at %s", current_head[:7])
+                val = phase_validate(wt_cfg, f, self.ctr)
+                if val == "invalid":
+                    LOG.info(
+                        "  Validation: invalid — finding disproved at %s",
+                        current_head[:7],
+                    )
+                    db.mark_finding(f["id"], "invalid", head=current_head)
+                    return False
+                elif val in ("uncertain", "error"):
+                    reason = (
+                        "validation uncertain — requires human review"
+                        if val == "uncertain"
+                        else "validation call failed — fail-closed"
+                    )
+                    LOG.warning("  Validation: %s — marking blocked", val)
+                    db.mark_finding(
+                        f["id"], "blocked",
+                        pr_id=pr_id, reason=reason, head=current_head,
+                    )
+                    return False
+                else:  # valid
+                    db.set_validation(f["id"], "valid", current_head)
 
             # Repair.
             if not phase_repair(wt_cfg, db, [f], self.ctr):

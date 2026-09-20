@@ -9,6 +9,7 @@ from .codex import (
     AUDIT_SCHEMA,
     REVALIDATE_SCHEMA,
     REVIEW_SCHEMA,
+    VALIDATE_SCHEMA,
     VERIFY_SCHEMA,
     CodexError,
     parse_json,
@@ -27,6 +28,7 @@ from .prompts import (
     REPAIR_PROMPT,
     REVALIDATE_PROMPT,
     REVIEW_PROMPT,
+    VALIDATE_PROMPT,
     VERIFY_PROMPT,
 )
 
@@ -230,6 +232,52 @@ def phase_revalidate(cfg: dict, finding: dict, ctr: dict) -> str:
     status = "valid" if still_applies else "stale"
     LOG.info("  Revalidation: %s — %s", status, reason)
     return status
+
+
+def phase_validate(cfg: dict, finding: dict, ctr: dict) -> str:
+    """Independently validate an audit finding at the exact audited HEAD.
+
+    Uses a fresh Codex context.  Does NOT propose or implement any fix.
+    Returns 'valid' | 'invalid' | 'uncertain' | 'error'.
+
+    Fail-closed: any Codex/schema/parse error returns 'error'.
+    """
+    repo = Path(cfg["repo"]["path"]).resolve()
+
+    prompt = VALIDATE_PROMPT.format(
+        area=finding["area"],
+        title=finding["title"],
+        file_path=finding.get("file_path") or "(no specific file)",
+        line_range=finding.get("line_range") or "(no specific lines)",
+        description=finding.get("description", ""),
+    )
+    try:
+        output = _invoke_codex(
+            cfg, ctr, prompt, repo,
+            flags=cfg["codex"]["audit_flags"],
+            cmd=cfg["codex"]["cmd"],
+            model=cfg["codex"]["model"],
+            timeout=cfg["codex"]["timeout"],
+            output_schema=VALIDATE_SCHEMA,
+        )
+        result = parse_json(output)
+    except (CodexError, ValueError) as exc:
+        LOG.warning("  Validation call failed: %s — fail-closed", exc)
+        return "error"
+
+    verdict = result.get("verdict")
+    if verdict not in ("valid", "invalid", "uncertain"):
+        LOG.warning("  Validation returned unexpected verdict %r — fail-closed", verdict)
+        return "error"
+
+    LOG.info(
+        "  Validation verdict: %s — %s",
+        verdict, result.get("reason", ""),
+    )
+    evidence = result.get("evidence", "")
+    if evidence:
+        LOG.info("  Evidence: %.200s", evidence)
+    return verdict
 
 
 def phase_repair(cfg: dict, db: DB, findings: list, ctr: dict) -> bool:
