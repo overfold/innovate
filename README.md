@@ -148,13 +148,22 @@ Global flags accepted before the command:
 | Key | Description |
 |-----|-------------|
 | `cmd` | Codex binary name (default: `codex`) |
-| `model` | Model identifier passed via `--model` (default: `o4-mini`) |
+| `model` | Default model identifier passed via `--model` (default: `o4-mini`) |
 | `timeout` | Seconds before a Codex invocation is killed (default: `300`) |
 | `audit_flags` | Flags for read-only calls — analysis, diff-review, revalidation. Default: `["exec"]` |
 | `repair_flags` | Flags for file-editing calls — repair, implement review feedback. Default: `["exec", "--sandbox", "workspace-write"]` |
+| `audit_model` | Model for the scoped audit stage. Falls back to `model` when absent. |
+| `revalidate_model` | Model for the stale-check stage (run before repair when the finding HEAD differs). Falls back to `model`. |
+| `validate_model` | Model for the finding-validation stage (confirms a finding before repair). Falls back to `model`. |
+| `repair_model` | Model for the repair stage (applies the code fix). Falls back to `model`. |
+| `verify_model` | Model for the diff-review stage (run after repair, before opening a PR). Falls back to `model`. |
+| `review_model` | Model for the PR-review stage, including implementing blocking feedback. Falls back to `model`. |
 
 `--model` is inserted automatically after the first element of `audit_flags` /
 `repair_flags` when that element is the `exec` subcommand.
+
+Configs that only set `model` continue to work unchanged — every stage falls
+back to `model` when its stage-specific key is absent.
 
 ### `[verify]`
 

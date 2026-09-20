@@ -100,7 +100,7 @@ def verify_diff(cfg: dict, findings: list, ctr: dict) -> bool:
             cfg, ctr, prompt, repo,
             flags=cfg["codex"]["audit_flags"],
             cmd=cfg["codex"]["cmd"],
-            model=cfg["codex"]["model"],
+            model=cfg["codex"].get("verify_model") or cfg["codex"]["model"],
             timeout=cfg["codex"]["timeout"],
             output_schema=VERIFY_SCHEMA,
         )
@@ -136,7 +136,7 @@ def phase_audit(cfg: dict, db: DB, area: dict, ctr: dict) -> int:
             cfg, ctr, prompt, repo,
             flags=cfg["codex"]["audit_flags"],
             cmd=cfg["codex"]["cmd"],
-            model=cfg["codex"]["model"],
+            model=cfg["codex"].get("audit_model") or cfg["codex"]["model"],
             timeout=cfg["codex"]["timeout"],
             output_schema=AUDIT_SCHEMA,
         )
@@ -218,7 +218,7 @@ def phase_revalidate(cfg: dict, finding: dict, ctr: dict) -> str:
             cfg, ctr, prompt, repo,
             flags=cfg["codex"]["audit_flags"],
             cmd=cfg["codex"]["cmd"],
-            model=cfg["codex"]["model"],
+            model=cfg["codex"].get("revalidate_model") or cfg["codex"]["model"],
             timeout=cfg["codex"]["timeout"],
             output_schema=REVALIDATE_SCHEMA,
         )
@@ -262,7 +262,7 @@ def phase_validate(cfg: dict, finding: dict, ctr: dict, *, db: DB | None = None)
             cfg, ctr, prompt, repo,
             flags=cfg["codex"]["audit_flags"],
             cmd=cfg["codex"]["cmd"],
-            model=cfg["codex"]["model"],
+            model=cfg["codex"].get("validate_model") or cfg["codex"]["model"],
             timeout=cfg["codex"]["timeout"],
             output_schema=VALIDATE_SCHEMA,
         )
@@ -319,7 +319,7 @@ def phase_repair(cfg: dict, db: DB, findings: list, ctr: dict) -> bool:
                 cfg, ctr, prompt, repo,
                 flags=cfg["codex"]["repair_flags"],
                 cmd=cfg["codex"]["cmd"],
-                model=cfg["codex"]["model"],
+                model=cfg["codex"].get("repair_model") or cfg["codex"]["model"],
                 timeout=cfg["codex"]["timeout"],
             )
         except CodexError as exc:
@@ -401,7 +401,7 @@ def phase_review_loop(
                 cfg, ctr, prompt, repo,
                 flags=cfg["codex"]["audit_flags"],
                 cmd=cfg["codex"]["cmd"],
-                model=cfg["codex"]["model"],
+                model=cfg["codex"].get("review_model") or cfg["codex"]["model"],
                 timeout=cfg["codex"]["timeout"],
                 output_schema=REVIEW_SCHEMA,
             )
@@ -457,7 +457,7 @@ def phase_review_loop(
                 cfg, ctr, impl_prompt, repo,
                 flags=cfg["codex"]["repair_flags"],
                 cmd=cfg["codex"]["cmd"],
-                model=cfg["codex"]["model"],
+                model=cfg["codex"].get("review_model") or cfg["codex"]["model"],
                 timeout=cfg["codex"]["timeout"],
             )
         except CodexError as exc:
