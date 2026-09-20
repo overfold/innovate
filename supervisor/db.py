@@ -35,7 +35,9 @@ CREATE TABLE IF NOT EXISTS findings (
     -- 'invalid': audit claim disproved at validated_at_head (HEAD-pinned, no repair)
     -- 'uncertain': could not confirm; blocked for human review (same as 'blocked')
     validation_verdict  TEXT,   -- valid | invalid | uncertain | NULL (not yet validated)
-    validated_at_head   TEXT    -- HEAD at which the last validation was performed
+    validated_at_head   TEXT,   -- HEAD at which the last validation was performed
+    validation_reason   TEXT,   -- validator's one-sentence conclusion
+    validation_evidence TEXT    -- validator's concrete code evidence
 );
 
 CREATE TABLE IF NOT EXISTS audit_runs (
@@ -99,6 +101,8 @@ class DB:
             "ALTER TABLE findings ADD COLUMN repair_attempts INTEGER NOT NULL DEFAULT 0",
             "ALTER TABLE findings ADD COLUMN validation_verdict TEXT",
             "ALTER TABLE findings ADD COLUMN validated_at_head TEXT",
+            "ALTER TABLE findings ADD COLUMN validation_reason TEXT",
+            "ALTER TABLE findings ADD COLUMN validation_evidence TEXT",
         ]:
             try:
                 self._conn.execute(_migration)
@@ -175,7 +179,8 @@ class DB:
                            severity=?, confidence=?, file_path=?,
                            line_range=?, description=?,
                            rejected_at_head=NULL,
-                           validation_verdict=NULL, validated_at_head=NULL
+                           validation_verdict=NULL, validated_at_head=NULL,
+                           validation_reason=NULL, validation_evidence=NULL
                        WHERE id=?""",
                     common_args,
                 )
@@ -188,6 +193,7 @@ class DB:
                            severity=?, confidence=?, file_path=?,
                            line_range=?, description=?,
                            validation_verdict=NULL, validated_at_head=NULL,
+                           validation_reason=NULL, validation_evidence=NULL,
                            repair_attempts=0
                        WHERE id=?""",
                     common_args,
@@ -201,7 +207,8 @@ class DB:
                            severity=?, confidence=?, file_path=?,
                            line_range=?, description=?,
                            rejected_at_head=NULL, repair_attempts=0,
-                           validation_verdict=NULL, validated_at_head=NULL
+                           validation_verdict=NULL, validated_at_head=NULL,
+                           validation_reason=NULL, validation_evidence=NULL
                        WHERE id=?""",
                     common_args,
                 )
@@ -270,11 +277,15 @@ class DB:
             "SELECT * FROM findings WHERE status='in_progress' ORDER BY id"
         ).fetchall()
 
-    def set_validation(self, fid: int, verdict: str, head: str) -> None:
+    def set_validation(
+        self, fid: int, verdict: str, head: str,
+        reason: str = "", evidence: str = "",
+    ) -> None:
         """Record a validation result without changing the finding status."""
         self._conn.execute(
-            "UPDATE findings SET validation_verdict=?, validated_at_head=? WHERE id=?",
-            (verdict, head, fid),
+            "UPDATE findings SET validation_verdict=?, validated_at_head=?,"
+            " validation_reason=?, validation_evidence=? WHERE id=?",
+            (verdict, head, reason or "", evidence or "", fid),
         )
         self._conn.commit()
 

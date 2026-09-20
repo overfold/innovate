@@ -377,6 +377,7 @@ class TestFixFinding:
 
         with patch(f"{RUNNER_MODULE}.create_worktree", return_value=wt), \
              patch(f"{RUNNER_MODULE}.remove_worktree"), \
+             patch(f"{RUNNER_MODULE}.phase_validate", return_value="valid"), \
              patch(f"{RUNNER_MODULE}.phase_repair", return_value=True), \
              patch(f"{RUNNER_MODULE}.phase_verify", return_value=False):
 
@@ -401,6 +402,7 @@ class TestFixFinding:
 
         with patch(f"{RUNNER_MODULE}.create_worktree", return_value=wt), \
              patch(f"{RUNNER_MODULE}.remove_worktree"), \
+             patch(f"{RUNNER_MODULE}.phase_validate", return_value="valid"), \
              patch(f"{RUNNER_MODULE}.phase_repair", return_value=True), \
              patch(f"{RUNNER_MODULE}.phase_verify", return_value=False):
 
@@ -1702,16 +1704,15 @@ class TestPhaseValidate:
             result = phase_validate(cfg, f, ctr)
         assert result == "error"
 
-    def test_budget_exhausted_raises_codex_error(self, tmp_path):
+    def test_budget_exhausted_returns_deferred(self, tmp_path):
         from supervisor.phases import phase_validate
-        from supervisor.codex import CodexError
         cfg, f = self._cfg_and_finding(tmp_path)
         cfg["budget"]["codex_call_budget"] = 0
         ctr = {"codex_calls": 0, "consecutive_failures": 0}
         with patch("supervisor.phases.run_codex") as mock_run:
             result = phase_validate(cfg, f, ctr)
         mock_run.assert_not_called()
-        assert result == "error"
+        assert result == "deferred"
 
     def test_validate_does_not_propose_repair(self, tmp_path):
         """Validate uses audit_flags (read-only), not repair_flags."""
@@ -1727,6 +1728,26 @@ class TestPhaseValidate:
         with patch("supervisor.phases.run_codex", side_effect=capture_run):
             phase_validate(cfg, f, ctr)
         assert "--read-only" in captured_flags
+
+    def test_persists_reason_and_evidence_when_db_provided(self, tmp_path):
+        """When db is provided, phase_validate stores reason and evidence in the DB."""
+        from supervisor.phases import phase_validate
+        cfg, _ = self._cfg_and_finding(tmp_path)
+        db = _db()
+        f = _open_finding(db)
+        ctr = {"codex_calls": 0, "consecutive_failures": 0}
+        with patch("supervisor.phases.run_codex", return_value=""), \
+             patch("supervisor.phases.parse_json",
+                   return_value={"verdict": "valid", "reason": "confirmed bug",
+                                 "evidence": "line 99 is unguarded"}), \
+             patch("supervisor.phases.current_commit", return_value="abc1234"):
+            result = phase_validate(cfg, f, ctr, db=db)
+        assert result == "valid"
+        row = db.get_finding(f["id"])
+        assert row["validation_verdict"] == "valid"
+        assert row["validated_at_head"] == "abc1234"
+        assert row["validation_reason"] == "confirmed bug"
+        assert row["validation_evidence"] == "line 99 is unguarded"
 
 
 # ── validation state-machine tests (via _fix_finding) ─────────────────────────
@@ -1795,8 +1816,8 @@ class TestValidationStateMachine:
         assert db.get_finding(f["id"])["status"] == "blocked"
         assert "uncertain" in db.get_finding(f["id"])["reject_reason"]
 
-    def test_validation_error_blocked_fail_closed(self, tmp_path):
-        """Codex/parse/schema error during validation → blocked (fail-closed)."""
+    def test_validation_error_requeues_finding(self, tmp_path):
+        """Codex/parse/schema error during validation → open (retryable) + failure counter."""
         sup, db, f, wt = self._setup(tmp_path)
 
         with patch(f"{RUNNER_MODULE}.create_worktree", return_value=wt), \
@@ -1807,7 +1828,23 @@ class TestValidationStateMachine:
 
         assert result is False
         mock_repair.assert_not_called()
-        assert db.get_finding(f["id"])["status"] == "blocked"
+        assert db.get_finding(f["id"])["status"] == "open"
+        assert sup.ctr["consecutive_failures"] == 1
+
+    def test_validation_deferred_requeues_no_failure(self, tmp_path):
+        """Budget exhaustion during validation → open (retryable), no failure increment."""
+        sup, db, f, wt = self._setup(tmp_path)
+
+        with patch(f"{RUNNER_MODULE}.create_worktree", return_value=wt), \
+             patch(f"{RUNNER_MODULE}.remove_worktree"), \
+             patch(f"{RUNNER_MODULE}.phase_validate", return_value="deferred"), \
+             patch(f"{RUNNER_MODULE}.phase_repair") as mock_repair:
+            result = sup._fix_finding(db.get_finding(f["id"]), "abc1234")
+
+        assert result is False
+        mock_repair.assert_not_called()
+        assert db.get_finding(f["id"])["status"] == "open"
+        assert sup.ctr["consecutive_failures"] == 0
 
     def test_valid_cached_at_head_skips_codex(self, tmp_path):
         """Already validated as valid at current HEAD → phase_validate not called again."""
@@ -1941,24 +1978,29 @@ class TestValidationDB:
 
         assert result == "exhausted"
 
-    def test_set_validation_stores_verdict_and_head(self):
+    def test_set_validation_stores_verdict_head_reason_evidence(self):
         db = _db()
         f = _open_finding(db)
-        db.set_validation(f["id"], "valid", "abc1234")
+        db.set_validation(f["id"], "valid", "abc1234",
+                          reason="issue confirmed", evidence="line 42 shows bug")
         row = db.get_finding(f["id"])
         assert row["validation_verdict"] == "valid"
         assert row["validated_at_head"] == "abc1234"
+        assert row["validation_reason"] == "issue confirmed"
+        assert row["validation_evidence"] == "line 42 shows bug"
         assert row["status"] == "open"  # status unchanged
 
     def test_set_validation_overwrite(self):
         """set_validation can be called multiple times; last value wins."""
         db = _db()
         f = _open_finding(db)
-        db.set_validation(f["id"], "valid", "head1")
-        db.set_validation(f["id"], "uncertain", "head2")
+        db.set_validation(f["id"], "valid", "head1", reason="r1", evidence="e1")
+        db.set_validation(f["id"], "uncertain", "head2", reason="r2", evidence="e2")
         row = db.get_finding(f["id"])
         assert row["validation_verdict"] == "uncertain"
         assert row["validated_at_head"] == "head2"
+        assert row["validation_reason"] == "r2"
+        assert row["validation_evidence"] == "e2"
 
     def test_uncertain_finding_becomes_blocked_not_open(self):
         """Uncertain validation → blocked, not open."""
@@ -1971,15 +2013,19 @@ class TestValidationDB:
         assert len(db.blocked_findings()) == 1
 
     def test_reopened_invalid_finding_clears_validation_state(self):
-        """When an invalid finding is reopened at a new HEAD, validation state is wiped."""
+        """When an invalid finding is reopened at a new HEAD, all validation state is wiped."""
         db = _db()
         f = _open_finding(db, "clearedstate")
+        db.set_validation(f["id"], "invalid", "head1",
+                          reason="not a bug", evidence="code is guarded")
         db.mark_finding(f["id"], "invalid", head="head1")
 
         db.upsert_finding({**f, "fingerprint": self._fp(f), "commit_hash": "head2"})
         row = db.get_finding(f["id"])
         assert row["validation_verdict"] is None
         assert row["validated_at_head"] is None
+        assert row["validation_reason"] is None
+        assert row["validation_evidence"] is None
 
 
 # ── validation persistence / crash-restart ────────────────────────────────────

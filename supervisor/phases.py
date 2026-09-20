@@ -234,13 +234,19 @@ def phase_revalidate(cfg: dict, finding: dict, ctr: dict) -> str:
     return status
 
 
-def phase_validate(cfg: dict, finding: dict, ctr: dict) -> str:
+def phase_validate(cfg: dict, finding: dict, ctr: dict, *, db: DB | None = None) -> str:
     """Independently validate an audit finding at the exact audited HEAD.
 
     Uses a fresh Codex context.  Does NOT propose or implement any fix.
-    Returns 'valid' | 'invalid' | 'uncertain' | 'error'.
+    Returns 'valid' | 'invalid' | 'uncertain' | 'error' | 'deferred'.
 
-    Fail-closed: any Codex/schema/parse error returns 'error'.
+    'deferred' means the Codex call budget was exhausted; the caller should
+    requeue the finding for the next run without counting it as a failure.
+    'error' means any other Codex/schema/parse failure; fail-closed.
+
+    When *db* is provided the verdict, reason, and evidence are persisted via
+    db.set_validation before returning, so crash-restarts at the same HEAD
+    skip the Codex call and proceed directly to repair.
     """
     repo = Path(cfg["repo"]["path"]).resolve()
 
@@ -261,7 +267,13 @@ def phase_validate(cfg: dict, finding: dict, ctr: dict) -> str:
             output_schema=VALIDATE_SCHEMA,
         )
         result = parse_json(output)
-    except (CodexError, ValueError) as exc:
+    except CodexError as exc:
+        if "exhausted" in str(exc):
+            LOG.info("  Validation deferred — Codex call budget exhausted")
+            return "deferred"
+        LOG.warning("  Validation call failed: %s — fail-closed", exc)
+        return "error"
+    except ValueError as exc:
         LOG.warning("  Validation call failed: %s — fail-closed", exc)
         return "error"
 
@@ -270,13 +282,16 @@ def phase_validate(cfg: dict, finding: dict, ctr: dict) -> str:
         LOG.warning("  Validation returned unexpected verdict %r — fail-closed", verdict)
         return "error"
 
-    LOG.info(
-        "  Validation verdict: %s — %s",
-        verdict, result.get("reason", ""),
-    )
+    reason = result.get("reason", "")
     evidence = result.get("evidence", "")
+    LOG.info("  Validation verdict: %s — %s", verdict, reason)
     if evidence:
         LOG.info("  Evidence: %.200s", evidence)
+
+    if db is not None:
+        head = current_commit(repo)
+        db.set_validation(finding["id"], verdict, head, reason=reason, evidence=evidence)
+
     return verdict
 
 

@@ -277,7 +277,7 @@ class Supervisor:
             )
             if not already_valid:
                 LOG.info("  Validating finding at %s", current_head[:7])
-                val = phase_validate(wt_cfg, f, self.ctr)
+                val = phase_validate(wt_cfg, f, self.ctr, db=db)
                 if val == "invalid":
                     LOG.info(
                         "  Validation: invalid — finding disproved at %s",
@@ -285,20 +285,27 @@ class Supervisor:
                     )
                     db.mark_finding(f["id"], "invalid", head=current_head)
                     return False
-                elif val in ("uncertain", "error"):
-                    reason = (
-                        "validation uncertain — requires human review"
-                        if val == "uncertain"
-                        else "validation call failed — fail-closed"
-                    )
-                    LOG.warning("  Validation: %s — marking blocked", val)
+                elif val == "uncertain":
+                    LOG.warning("  Validation: uncertain — blocking for human review")
                     db.mark_finding(
                         f["id"], "blocked",
-                        pr_id=pr_id, reason=reason, head=current_head,
+                        pr_id=pr_id,
+                        reason="validation uncertain — requires human review",
+                        head=current_head,
                     )
                     return False
-                else:  # valid
-                    db.set_validation(f["id"], "valid", current_head)
+                elif val == "error":
+                    LOG.warning("  Validation call failed — requeueing finding")
+                    db.mark_finding(f["id"], "open")
+                    self.ctr["consecutive_failures"] += 1
+                    return False
+                elif val == "deferred":
+                    LOG.info(
+                        "  Validation deferred — Codex budget exhausted, requeueing"
+                    )
+                    db.mark_finding(f["id"], "open")
+                    return False
+                # else: valid — reason/evidence already persisted by phase_validate(db=db)
 
             # Repair.
             if not phase_repair(wt_cfg, db, [f], self.ctr):
