@@ -757,6 +757,66 @@ class TestGitHubAPIFailures:
 
         assert db.get_finding(f["id"])["status"] == "open"
 
+    def test_gh_close_pr_failure_leaves_in_progress_open_pr(self):
+        """If gh_close_pr raises during reconcile of an open PR, leave in_progress (fail-closed)."""
+        db = _db()
+        f = _open_finding(db)
+        pr_id = db.create_pr("maint/correctness/ts")
+        db.update_pr(pr_id, pr_number=9, pr_url="https://gh/9")
+        db.mark_finding(f["id"], "in_progress", pr_id=pr_id)
+
+        sup = Supervisor(_cfg(), db)
+        with patch(f"{RUNNER_MODULE}.gh_pr_state", return_value="open"), \
+             patch(f"{RUNNER_MODULE}.gh_close_pr",
+                   side_effect=GitHubAPIError("network failure")):
+            sup.startup_reconcile()
+
+        assert db.get_finding(f["id"])["status"] == "in_progress"
+
+    def test_gh_close_pr_failure_review_error_leaves_in_progress(self, tmp_path):
+        """If gh_close_pr fails after REVIEW_FAILED_ERROR, finding stays in_progress."""
+        sup, db, f, wt = TestFixFinding()._setup(tmp_path)
+
+        with patch(f"{RUNNER_MODULE}.create_worktree", return_value=wt), \
+             patch(f"{RUNNER_MODULE}.remove_worktree"), \
+             patch(f"{RUNNER_MODULE}.phase_repair", return_value=True), \
+             patch(f"{RUNNER_MODULE}.phase_verify", return_value=True), \
+             patch(f"{RUNNER_MODULE}.push_branch"), \
+             patch(f"{RUNNER_MODULE}.gh_create_pr",
+                   return_value=(10, "https://gh/10")), \
+             patch(f"{RUNNER_MODULE}.phase_review_loop",
+                   return_value=REVIEW_FAILED_ERROR), \
+             patch(f"{RUNNER_MODULE}.gh_close_pr",
+                   side_effect=GitHubAPIError("transient")):
+
+            result = sup._fix_finding(db.get_finding(f["id"]), "abc1234")
+
+        assert result is False
+        # Close failed → DB state must not advance; leave in_progress for reconcile
+        assert db.get_finding(f["id"])["status"] == "in_progress"
+        assert sup.ctr["consecutive_failures"] == 1
+
+    def test_gh_close_pr_failure_paused_budget_leaves_in_progress(self, tmp_path):
+        """If gh_close_pr fails after REVIEW_PAUSED_BUDGET, finding stays in_progress."""
+        sup, db, f, wt = TestFixFinding()._setup(tmp_path)
+
+        with patch(f"{RUNNER_MODULE}.create_worktree", return_value=wt), \
+             patch(f"{RUNNER_MODULE}.remove_worktree"), \
+             patch(f"{RUNNER_MODULE}.phase_repair", return_value=True), \
+             patch(f"{RUNNER_MODULE}.phase_verify", return_value=True), \
+             patch(f"{RUNNER_MODULE}.push_branch"), \
+             patch(f"{RUNNER_MODULE}.gh_create_pr",
+                   return_value=(12, "https://gh/12")), \
+             patch(f"{RUNNER_MODULE}.phase_review_loop",
+                   return_value=REVIEW_PAUSED_BUDGET), \
+             patch(f"{RUNNER_MODULE}.gh_close_pr",
+                   side_effect=GitHubAPIError("transient")):
+
+            result = sup._fix_finding(db.get_finding(f["id"]), "abc1234")
+
+        assert result is False
+        assert db.get_finding(f["id"])["status"] == "in_progress"
+
 
 # ── deferred reconciliation ───────────────────────────────────────────────────
 
@@ -791,6 +851,22 @@ class TestDeferredReconcile:
         mock_close.assert_not_called()
         assert db.get_finding(f["id"])["status"] == "open"
 
+    def test_gh_close_pr_failure_deferred_leaves_deferred(self):
+        """If gh_close_pr raises during deferred reconcile, finding stays deferred."""
+        db = _db()
+        f = _open_finding(db)
+        pr_id = db.create_pr("maint/correctness/deferred-branch")
+        db.update_pr(pr_id, pr_number=99, pr_url="https://gh/99")
+        db.mark_finding(f["id"], "deferred", pr_id=pr_id)
+
+        sup = Supervisor(_cfg(), db)
+        with patch(f"{RUNNER_MODULE}.gh_close_pr",
+                   side_effect=GitHubAPIError("network error")):
+            sup.startup_reconcile()
+
+        assert db.get_finding(f["id"])["status"] == "deferred"
+        assert db.get_pr(pr_id)["status"] == "open"  # DB not updated either
+
     def test_deferred_finding_not_in_open_findings_before_reconcile(self):
         """Verify deferred findings ARE returned by open_findings() (so the loop picks them up)."""
         db = _db()
@@ -808,7 +884,9 @@ class TestRunOnceReturnValues:
         """run_once returns 'blocked' (not 'exhausted') when blocked findings exist."""
         db = _db()
         f = _open_finding(db)
-        db.mark_finding(f["id"], "blocked", reason="rounds exhausted")
+        # head="abc1234" matches current_commit mock so stale-blocked revalidation
+        # skips this finding (blocked_at_head == head).
+        db.mark_finding(f["id"], "blocked", reason="rounds exhausted", head="abc1234")
 
         # Record enough clean audits to hit the streak threshold
         for _ in range(3):
@@ -854,6 +932,54 @@ class TestRunOnceReturnValues:
             result = sup.run_once()
 
         assert result == "budget"
+
+    def test_stale_blocked_finding_revalidated_stale(self):
+        """run_once marks a blocked finding stale when revalidation says it's gone."""
+        db = _db()
+        f = _open_finding(db)
+        # Blocked at old head — will be revalidated at "abc1234"
+        db.mark_finding(f["id"], "blocked", reason="rounds exhausted", head="oldhead")
+        for _ in range(3):
+            run_id = db.start_audit("correctness", "abc1234")
+            db.finish_audit(run_id, 0, 0)
+
+        sup = Supervisor(_cfg(), db)
+        sup.startup_reconcile = lambda: None
+        with patch(f"{RUNNER_MODULE}.create_audit_worktree") as mock_wt, \
+             patch(f"{RUNNER_MODULE}.remove_audit_worktree"), \
+             patch(f"{RUNNER_MODULE}.current_commit", return_value="abc1234"), \
+             patch(f"{RUNNER_MODULE}.phase_audit", return_value=0), \
+             patch(f"{RUNNER_MODULE}.phase_revalidate", return_value="stale"):
+            mock_wt.return_value = "/tmp/fake-wt"
+            result = sup.run_once()
+
+        assert result == "exhausted"
+        assert db.get_finding(f["id"])["status"] == "stale"
+
+    def test_stale_blocked_finding_still_present_refreshes_head(self):
+        """run_once keeps a finding blocked but updates blocked_at_head when revalidation says valid."""
+        db = _db()
+        f = _open_finding(db)
+        db.mark_finding(f["id"], "blocked", reason="rounds exhausted", head="oldhead")
+        # Enough clean audits so the area registers as exhausted.
+        for _ in range(3):
+            run_id = db.start_audit("correctness", "abc1234")
+            db.finish_audit(run_id, 0, 0)
+
+        sup = Supervisor(_cfg(), db)
+        sup.startup_reconcile = lambda: None
+        with patch(f"{RUNNER_MODULE}.create_audit_worktree") as mock_wt, \
+             patch(f"{RUNNER_MODULE}.remove_audit_worktree"), \
+             patch(f"{RUNNER_MODULE}.current_commit", return_value="abc1234"), \
+             patch(f"{RUNNER_MODULE}.phase_audit", return_value=0), \
+             patch(f"{RUNNER_MODULE}.phase_revalidate", return_value="valid"):
+            mock_wt.return_value = "/tmp/fake-wt"
+            result = sup.run_once()
+
+        assert result == "blocked"
+        row = db.get_finding(f["id"])
+        assert row["status"] == "blocked"
+        assert row["blocked_at_head"] == "abc1234"
 
     def test_merge_triggers_sweep_restart(self, tmp_path):
         """A successful fix+merge should cause a second pass (restart)."""
@@ -936,6 +1062,38 @@ class TestExhaustion:
 
         streak = db.clean_audit_streak("correctness", 3, "abc1234")
         assert streak == 3
+
+    def test_stale_blocked_findings_returns_different_head(self):
+        """stale_blocked_findings returns findings blocked at a different HEAD."""
+        db = _db()
+        f = _open_finding(db)
+        db.mark_finding(f["id"], "blocked", reason="rounds exhausted", head="oldhead")
+        rows = db.stale_blocked_findings("newhead")
+        assert len(rows) == 1
+        assert rows[0]["id"] == f["id"]
+
+    def test_stale_blocked_findings_excludes_same_head(self):
+        """stale_blocked_findings skips findings already validated at current HEAD."""
+        db = _db()
+        f = _open_finding(db)
+        db.mark_finding(f["id"], "blocked", reason="rounds exhausted", head="abc1234")
+        assert db.stale_blocked_findings("abc1234") == []
+
+    def test_stale_blocked_findings_includes_null_head(self):
+        """Findings blocked before blocked_at_head existed are treated as stale."""
+        db = _db()
+        f = _open_finding(db)
+        db.mark_finding(f["id"], "blocked", reason="rounds exhausted")  # no head
+        assert len(db.stale_blocked_findings("abc1234")) == 1
+
+    def test_refresh_blocked_head_updates_column(self):
+        db = _db()
+        f = _open_finding(db)
+        db.mark_finding(f["id"], "blocked", head="oldhead")
+        db.refresh_blocked_head(f["id"], "newhead")
+        row = db.get_finding(f["id"])
+        assert row["blocked_at_head"] == "newhead"
+        assert row["status"] == "blocked"
 
     def test_regression_resets_exhaustion(self):
         """A finding reopened after being fixed resets the exhaustion streak."""

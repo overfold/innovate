@@ -109,7 +109,14 @@ class Supervisor:
                     "  Closing deferred PR #%d for finding %d (%s)",
                     pr_row["pr_number"], finding["id"], finding["title"],
                 )
-                gh_close_pr(owner, repo_name, pr_row["pr_number"])
+                try:
+                    gh_close_pr(owner, repo_name, pr_row["pr_number"])
+                except GitHubAPIError as exc:
+                    LOG.warning(
+                        "  Failed to close PR #%d — leaving deferred: %s",
+                        pr_row["pr_number"], exc,
+                    )
+                    continue
                 db.update_pr(pr_row["id"], status="closed")
             db.mark_finding(finding["id"], "open")
 
@@ -185,7 +192,15 @@ class Supervisor:
                 db.update_pr(pr_row["id"], status="closed")
                 db.mark_finding(finding["id"], "open")
             else:  # open — close and requeue for a clean retry
-                gh_close_pr(owner, repo_name, pr_number)
+                try:
+                    gh_close_pr(owner, repo_name, pr_number)
+                except GitHubAPIError as exc:
+                    LOG.warning(
+                        "  Failed to close PR #%d — leaving in_progress"
+                        " for next reconcile: %s",
+                        pr_number, exc,
+                    )
+                    continue
                 db.update_pr(pr_row["id"], status="closed")
                 db.mark_finding(finding["id"], "open")
 
@@ -238,9 +253,17 @@ class Supervisor:
 
         wt_path = None
         try:
-            # Create a fresh, isolated worktree — crash-safe by construction.
-            wt_path = create_worktree(repo, branch, main)
-            wt_cfg = {**cfg, "repo": {**cfg["repo"], "path": str(wt_path)}}
+            # Create the repair worktree at the exact audited SHA so the diff
+            # base and the code under repair are always the same commit.
+            wt_path = create_worktree(repo, branch, current_head)
+            wt_cfg = {
+                **cfg,
+                "repo": {
+                    **cfg["repo"],
+                    "path": str(wt_path),
+                    "base_sha": current_head,  # pins verify_diff / review diffs
+                },
+            }
 
             # Repair.
             if not phase_repair(wt_cfg, db, [f], self.ctr):
@@ -288,7 +311,16 @@ class Supervisor:
 
             if outcome == REVIEW_FAILED_ERROR:
                 LOG.error("  Review loop failed — closing PR and re-queuing finding")
-                gh_close_pr(owner, repo_name, pr_number)
+                try:
+                    gh_close_pr(owner, repo_name, pr_number)
+                except GitHubAPIError as exc:
+                    LOG.error(
+                        "  Failed to close PR #%d: %s"
+                        " — leaving in_progress for startup_reconcile",
+                        pr_number, exc,
+                    )
+                    self.ctr["consecutive_failures"] += 1
+                    return False
                 db.update_pr(pr_id, status="closed")
                 db.mark_finding(f["id"], "open")
                 self.ctr["consecutive_failures"] += 1
@@ -307,8 +339,16 @@ class Supervisor:
                     "  Review rounds exhausted after %d rounds — marking blocked",
                     cfg["budget"]["max_review_rounds"],
                 )
+                try:
+                    gh_close_pr(owner, repo_name, pr_number)
+                except GitHubAPIError as exc:
+                    LOG.error(
+                        "  Failed to close PR #%d: %s"
+                        " — leaving in_progress for startup_reconcile",
+                        pr_number, exc,
+                    )
+                    return False
                 db.update_pr(pr_id, status="closed")
-                gh_close_pr(owner, repo_name, pr_number)
                 db.mark_finding(
                     f["id"], "blocked",
                     pr_id=pr_id,
@@ -316,6 +356,7 @@ class Supervisor:
                         f"review rounds exhausted after "
                         f"{cfg['budget']['max_review_rounds']} rounds"
                     ),
+                    head=current_head,
                 )
                 return False
 
@@ -451,6 +492,28 @@ class Supervisor:
 
                     if merged_this_pass:
                         break
+
+                # Revalidate blocked findings from an earlier HEAD.
+                # Skip when a merge happened this pass — the sweep will restart
+                # at a fresh HEAD and revalidate on that pass instead.
+                if not merged_this_pass:
+                    for finding in self.db.stale_blocked_findings(head):
+                        if self._over_budget():
+                            break
+                        rv = phase_revalidate(audit_cfg, dict(finding), self.ctr)
+                        if rv == "stale":
+                            LOG.info(
+                                "  Blocked finding no longer applies at %s — stale: %s",
+                                head[:7], finding["title"],
+                            )
+                            self.db.mark_finding(
+                                finding["id"], "stale",
+                                reason=f"no longer applies at HEAD {head[:7]}",
+                            )
+                        elif rv == "valid":
+                            self.db.refresh_blocked_head(finding["id"], head)
+                        else:  # error
+                            self.ctr["consecutive_failures"] += 1
 
             finally:
                 remove_audit_worktree(repo, audit_wt)

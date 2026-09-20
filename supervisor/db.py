@@ -10,25 +10,26 @@ _CONF_RANK = {"high": 0, "medium": 1, "low": 2}
 
 _SCHEMA = """
 CREATE TABLE IF NOT EXISTS findings (
-    id            INTEGER PRIMARY KEY,
-    fingerprint   TEXT    UNIQUE NOT NULL,
-    area          TEXT    NOT NULL,
-    severity      TEXT    NOT NULL,
-    confidence    TEXT    NOT NULL,
-    file_path     TEXT,
-    line_range    TEXT,
-    title         TEXT    NOT NULL,
-    description   TEXT    NOT NULL,
+    id              INTEGER PRIMARY KEY,
+    fingerprint     TEXT    UNIQUE NOT NULL,
+    area            TEXT    NOT NULL,
+    severity        TEXT    NOT NULL,
+    confidence      TEXT    NOT NULL,
+    file_path       TEXT,
+    line_range      TEXT,
+    title           TEXT    NOT NULL,
+    description     TEXT    NOT NULL,
     -- open | in_progress | fixed | rejected | stale | deferred | blocked
     -- 'deferred': per-run Codex budget hit; auto-resumes next run.
     -- 'blocked':  review rounds exhausted without convergence; not retried.
     -- 'stale':    finding no longer applies at current HEAD.
-    status        TEXT    NOT NULL DEFAULT 'open',
-    discovered    TEXT    NOT NULL DEFAULT (datetime('now')),
-    commit_hash   TEXT,
-    resolved      TEXT,
-    pr_id         INTEGER,
-    reject_reason TEXT
+    status          TEXT    NOT NULL DEFAULT 'open',
+    discovered      TEXT    NOT NULL DEFAULT (datetime('now')),
+    commit_hash     TEXT,
+    resolved        TEXT,
+    pr_id           INTEGER,
+    reject_reason   TEXT,
+    blocked_at_head TEXT    -- commit SHA where this finding was last confirmed blocked
 );
 
 CREATE TABLE IF NOT EXISTS audit_runs (
@@ -85,6 +86,14 @@ class DB:
         self._conn.row_factory = sqlite3.Row
         self._conn.executescript(_SCHEMA)
         self._conn.commit()
+        # Migration: add blocked_at_head for databases created before this column.
+        try:
+            self._conn.execute(
+                "ALTER TABLE findings ADD COLUMN blocked_at_head TEXT"
+            )
+            self._conn.commit()
+        except sqlite3.OperationalError:
+            pass  # column already exists
 
     # ── key/value state ──────────────────────────────────────────────────────
 
@@ -171,6 +180,15 @@ class DB:
             "SELECT * FROM findings WHERE status='blocked' ORDER BY id"
         ).fetchall()
 
+    def stale_blocked_findings(self, current_head: str) -> list[sqlite3.Row]:
+        """Return blocked findings recorded at a different (or unknown) HEAD."""
+        return self._conn.execute(
+            "SELECT * FROM findings WHERE status='blocked'"
+            " AND (blocked_at_head IS NULL OR blocked_at_head != ?)"
+            " ORDER BY id",
+            (current_head,),
+        ).fetchall()
+
     def deferred_findings(self) -> list[sqlite3.Row]:
         return self._conn.execute(
             "SELECT * FROM findings WHERE status='deferred' ORDER BY id"
@@ -187,12 +205,23 @@ class DB:
         status: str,
         pr_id: int | None = None,
         reason: str = "",
+        head: str | None = None,
     ) -> None:
+        blocked_at_head = head if status == "blocked" else None
         self._conn.execute(
             """UPDATE findings
-               SET status=?, resolved=datetime('now'), pr_id=?, reject_reason=?
+               SET status=?, resolved=datetime('now'), pr_id=?, reject_reason=?,
+                   blocked_at_head=?
                WHERE id=?""",
-            (status, pr_id, reason, fid),
+            (status, pr_id, reason, blocked_at_head, fid),
+        )
+        self._conn.commit()
+
+    def refresh_blocked_head(self, fid: int, head: str) -> None:
+        """Update blocked_at_head without touching any other finding fields."""
+        self._conn.execute(
+            "UPDATE findings SET blocked_at_head=? WHERE id=? AND status='blocked'",
+            (head, fid),
         )
         self._conn.commit()
 

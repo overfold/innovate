@@ -32,6 +32,20 @@ from .prompts import (
 
 LOG = logging.getLogger("supervisor")
 
+
+def _invoke_codex(cfg: dict, ctr: dict, prompt: str, repo: Path, **kwargs) -> str:
+    """Atomically check the budget, increment the call counter, and run Codex.
+
+    Raises CodexError if the per-run call budget is already exhausted, making
+    the budget a hard limit regardless of where the call originates.
+    """
+    budget = cfg["budget"]["codex_call_budget"]
+    if ctr["codex_calls"] >= budget:
+        raise CodexError(f"Codex call budget ({budget}) exhausted")
+    ctr["codex_calls"] += 1
+    return run_codex(prompt, repo, **kwargs)
+
+
 # Review-loop outcome constants returned by phase_review_loop.
 REVIEW_APPROVED        = "approved"
 REVIEW_FAILED_ERROR    = "failed_error"    # Codex call failed or parse error
@@ -57,14 +71,19 @@ def run_tests(cfg: dict) -> bool:
 
 
 def verify_diff(cfg: dict, findings: list, ctr: dict) -> bool:
-    """Codex diff-review of all changes relative to the default branch.
+    """Codex diff-review of all changes relative to the audited base SHA.
+
+    Uses cfg["repo"]["base_sha"] when set (the exact SHA audited this run)
+    so the diff is pinned to the same commit the finding was found at, not a
+    potentially-stale local branch ref.  Falls back to default_branch for
+    contexts that do not set base_sha (e.g. manual phase_verify calls).
 
     Fail-closed: any Codex error or parse failure returns False.
     The default verdict when the field is absent is 'reject', not 'approve'.
     """
     repo = Path(cfg["repo"]["path"]).resolve()
-    main = cfg["repo"]["default_branch"]
-    diff = full_diff(repo, main)
+    base = cfg["repo"].get("base_sha") or cfg["repo"]["default_branch"]
+    diff = full_diff(repo, base)
     if not diff.strip():
         LOG.error("  Diff is empty — nothing to verify")
         return False
@@ -75,9 +94,8 @@ def verify_diff(cfg: dict, findings: list, ctr: dict) -> bool:
         diff=diff[:10_000],
     )
     try:
-        ctr["codex_calls"] += 1
-        output = run_codex(
-            prompt, repo,
+        output = _invoke_codex(
+            cfg, ctr, prompt, repo,
             flags=cfg["codex"]["audit_flags"],
             cmd=cfg["codex"]["cmd"],
             model=cfg["codex"]["model"],
@@ -112,9 +130,8 @@ def phase_audit(cfg: dict, db: DB, area: dict, ctr: dict) -> int:
     LOG.info("Auditing %-20s @ %s", area["name"], commit[:7])
 
     try:
-        ctr["codex_calls"] += 1
-        output = run_codex(
-            prompt, repo,
+        output = _invoke_codex(
+            cfg, ctr, prompt, repo,
             flags=cfg["codex"]["audit_flags"],
             cmd=cfg["codex"]["cmd"],
             model=cfg["codex"]["model"],
@@ -195,9 +212,8 @@ def phase_revalidate(cfg: dict, finding: dict, ctr: dict) -> str:
         description=finding["description"],
     )
     try:
-        ctr["codex_calls"] += 1
-        output = run_codex(
-            prompt, repo,
+        output = _invoke_codex(
+            cfg, ctr, prompt, repo,
             flags=cfg["codex"]["audit_flags"],
             cmd=cfg["codex"]["cmd"],
             model=cfg["codex"]["model"],
@@ -236,9 +252,8 @@ def phase_repair(cfg: dict, db: DB, findings: list, ctr: dict) -> bool:
         )
         LOG.info("  Repairing: %s", f["title"])
         try:
-            ctr["codex_calls"] += 1
-            run_codex(
-                prompt, repo,
+            _invoke_codex(
+                cfg, ctr, prompt, repo,
                 flags=cfg["codex"]["repair_flags"],
                 cmd=cfg["codex"]["cmd"],
                 model=cfg["codex"]["model"],
@@ -294,7 +309,7 @@ def phase_review_loop(
     PR and re-queue the finding.
     """
     repo = Path(cfg["repo"]["path"]).resolve()
-    main = cfg["repo"]["default_branch"]
+    base = cfg["repo"].get("base_sha") or cfg["repo"]["default_branch"]
     max_rounds = cfg["budget"]["max_review_rounds"]
     finding_titles = "; ".join(f["title"] for f in findings)
     pr_title = f"maint: {finding_titles[:60]}"
@@ -312,16 +327,15 @@ def phase_review_loop(
             db.update_pr(pr_id, review_rounds=rnd - 1)
             return REVIEW_DEFERRED_BUDGET
 
-        diff = full_diff(repo, main)
+        diff = full_diff(repo, base)
         prompt = REVIEW_PROMPT.format(
             pr_title=pr_title,
             finding_titles=finding_titles,
             diff=diff[:10_000],
         )
         try:
-            ctr["codex_calls"] += 1
-            output = run_codex(
-                prompt, repo,
+            output = _invoke_codex(
+                cfg, ctr, prompt, repo,
                 flags=cfg["codex"]["audit_flags"],
                 cmd=cfg["codex"]["cmd"],
                 model=cfg["codex"]["model"],
@@ -366,9 +380,8 @@ def phase_review_loop(
             return REVIEW_DEFERRED_BUDGET
 
         try:
-            ctr["codex_calls"] += 1
-            run_codex(
-                impl_prompt, repo,
+            _invoke_codex(
+                cfg, ctr, impl_prompt, repo,
                 flags=cfg["codex"]["repair_flags"],
                 cmd=cfg["codex"]["cmd"],
                 model=cfg["codex"]["model"],
@@ -379,7 +392,7 @@ def phase_review_loop(
             db.update_pr(pr_id, review_rounds=rnd)
             return REVIEW_FAILED_ERROR
 
-        if full_diff(repo, main) == prev_diff:
+        if full_diff(repo, base) == prev_diff:
             LOG.warning("  Review feedback produced no changes — fail-closed")
             db.update_pr(pr_id, review_rounds=rnd)
             return REVIEW_FAILED_ERROR
