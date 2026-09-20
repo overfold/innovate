@@ -17,7 +17,6 @@ from .codex import (
 from .db import DB, _fingerprint
 from .git import (
     _git,
-    create_branch,
     current_commit,
     full_diff,
     push_branch,
@@ -34,9 +33,10 @@ from .prompts import (
 LOG = logging.getLogger("supervisor")
 
 # Review-loop outcome constants returned by phase_review_loop.
-REVIEW_APPROVED      = "approved"
-REVIEW_FAILED_ERROR  = "failed_error"   # Codex call failed or parse error
-REVIEW_PAUSED_BUDGET = "paused_budget"  # Rounds exhausted without approval
+REVIEW_APPROVED        = "approved"
+REVIEW_FAILED_ERROR    = "failed_error"    # Codex call failed or parse error
+REVIEW_PAUSED_BUDGET   = "paused_budget"   # Review rounds exhausted (blocked)
+REVIEW_DEFERRED_BUDGET = "deferred_budget" # Per-run Codex budget hit; resume next run
 
 
 # ── Shared verify helpers ──────────────────────────────────────────────────────
@@ -216,25 +216,14 @@ def phase_revalidate(cfg: dict, finding: dict, ctr: dict) -> str:
     return status
 
 
-def phase_repair(
-    cfg: dict, db: DB, findings: list, ctr: dict
-) -> tuple[bool, str]:
-    """Apply fixes on a new branch.  Returns (success, branch_name).
+def phase_repair(cfg: dict, db: DB, findings: list, ctr: dict) -> bool:
+    """Apply fixes inside the current worktree checkout.
 
-    On failure the repo is restored to the default branch and '' is returned.
+    The caller is responsible for creating the worktree/branch and for
+    cleaning it up on failure. Returns True if changes were committed.
     """
     repo = Path(cfg["repo"]["path"]).resolve()
-    main = cfg["repo"]["default_branch"]
     area = findings[0]["area"]
-    ts = datetime.now(timezone.utc).strftime("%Y%m%d-%H%M%S")
-    branch = f"maint/{area}/{ts}"
-
-    try:
-        create_branch(repo, branch, main)
-    except subprocess.CalledProcessError as exc:
-        LOG.error("Cannot create branch %s: %s", branch, exc)
-        return False, ""
-
     base = current_commit(repo)
 
     for f in findings:
@@ -258,18 +247,14 @@ def phase_repair(
         except CodexError as exc:
             LOG.error("  Repair failed: %s", exc)
             ctr["consecutive_failures"] += 1
-            _git(repo, "checkout", main, check=False)
-            _git(repo, "branch", "-D", branch, check=False)
-            return False, ""
+            return False
 
     diff = full_diff(repo, base)
     if not diff.strip():
         LOG.warning("  Repair produced no file changes — skipping")
-        _git(repo, "checkout", main, check=False)
-        _git(repo, "branch", "-D", branch, check=False)
         for f in findings:
             db.mark_finding(f["id"], "rejected", reason="repair produced no changes")
-        return False, ""
+        return False
 
     titles = "; ".join(f["title"] for f in findings)
     commit_msg = f"maint({area}): {titles[:72]}"
@@ -280,7 +265,7 @@ def phase_repair(
     _git(repo, "commit", "-m", commit_msg)
 
     ctr["consecutive_failures"] = 0
-    return True, branch
+    return True
 
 
 def phase_verify(cfg: dict, findings: list, ctr: dict) -> bool:
@@ -321,11 +306,11 @@ def phase_review_loop(
 
         if ctr["codex_calls"] >= codex_budget:
             LOG.warning(
-                "  Codex call budget (%d) reached — pausing PR for human review",
+                "  Codex call budget (%d) reached — deferring to next run",
                 codex_budget,
             )
             db.update_pr(pr_id, review_rounds=rnd - 1)
-            return REVIEW_PAUSED_BUDGET
+            return REVIEW_DEFERRED_BUDGET
 
         diff = full_diff(repo, main)
         prompt = REVIEW_PROMPT.format(
@@ -374,11 +359,11 @@ def phase_review_loop(
         if ctr["codex_calls"] >= codex_budget:
             LOG.warning(
                 "  Codex call budget (%d) reached before implementing feedback"
-                " — pausing PR for human review",
+                " — deferring to next run",
                 codex_budget,
             )
             db.update_pr(pr_id, review_rounds=rnd)
-            return REVIEW_PAUSED_BUDGET
+            return REVIEW_DEFERRED_BUDGET
 
         try:
             ctr["codex_calls"] += 1
