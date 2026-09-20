@@ -1,0 +1,385 @@
+from __future__ import annotations
+
+import logging
+import subprocess
+from datetime import datetime, timezone
+from pathlib import Path
+
+from .codex import CodexError, extract_json, run_codex
+from .db import DB, _fingerprint
+from .git import (
+    _git,
+    create_branch,
+    current_commit,
+    full_diff,
+    push_branch,
+)
+from .prompts import (
+    AUDIT_PROMPT,
+    IMPLEMENT_REVIEW_PROMPT,
+    REPAIR_PROMPT,
+    REVALIDATE_PROMPT,
+    REVIEW_PROMPT,
+    VERIFY_PROMPT,
+)
+
+LOG = logging.getLogger("supervisor")
+
+# Review-loop outcome constants returned by phase_review_loop.
+REVIEW_APPROVED      = "approved"
+REVIEW_FAILED_ERROR  = "failed_error"   # Codex call failed or parse error
+REVIEW_PAUSED_BUDGET = "paused_budget"  # Rounds exhausted without approval
+
+
+# ── Shared verify helpers ──────────────────────────────────────────────────────
+
+def run_tests(cfg: dict) -> bool:
+    """Run the configured test command.  Returns True if it passes (or not set)."""
+    test_cmd = cfg["verify"]["test_cmd"]
+    if not test_cmd:
+        return True
+    repo = Path(cfg["repo"]["path"]).resolve()
+    LOG.info("  Running: %s", test_cmd)
+    r = subprocess.run(
+        test_cmd, shell=True, cwd=str(repo), capture_output=True, text=True
+    )
+    if r.returncode != 0:
+        LOG.error("  Tests failed:\n%s", (r.stdout + r.stderr)[-1200:])
+    return r.returncode == 0
+
+
+def verify_diff(cfg: dict, findings: list, ctr: dict) -> bool:
+    """Codex diff-review of all changes relative to the default branch.
+
+    Fail-closed: any Codex error or parse failure returns False.
+    The default verdict when the field is absent is 'reject', not 'approve'.
+    """
+    repo = Path(cfg["repo"]["path"]).resolve()
+    main = cfg["repo"]["default_branch"]
+    diff = full_diff(repo, main)
+    if not diff.strip():
+        LOG.error("  Diff is empty — nothing to verify")
+        return False
+
+    prompt = VERIFY_PROMPT.format(
+        title=findings[0]["title"],
+        description="\n".join(f["description"] for f in findings),
+        diff=diff[:10_000],
+    )
+    try:
+        ctr["codex_calls"] += 1
+        output = run_codex(
+            prompt, repo,
+            flags=cfg["codex"]["audit_flags"],
+            cmd=cfg["codex"]["cmd"],
+            model=cfg["codex"]["model"],
+            timeout=cfg["codex"]["timeout"],
+        )
+        result = extract_json(output)
+    except (CodexError, ValueError) as exc:
+        LOG.error(
+            "  Diff verification failed: %s — treating as rejected (fail-closed)", exc
+        )
+        return False
+
+    verdict = result.get("verdict", "reject")  # safe default: reject
+    LOG.info("  Verify verdict: %s — %s", verdict, result.get("reason", ""))
+    if verdict != "approve":
+        for issue in result.get("issues", []):
+            LOG.warning("    Issue: %s", issue)
+        return False
+    return True
+
+
+# ── Lifecycle phases ───────────────────────────────────────────────────────────
+
+def phase_audit(cfg: dict, db: DB, area: dict, ctr: dict) -> int:
+    """Run a scoped Codex audit for *area*.  Returns count of new findings stored."""
+    repo = Path(cfg["repo"]["path"]).resolve()
+    commit = current_commit(repo)
+    run_id = db.start_audit(area["name"], commit)
+
+    prompt = AUDIT_PROMPT.format(area=area["name"], description=area["description"])
+    LOG.info("Auditing %-20s @ %s", area["name"], commit[:7])
+
+    try:
+        ctr["codex_calls"] += 1
+        output = run_codex(
+            prompt, repo,
+            flags=cfg["codex"]["audit_flags"],
+            cmd=cfg["codex"]["cmd"],
+            model=cfg["codex"]["model"],
+            timeout=cfg["codex"]["timeout"],
+        )
+        raw_findings = extract_json(output)
+    except (CodexError, ValueError) as exc:
+        LOG.error("Audit failed for %s: %s", area["name"], exc)
+        db.finish_audit(run_id, 0, 0, "failed")
+        ctr["consecutive_failures"] += 1
+        return 0
+
+    if not isinstance(raw_findings, list):
+        raw_findings = []
+
+    new_count = 0
+    for raw in raw_findings:
+        try:
+            fp = _fingerprint(area["name"], raw.get("file_path"), raw["title"])
+            finding = {
+                "fingerprint": fp,
+                "area": area["name"],
+                "severity": raw.get("severity", "low"),
+                "confidence": raw.get("confidence", "medium"),
+                "file_path": raw.get("file_path"),
+                "line_range": raw.get("line_range"),
+                "title": str(raw["title"]),
+                "description": str(raw.get("description", "")),
+                "commit_hash": commit,
+            }
+            _, is_new = db.upsert_finding(finding)
+            if is_new:
+                new_count += 1
+                LOG.info(
+                    "  [%s/%s] %s",
+                    finding["severity"], finding["confidence"], finding["title"],
+                )
+        except (KeyError, TypeError) as exc:
+            LOG.warning("  Skipping malformed finding: %s", exc)
+
+    db.finish_audit(run_id, new_count, len(raw_findings))
+    LOG.info("Audit %s: %d new (%d total)", area["name"], new_count, len(raw_findings))
+    ctr["consecutive_failures"] = 0
+    return new_count
+
+
+def phase_revalidate(cfg: dict, finding: dict, ctr: dict) -> str:
+    """Check whether a queued finding still applies at the current HEAD.
+
+    Returns 'valid' | 'stale' | 'error'.
+
+    'error' means the revalidation call itself failed; the caller should skip
+    this finding for the current run and increment consecutive_failures.
+    """
+    repo = Path(cfg["repo"]["path"]).resolve()
+
+    if finding.get("file_path"):
+        fp = repo / finding["file_path"]
+        if not fp.exists():
+            LOG.info(
+                "  File no longer exists (%s) — marking stale", finding["file_path"]
+            )
+            return "stale"
+
+    prompt = REVALIDATE_PROMPT.format(
+        area=finding["area"],
+        title=finding["title"],
+        file_path=finding["file_path"] or "(no specific file)",
+        line_range=finding["line_range"] or "(no specific lines)",
+        description=finding["description"],
+    )
+    try:
+        ctr["codex_calls"] += 1
+        output = run_codex(
+            prompt, repo,
+            flags=cfg["codex"]["audit_flags"],
+            cmd=cfg["codex"]["cmd"],
+            model=cfg["codex"]["model"],
+            timeout=cfg["codex"]["timeout"],
+        )
+        result = extract_json(output)
+    except (CodexError, ValueError) as exc:
+        LOG.warning("  Revalidation call failed: %s", exc)
+        return "error"
+
+    still_applies = result.get("still_applies", True)  # conservative default
+    reason = result.get("reason", "")
+    status = "valid" if still_applies else "stale"
+    LOG.info("  Revalidation: %s — %s", status, reason)
+    return status
+
+
+def phase_repair(
+    cfg: dict, db: DB, findings: list, ctr: dict
+) -> tuple[bool, str]:
+    """Apply fixes on a new branch.  Returns (success, branch_name).
+
+    On failure the repo is restored to the default branch and '' is returned.
+    """
+    repo = Path(cfg["repo"]["path"]).resolve()
+    main = cfg["repo"]["default_branch"]
+    area = findings[0]["area"]
+    ts = datetime.now(timezone.utc).strftime("%Y%m%d-%H%M%S")
+    branch = f"maint/{area}/{ts}"
+
+    try:
+        create_branch(repo, branch, main)
+    except subprocess.CalledProcessError as exc:
+        LOG.error("Cannot create branch %s: %s", branch, exc)
+        return False, ""
+
+    base = current_commit(repo)
+
+    for f in findings:
+        prompt = REPAIR_PROMPT.format(
+            title=f["title"],
+            severity=f["severity"],
+            file_path=f["file_path"] or "(unknown)",
+            line_range=f["line_range"] or "(unknown)",
+            description=f["description"],
+        )
+        LOG.info("  Repairing: %s", f["title"])
+        try:
+            ctr["codex_calls"] += 1
+            run_codex(
+                prompt, repo,
+                flags=cfg["codex"]["repair_flags"],
+                cmd=cfg["codex"]["cmd"],
+                model=cfg["codex"]["model"],
+                timeout=cfg["codex"]["timeout"],
+            )
+        except CodexError as exc:
+            LOG.error("  Repair failed: %s", exc)
+            ctr["consecutive_failures"] += 1
+            _git(repo, "checkout", main, check=False)
+            _git(repo, "branch", "-D", branch, check=False)
+            return False, ""
+
+    diff = full_diff(repo, base)
+    if not diff.strip():
+        LOG.warning("  Repair produced no file changes — skipping")
+        _git(repo, "checkout", main, check=False)
+        _git(repo, "branch", "-D", branch, check=False)
+        for f in findings:
+            db.mark_finding(f["id"], "rejected", reason="repair produced no changes")
+        return False, ""
+
+    titles = "; ".join(f["title"] for f in findings)
+    commit_msg = f"maint({area}): {titles[:72]}"
+    trailer = cfg["repo"].get("commit_trailer", "")
+    if trailer:
+        commit_msg += f"\n\n{trailer}"
+    _git(repo, "add", "-A")
+    _git(repo, "commit", "-m", commit_msg)
+
+    ctr["consecutive_failures"] = 0
+    return True, branch
+
+
+def phase_verify(cfg: dict, findings: list, ctr: dict) -> bool:
+    """Run test suite + Codex diff-review.  Fail-closed on any error."""
+    return run_tests(cfg) and verify_diff(cfg, findings, ctr)
+
+
+def phase_review_loop(
+    cfg: dict,
+    db: DB,
+    pr_id: int,
+    findings: list,
+    branch: str,
+    ctr: dict,
+) -> str:
+    """Review the PR with Codex, implement blocking feedback, re-verify, repeat.
+
+    Full loop per round:
+        review → implement feedback → tests → diff-verify → push → review again
+
+    Returns REVIEW_APPROVED, REVIEW_FAILED_ERROR, or REVIEW_PAUSED_BUDGET.
+
+    REVIEW_PAUSED_BUDGET means rounds were exhausted without approval; the PR
+    is left open for human inspection.
+    REVIEW_FAILED_ERROR means a Codex call failed; the caller should close the
+    PR and re-queue the finding.
+    """
+    repo = Path(cfg["repo"]["path"]).resolve()
+    main = cfg["repo"]["default_branch"]
+    max_rounds = cfg["budget"]["max_review_rounds"]
+    finding_titles = "; ".join(f["title"] for f in findings)
+    pr_title = f"maint: {finding_titles[:60]}"
+
+    for rnd in range(1, max_rounds + 1):
+        LOG.info("  Review round %d/%d", rnd, max_rounds)
+
+        diff = full_diff(repo, main)
+        prompt = REVIEW_PROMPT.format(
+            pr_title=pr_title,
+            finding_titles=finding_titles,
+            diff=diff[:10_000],
+        )
+        try:
+            ctr["codex_calls"] += 1
+            output = run_codex(
+                prompt, repo,
+                flags=cfg["codex"]["audit_flags"],
+                cmd=cfg["codex"]["cmd"],
+                model=cfg["codex"]["model"],
+                timeout=cfg["codex"]["timeout"],
+            )
+            review = extract_json(output)
+        except (CodexError, ValueError) as exc:
+            LOG.error("  Review call failed: %s — fail-closed", exc)
+            db.update_pr(pr_id, review_rounds=rnd)
+            return REVIEW_FAILED_ERROR
+
+        # Default to request_changes, not approve (fail-closed).
+        verdict = review.get("verdict", "request_changes")
+        LOG.info("  Review verdict: %s — %s", verdict, review.get("summary", ""))
+
+        blocking = [
+            c for c in review.get("comments", [])
+            if c.get("severity") == "blocking"
+        ]
+
+        if verdict == "approve" and not blocking:
+            db.update_pr(pr_id, review_rounds=rnd)
+            return REVIEW_APPROVED
+
+        for c in blocking:
+            LOG.info("  Blocking: [%s] %s", c.get("file", "general"), c["description"])
+
+        comments_text = "\n".join(
+            f"- [{c.get('file', 'general')}] {c['description']}" for c in blocking
+        )
+        impl_prompt = IMPLEMENT_REVIEW_PROMPT.format(comments=comments_text)
+        prev_diff = diff
+
+        try:
+            ctr["codex_calls"] += 1
+            run_codex(
+                impl_prompt, repo,
+                flags=cfg["codex"]["repair_flags"],
+                cmd=cfg["codex"]["cmd"],
+                model=cfg["codex"]["model"],
+                timeout=cfg["codex"]["timeout"],
+            )
+        except CodexError as exc:
+            LOG.error("  Failed to implement review feedback: %s", exc)
+            db.update_pr(pr_id, review_rounds=rnd)
+            return REVIEW_FAILED_ERROR
+
+        if full_diff(repo, main) == prev_diff:
+            LOG.warning("  Review feedback produced no changes — fail-closed")
+            db.update_pr(pr_id, review_rounds=rnd)
+            return REVIEW_FAILED_ERROR
+
+        commit_msg = f"maint: address review feedback (round {rnd})"
+        trailer = cfg["repo"].get("commit_trailer", "")
+        if trailer:
+            commit_msg += f"\n\n{trailer}"
+        _git(repo, "add", "-A")
+        _git(repo, "commit", "-m", commit_msg)
+
+        if not run_tests(cfg):
+            LOG.error("  Tests failed after applying review feedback")
+            db.update_pr(pr_id, review_rounds=rnd)
+            return REVIEW_FAILED_ERROR
+
+        if not verify_diff(cfg, findings, ctr):
+            LOG.error("  Diff verification rejected after applying review feedback")
+            db.update_pr(pr_id, review_rounds=rnd)
+            return REVIEW_FAILED_ERROR
+
+        push_branch(repo, branch)
+
+    db.update_pr(pr_id, review_rounds=max_rounds)
+    LOG.warning("  Review round budget (%d) exhausted without approval", max_rounds)
+    return REVIEW_PAUSED_BUDGET
