@@ -88,6 +88,12 @@ max_consecutive_failures = 5
 # Total Codex CLI invocations allowed per run.
 codex_call_budget = 100
 
+# Maximum no-change repair attempts before a finding is escalated to "blocked"
+# and removed from the automatic queue for human review.  The counter persists
+# across HEAD changes so that a finding which regresses repeatedly cannot loop
+# forever; it resets only when the finding is genuinely fixed or goes stale.
+max_repair_attempts = 3
+
 
 # ── Audit areas ────────────────────────────────────────────────────────────────
 # Each [[audit_areas]] block defines one scoped audit that Codex will run.

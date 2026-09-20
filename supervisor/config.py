@@ -32,6 +32,7 @@ DEFAULT_CONFIG: dict[str, Any] = {
         "max_review_rounds": 4,
         "max_consecutive_failures": 5,
         "codex_call_budget": 100,
+        "max_repair_attempts": 3,
     },
     "audit_areas": [
         {

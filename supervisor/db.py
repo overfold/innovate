@@ -29,7 +29,9 @@ CREATE TABLE IF NOT EXISTS findings (
     resolved        TEXT,
     pr_id           INTEGER,
     reject_reason   TEXT,
-    blocked_at_head TEXT    -- commit SHA where this finding was last confirmed blocked
+    blocked_at_head  TEXT,   -- commit SHA where this finding was last confirmed blocked
+    rejected_at_head TEXT,   -- commit SHA where repair last produced no changes
+    repair_attempts  INTEGER NOT NULL DEFAULT 0
 );
 
 CREATE TABLE IF NOT EXISTS audit_runs (
@@ -86,14 +88,18 @@ class DB:
         self._conn.row_factory = sqlite3.Row
         self._conn.executescript(_SCHEMA)
         self._conn.commit()
-        # Migration: add blocked_at_head for databases created before this column.
-        try:
-            self._conn.execute(
-                "ALTER TABLE findings ADD COLUMN blocked_at_head TEXT"
-            )
-            self._conn.commit()
-        except sqlite3.OperationalError:
-            pass  # column already exists
+        # Migrations for columns added after the initial schema.
+        for _migration in [
+            "ALTER TABLE findings ADD COLUMN blocked_at_head TEXT",
+            "ALTER TABLE findings ADD COLUMN rejected_at_head TEXT",
+            "ALTER TABLE findings ADD COLUMN repair_attempts INTEGER NOT NULL DEFAULT 0",
+        ]:
+            try:
+                self._conn.execute(_migration)
+                self._conn.commit()
+            except sqlite3.OperationalError as exc:
+                if "duplicate column name" not in str(exc):
+                    raise
 
     # ── key/value state ──────────────────────────────────────────────────────
 
@@ -120,30 +126,57 @@ class DB:
         open, in_progress, or paused are left untouched.
         """
         row = self._conn.execute(
-            "SELECT id, status FROM findings WHERE fingerprint=?", (f["fingerprint"],)
+            "SELECT id, status, rejected_at_head FROM findings WHERE fingerprint=?",
+            (f["fingerprint"],),
         ).fetchone()
         if row:
-            if row["status"] in ("fixed", "stale", "rejected"):
+            was_rejected = row["status"] == "rejected"
+            if was_rejected:
+                # Rejection is terminal for that HEAD: only reopen once HEAD changes.
+                rah = row["rejected_at_head"]
+                fch = f.get("commit_hash")
+                if rah and fch and rah == fch:
+                    return row["id"], False  # same HEAD — leave rejected
+                # Different (or unknown) HEAD: fall through to reopen below.
+            elif row["status"] not in ("fixed", "stale"):
+                return row["id"], False
+            # Reopen: fixed/stale regression, or rejected finding at a new HEAD.
+            common_args = (
+                f.get("commit_hash"),
+                f.get("severity"),
+                f.get("confidence"),
+                f.get("file_path"),
+                f.get("line_range"),
+                f.get("description"),
+                row["id"],
+            )
+            if was_rejected:
+                # Preserve repair_attempts: HEAD changed but the counter accumulates
+                # across HEADs so the blocked cap is eventually reachable.
                 self._conn.execute(
                     """UPDATE findings
                        SET status='open', resolved=NULL, pr_id=NULL,
                            reject_reason=NULL, commit_hash=?,
                            severity=?, confidence=?, file_path=?,
-                           line_range=?, description=?
+                           line_range=?, description=?,
+                           rejected_at_head=NULL
                        WHERE id=?""",
-                    (
-                        f.get("commit_hash"),
-                        f.get("severity"),
-                        f.get("confidence"),
-                        f.get("file_path"),
-                        f.get("line_range"),
-                        f.get("description"),
-                        row["id"],
-                    ),
+                    common_args,
                 )
-                self._conn.commit()
-                return row["id"], True
-            return row["id"], False
+            else:
+                # Genuine fixed/stale regression: fresh repair slate.
+                self._conn.execute(
+                    """UPDATE findings
+                       SET status='open', resolved=NULL, pr_id=NULL,
+                           reject_reason=NULL, commit_hash=?,
+                           severity=?, confidence=?, file_path=?,
+                           line_range=?, description=?,
+                           rejected_at_head=NULL, repair_attempts=0
+                       WHERE id=?""",
+                    common_args,
+                )
+            self._conn.commit()
+            return row["id"], True
         cur = self._conn.execute(
             """INSERT INTO findings
                (fingerprint, area, severity, confidence, file_path, line_range,
@@ -180,6 +213,14 @@ class DB:
             "SELECT * FROM findings WHERE status='blocked' ORDER BY id"
         ).fetchall()
 
+    def rejected_at_head_findings(self, head: str) -> list[sqlite3.Row]:
+        """Return findings rejected at exactly *head* — unresolvable until HEAD changes."""
+        return self._conn.execute(
+            "SELECT * FROM findings WHERE status='rejected' AND rejected_at_head=?"
+            " ORDER BY id",
+            (head,),
+        ).fetchall()
+
     def stale_blocked_findings(self, current_head: str) -> list[sqlite3.Row]:
         """Return blocked findings recorded at a different (or unknown) HEAD."""
         return self._conn.execute(
@@ -207,14 +248,31 @@ class DB:
         reason: str = "",
         head: str | None = None,
     ) -> None:
-        blocked_at_head = head if status == "blocked" else None
-        self._conn.execute(
-            """UPDATE findings
-               SET status=?, resolved=datetime('now'), pr_id=?, reject_reason=?,
-                   blocked_at_head=?
-               WHERE id=?""",
-            (status, pr_id, reason, blocked_at_head, fid),
-        )
+        if status == "rejected":
+            self._conn.execute(
+                """UPDATE findings
+                   SET status=?, resolved=datetime('now'), pr_id=?, reject_reason=?,
+                       blocked_at_head=NULL, rejected_at_head=?,
+                       repair_attempts=repair_attempts + 1
+                   WHERE id=?""",
+                (status, pr_id, reason, head, fid),
+            )
+        elif status == "blocked":
+            self._conn.execute(
+                """UPDATE findings
+                   SET status=?, resolved=datetime('now'), pr_id=?, reject_reason=?,
+                       blocked_at_head=?
+                   WHERE id=?""",
+                (status, pr_id, reason, head, fid),
+            )
+        else:
+            self._conn.execute(
+                """UPDATE findings
+                   SET status=?, resolved=datetime('now'), pr_id=?, reject_reason=?,
+                       blocked_at_head=NULL
+                   WHERE id=?""",
+                (status, pr_id, reason, fid),
+            )
         self._conn.commit()
 
     def refresh_blocked_head(self, fid: int, head: str) -> None:
@@ -276,11 +334,12 @@ class DB:
         ).fetchone()
 
     def clean_audit_streak(self, area: str, window: int, current_head: str) -> int:
-        """Count recent clean audits (total_found == 0) for *area* at *current_head*.
+        """Count recent audits with no new findings for *area* at *current_head*.
 
-        An area is not exhausted while any finding for it is open, in_progress,
-        or paused.  All audits counted must be at exactly *current_head*: audits
-        from older commits do not contribute to the streak.
+        A finding rejected at the current HEAD is terminal for that HEAD and
+        does not block the streak.  Only open, in_progress, or deferred findings
+        (all of which are actively being worked or queued) block the streak.
+        All audits counted must be at exactly *current_head*.
         """
         active = self._conn.execute(
             """SELECT COUNT(*) AS n FROM findings
@@ -291,14 +350,14 @@ class DB:
             return 0
 
         rows = self._conn.execute(
-            """SELECT total_found FROM audit_runs
+            """SELECT new_findings FROM audit_runs
                WHERE area=? AND status='completed' AND commit_hash=?
                ORDER BY id DESC LIMIT ?""",
             (area, current_head, window),
         ).fetchall()
         if not rows:
             return 0
-        return sum(1 for r in rows if r["total_found"] == 0)
+        return sum(1 for r in rows if r["new_findings"] == 0)
 
     # ── summary queries ───────────────────────────────────────────────────────
 

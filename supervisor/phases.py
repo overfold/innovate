@@ -91,7 +91,7 @@ def verify_diff(cfg: dict, findings: list, ctr: dict) -> bool:
     prompt = VERIFY_PROMPT.format(
         title=findings[0]["title"],
         description="\n".join(f["description"] for f in findings),
-        diff=diff[:10_000],
+        base=base,
     )
     try:
         output = _invoke_codex(
@@ -268,7 +268,8 @@ def phase_repair(cfg: dict, db: DB, findings: list, ctr: dict) -> bool:
     if not diff.strip():
         LOG.warning("  Repair produced no file changes — skipping")
         for f in findings:
-            db.mark_finding(f["id"], "rejected", reason="repair produced no changes")
+            db.mark_finding(f["id"], "rejected", reason="repair produced no changes", head=base)
+        ctr["consecutive_failures"] += 1
         return False
 
     titles = "; ".join(f["title"] for f in findings)
@@ -331,7 +332,7 @@ def phase_review_loop(
         prompt = REVIEW_PROMPT.format(
             pr_title=pr_title,
             finding_titles=finding_titles,
-            diff=diff[:10_000],
+            base=base,
         )
         try:
             output = _invoke_codex(
@@ -360,6 +361,16 @@ def phase_review_loop(
         if verdict == "approve" and not blocking:
             db.update_pr(pr_id, review_rounds=rnd)
             return REVIEW_APPROVED
+
+        if not blocking:
+            # request_changes with no blocking comments is an inconsistent
+            # schema response — fail-closed rather than silently approve.
+            LOG.error(
+                "  %s with no blocking comments — inconsistent review (fail-closed)",
+                verdict,
+            )
+            db.update_pr(pr_id, review_rounds=rnd)
+            return REVIEW_FAILED_ERROR
 
         for c in blocking:
             LOG.info("  Blocking: [%s] %s", c.get("file", "general"), c["description"])
