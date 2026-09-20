@@ -171,6 +171,11 @@ class DB:
             "SELECT * FROM findings WHERE status='blocked' ORDER BY id"
         ).fetchall()
 
+    def deferred_findings(self) -> list[sqlite3.Row]:
+        return self._conn.execute(
+            "SELECT * FROM findings WHERE status='deferred' ORDER BY id"
+        ).fetchall()
+
     def in_progress_findings(self) -> list[sqlite3.Row]:
         return self._conn.execute(
             "SELECT * FROM findings WHERE status='in_progress' ORDER BY id"

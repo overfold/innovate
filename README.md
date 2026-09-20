@@ -76,7 +76,16 @@ Global flags accepted before the command:
 ## Lifecycle
 
 ```
-┌─────────────┐
+┌─────────────────┐
+│ startup_reconcile│  On every start: reconcile in_progress findings against
+└──────┬──────────┘  GitHub state; close deferred PRs and requeue findings.
+       │
+┌──────▼──────────┐
+│  fetch + audit  │  Fetch origin/<main> fail-closed; create a read-only
+│    worktree     │  git worktree at that exact SHA. All audits run there.
+└──────┬──────────┘
+       │
+┌──────▼──────┐
 │ Scoped audit │  Codex inspects one area deeply and returns all findings.
 └──────┬──────┘  Findings are fingerprinted and deduplicated in the DB.
        │
@@ -89,8 +98,8 @@ Global flags accepted before the command:
 └──────┬──────┘
        │
 ┌──────▼──────┐
-│    Repair   │  Fresh Codex context applies the minimal fix on a new branch.
-└──────┬──────┘
+│    Repair   │  Fresh Codex context applies the minimal fix on a new branch
+└──────┬──────┘  in an isolated worktree (main checkout is never modified).
        │
 ┌──────▼──────┐
 │    Verify   │  Optional test suite + fresh Codex diff-review.
@@ -100,7 +109,8 @@ Global flags accepted before the command:
 │  PR + review│  Push branch, open PR, fresh Codex reviews the diff.
 │    loop     │  Blocking comments → implement, commit, run tests, diff-verify,
 └──────┬──────┘  then review again.  Up to max_review_rounds times.
-       │         Budget exhausted → close PR, mark finding "paused".
+       │         Budget exhausted → defer to next run (close PR, requeue).
+       │         Rounds exhausted → close PR, mark finding "blocked".
 ┌──────▼──────┐
 │   CI gate   │  Wait for GitHub CI (configurable timeout).
 └──────┬──────┘  Only an explicit success permits merge.
@@ -109,11 +119,13 @@ Global flags accepted before the command:
 │    Merge    │  gh pr merge --squash --delete-branch
 └──────┬──────┘
        │
-       └─► Pull main, move to next finding, then next area.
+       └─► Restart sweep from freshly fetched origin/<main>.
            After all areas: re-audit to catch regressions.
            After max_audits_per_area consecutive clean audits per area
            at the same HEAD → area exhausted.
-           All areas exhausted → supervisor exits.
+           All areas exhausted, no blocked findings → EXHAUSTED (clean).
+           All areas exhausted, blocked findings remain → BLOCKED.
+           Budget limit reached → BUDGET (restart next run).
 ```
 
 ---
@@ -138,8 +150,8 @@ Global flags accepted before the command:
 | `cmd` | Codex binary name (default: `codex`) |
 | `model` | Model identifier passed via `--model` (default: `o4-mini`) |
 | `timeout` | Seconds before a Codex invocation is killed (default: `300`) |
-| `audit_flags` | Flags for read-only calls — analysis, diff-review, revalidation. Default: `["exec", "--quiet"]` |
-| `repair_flags` | Flags for file-editing calls — repair, implement review feedback. Default: `["exec", "--quiet", "--sandbox", "workspace-write"]` |
+| `audit_flags` | Flags for read-only calls — analysis, diff-review, revalidation. Default: `["exec"]` |
+| `repair_flags` | Flags for file-editing calls — repair, implement review feedback. Default: `["exec", "--sandbox", "workspace-write"]` |
 
 `--model` is inserted automatically after the first element of `audit_flags` /
 `repair_flags` when that element is the `exec` subcommand.
@@ -167,11 +179,11 @@ Global flags accepted before the command:
 Each block defines one scoped audit. The `description` is injected verbatim
 into the Codex audit prompt, so be specific about what to look for.
 
-The eight default areas (correctness, security, reliability, tests, persistence,
-api\_contracts, dependencies, maintainability) are compiled into `maintain.py`
-and used when no `[[audit_areas]]` entries appear in the config file. Adding
-even one `[[audit_areas]]` block in `config.toml` **replaces** all defaults, so
-copy all eight if you only want to add one.
+The nine default areas (correctness, security, reliability, tests, persistence,
+api\_contracts, dependencies, maintainability, documentation) are compiled into
+`maintain.py` and used when no `[[audit_areas]]` entries appear in the config
+file. Adding even one `[[audit_areas]]` block in `config.toml` **replaces** all
+defaults, so copy all nine if you only want to add one.
 
 ---
 
@@ -200,16 +212,17 @@ Finding statuses:
 | `fixed` | PR merged successfully |
 | `rejected` | Discarded (repair produced no changes, or manually rejected) |
 | `stale` | Revalidation determined the finding no longer applies to current HEAD |
-| `paused` | Review-round budget exhausted; PR was closed without merge |
+| `deferred` | Per-run Codex budget hit during review; PR closed, retried next run |
+| `blocked` | Review-round budget exhausted without approval; requires human review |
 
 PR statuses:
 
 | Status | Meaning |
 |--------|---------|
 | `open` | PR is open and being reviewed |
-| `paused` | Closed because `max_review_rounds` was exhausted |
+| `deferred` | Codex budget hit; will be closed and retried next run |
 | `merged` | Successfully merged |
-| `closed` | Closed for another reason |
+| `closed` | Closed (clean retry or deferred cleanup) |
 | `failed` | CI failed or other unrecoverable error |
 
 ---
@@ -217,14 +230,46 @@ PR statuses:
 ## Exhaustion and HEAD tracking
 
 Clean-audit exhaustion is **tied to the HEAD commit** the audit ran against.
-When a PR is merged and the trunk advances:
 
-- Every area's clean-audit streak is checked against the new HEAD.
-- If the most-recent audit for an area was at an older commit, its streak resets
-  to zero and the area is re-queued for auditing.
+When a PR is merged, the supervisor **immediately restarts the sweep** from a
+freshly fetched `origin/<default_branch>`. This guarantees that all subsequent
+audits and revalidations see the merged code — no finding is ever evaluated
+against stale code from before the merge.
 
-This ensures that merged code is always audited in every area before the
-supervisor considers any area exhausted.
+An area's streak resets to zero if the most-recent audit was at an older commit,
+ensuring merged code is always re-audited before any area is declared exhausted.
+
+`run_once()` stops and reports one of three terminal states:
+
+| State | Meaning |
+|-------|---------|
+| `exhausted` | Every area is clean at the current HEAD; no unresolved findings |
+| `blocked` | Every area is clean, but one or more findings could not be resolved autonomously and require human review |
+| `budget` | The run stopped early because a Codex, fix, or failure budget was reached; re-running will continue from the queued state |
+
+---
+
+## Crash recovery and worktrees
+
+All repair and fix work happens in **isolated git worktrees** — the configured
+repository checkout is never modified directly. If the supervisor is killed
+mid-repair, the main checkout is always left clean.
+
+On the next run, `startup_reconcile()` scans for findings left in `in_progress`
+or `deferred` state and reconciles them against GitHub:
+
+- **in_progress, PR merged** → mark finding `fixed`.
+- **in_progress, PR closed** → requeue finding as `open` for a clean retry.
+- **in_progress, PR open** → close the stale PR and requeue (the next run will
+  produce a fresh branch and PR from current HEAD).
+- **in_progress, GitHub API error** → leave state untouched; retry next run
+  (fail-closed — never misclassify an API failure as a known state).
+- **deferred** → close the existing PR and requeue as `open` so the next run
+  produces a fresh branch with the full review-round budget.
+
+Audits always run against a freshly-fetched read-only worktree at exactly
+`origin/<default_branch>` — stale or wrong-branch local checkouts never
+influence what the supervisor sees.
 
 ---
 
@@ -257,7 +302,7 @@ already resolved or that no longer exist.
   `max_consecutive_failures` prevent runaway billing or infinite loops.
 * **Review-budget exhaustion ≠ approval** — when `max_review_rounds` is
   exhausted with unresolved comments, the PR is **closed** and the finding is
-  marked `paused`, not merged.
+  marked `blocked`, not merged.
 * **Exhaustion detection** — the supervisor stops when every audit area produces
   no new findings for `max_audits_per_area` consecutive runs at the current HEAD.
 * **Confirmations for destructive CLI operations** — `reset` asks before

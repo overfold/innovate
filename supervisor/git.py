@@ -11,6 +11,10 @@ from pathlib import Path
 LOG = logging.getLogger("supervisor")
 
 
+class GitHubAPIError(Exception):
+    """Raised when a GitHub CLI call fails or returns unparseable output."""
+
+
 def _git(repo: Path, *args: str, check: bool = True) -> subprocess.CompletedProcess:
     return subprocess.run(
         ["git", *args],
@@ -40,11 +44,29 @@ def create_worktree(repo: Path, branch: str, base: str) -> Path:
 
     The worktree is an isolated checkout — crashes here leave the main repo
     untouched. Always pair with remove_worktree() in a finally block.
+    Raises subprocess.CalledProcessError if the fetch fails.
     """
-    _git(repo, "fetch", "origin", base, check=False)
+    _git(repo, "fetch", "origin", base)  # fail-closed
     wt_dir = Path(tempfile.mkdtemp(prefix="maintain-wt-"))
     _git(repo, "worktree", "add", "-b", branch, str(wt_dir), f"origin/{base}")
     return wt_dir
+
+
+def create_audit_worktree(repo: Path, base: str) -> Path:
+    """Fetch origin/<base> (fail-closed) and create a detached-HEAD audit worktree.
+
+    Raises subprocess.CalledProcessError if the fetch or worktree creation fails.
+    Always pair with remove_audit_worktree() in a finally block.
+    """
+    _git(repo, "fetch", "origin", base)  # fail-closed
+    wt_dir = Path(tempfile.mkdtemp(prefix="maintain-audit-"))
+    _git(repo, "worktree", "add", "--detach", str(wt_dir), f"origin/{base}")
+    return wt_dir
+
+
+def remove_audit_worktree(repo: Path, wt_path: Path) -> None:
+    """Remove a detached audit worktree (no branch to delete)."""
+    _git(repo, "worktree", "remove", "--force", str(wt_path), check=False)
 
 
 def remove_worktree(repo: Path, branch: str, wt_path: Path) -> None:
@@ -102,9 +124,10 @@ def gh_find_pr_by_branch(
 ) -> tuple[int, str] | None:
     """Search for an open PR whose head branch matches *branch*.
 
-    Returns (pr_number, pr_url) or None if not found.
-    Used during crash recovery when the DB has a branch recorded but no
-    pr_number yet (process died between gh pr create and the DB update).
+    Returns (pr_number, pr_url) if an open PR was found, or None if there
+    is genuinely no open PR for that branch.
+    Raises GitHubAPIError on CLI failure or unparseable output — callers
+    must not treat an API failure as "no PR exists."
     """
     r = subprocess.run(
         [
@@ -120,11 +143,13 @@ def gh_find_pr_by_branch(
         check=False,
     )
     if r.returncode != 0:
-        return None
+        raise GitHubAPIError(
+            f"gh pr list failed (exit {r.returncode}): {r.stderr.strip()}"
+        )
     try:
         items = json.loads(r.stdout)
-    except json.JSONDecodeError:
-        return None
+    except json.JSONDecodeError as exc:
+        raise GitHubAPIError(f"gh pr list returned non-JSON: {r.stdout!r}") from exc
     if not items:
         return None
     item = items[0]
@@ -132,7 +157,11 @@ def gh_find_pr_by_branch(
 
 
 def gh_pr_state(owner: str, repo_name: str, pr_number: int) -> str:
-    """Return 'open', 'merged', 'closed', or 'unknown'."""
+    """Return 'open', 'merged', or 'closed'.
+
+    Raises GitHubAPIError on CLI failure or unparseable output — callers must
+    not treat an API failure as a known PR state.
+    """
     r = subprocess.run(
         [
             "gh", "pr", "view", str(pr_number),
@@ -144,14 +173,19 @@ def gh_pr_state(owner: str, repo_name: str, pr_number: int) -> str:
         check=False,
     )
     if r.returncode != 0:
-        return "unknown"
+        raise GitHubAPIError(
+            f"gh pr view #{pr_number} failed (exit {r.returncode}): {r.stderr.strip()}"
+        )
     try:
         data = json.loads(r.stdout)
-    except json.JSONDecodeError:
-        return "unknown"
+    except json.JSONDecodeError as exc:
+        raise GitHubAPIError(
+            f"gh pr view #{pr_number} returned non-JSON: {r.stdout!r}"
+        ) from exc
     if data.get("mergedAt"):
         return "merged"
-    return data.get("state", "unknown").lower()
+    state = data.get("state", "").lower()
+    return state if state in ("open", "merged", "closed") else "closed"
 
 
 def gh_close_pr(owner: str, repo_name: str, pr_number: int) -> None:

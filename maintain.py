@@ -117,6 +117,12 @@ def main() -> None:
                         "Repository exhausted — stopping."
                     )
                     break
+                if result == "blocked":
+                    logging.getLogger("supervisor").warning(
+                        "Repository has unresolved blocked findings —"
+                        " human review required.  Stopping."
+                    )
+                    break
                 time.sleep(5)
 
         elif args.cmd == "status":
