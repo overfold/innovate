@@ -9,7 +9,9 @@ from pathlib import Path
 
 from .db import DB
 from .git import (
+    GitHubAPIError,
     ci_permits_merge,
+    create_audit_worktree,
     create_worktree,
     current_commit,
     gh_close_pr,
@@ -18,6 +20,7 @@ from .git import (
     gh_merge_pr,
     gh_pr_state,
     push_branch,
+    remove_audit_worktree,
     remove_worktree,
     wait_for_ci,
 )
@@ -78,21 +81,39 @@ class Supervisor:
         return "\n".join(parts)
 
     def startup_reconcile(self) -> None:
-        """Reconcile in_progress findings against Git/GitHub state.
+        """Reconcile in_progress and deferred findings against GitHub state.
 
         Called at the start of every run_once() to recover from a previous crash
-        or unexpected termination that left findings stuck in in_progress.
+        or unexpected termination.
 
-        Handles the PR-creation gap: if the DB has a branch recorded but no
-        pr_number yet (crash between gh pr create and the DB update), we search
-        GitHub for an open PR on that branch and backfill the record rather than
-        orphaning the PR and creating a duplicate.
+        in_progress: reconcile against actual GitHub PR state.
+        deferred: Codex budget ran out mid-review — the existing PR is closed so
+                  the next run retries from a clean branch.
+
+        GitHub API errors are fail-closed: an unknown/unreachable state is left
+        untouched rather than being mis-classified as "closed" or "not found".
         """
         db = self.db
         cfg = self.cfg
         owner = cfg["repo"]["owner"]
         repo_name = cfg["repo"]["name"]
 
+        # ── deferred findings: close stale PR and requeue cleanly ─────────────
+        deferred_rows = db.deferred_findings()
+        if deferred_rows:
+            LOG.info("Requeueing %d deferred finding(s)…", len(deferred_rows))
+        for finding in deferred_rows:
+            pr_row = db.get_pr(finding["pr_id"]) if finding["pr_id"] else None
+            if pr_row and pr_row["pr_number"]:
+                LOG.info(
+                    "  Closing deferred PR #%d for finding %d (%s)",
+                    pr_row["pr_number"], finding["id"], finding["title"],
+                )
+                gh_close_pr(owner, repo_name, pr_row["pr_number"])
+                db.update_pr(pr_row["id"], status="closed")
+            db.mark_finding(finding["id"], "open")
+
+        # ── in_progress findings: crash recovery ──────────────────────────────
         rows = db.in_progress_findings()
         if not rows:
             return
@@ -101,7 +122,7 @@ class Supervisor:
         for finding in rows:
             pr_row = db.get_pr(finding["pr_id"]) if finding["pr_id"] else None
 
-            # Case 1: no PR record at all — finding was marked in_progress before
+            # Case 1: no PR record at all — finding marked in_progress before
             # the branch was even created. Requeue cleanly.
             if pr_row is None:
                 LOG.info(
@@ -122,7 +143,14 @@ class Supervisor:
                     " — searching GitHub for branch %s",
                     finding["id"], finding["title"], branch,
                 )
-                found = gh_find_pr_by_branch(owner, repo_name, branch)
+                try:
+                    found = gh_find_pr_by_branch(owner, repo_name, branch)
+                except GitHubAPIError as exc:
+                    LOG.warning(
+                        "  GitHub API error searching for branch %s — leaving"
+                        " state untouched: %s", branch, exc,
+                    )
+                    continue  # fail-closed: do not requeue or create duplicate
                 if found:
                     pr_number, pr_url = found
                     db.update_pr(pr_row["id"], pr_number=pr_number, pr_url=pr_url)
@@ -138,7 +166,14 @@ class Supervisor:
                     continue
 
             # Case 3: pr_number is known — check its GitHub state.
-            state = gh_pr_state(owner, repo_name, pr_number)
+            try:
+                state = gh_pr_state(owner, repo_name, pr_number)
+            except GitHubAPIError as exc:
+                LOG.warning(
+                    "  GitHub API error for PR #%d — leaving state untouched: %s",
+                    pr_number, exc,
+                )
+                continue  # fail-closed: leave in_progress, retry next run
             LOG.info(
                 "  Finding %d (%s): PR #%d is %s",
                 finding["id"], finding["title"], pr_number, state,
@@ -146,7 +181,7 @@ class Supervisor:
             if state == "merged":
                 db.update_pr(pr_row["id"], status="merged")
                 db.mark_finding(finding["id"], "fixed", pr_id=pr_row["id"])
-            elif state in ("closed", "unknown"):
+            elif state == "closed":
                 db.update_pr(pr_row["id"], status="closed")
                 db.mark_finding(finding["id"], "open")
             else:  # open — close and requeue for a clean retry
@@ -331,17 +366,24 @@ class Supervisor:
                 remove_worktree(repo, branch, wt_path)
 
     def run_once(self) -> str:
-        """Run one full pass over all audit areas.
+        """Run one full sweep over all audit areas.
 
-        Returns 'exhausted' | 'done' | 'partial'.
+        A successful merge terminates the current sweep and restarts it from a
+        freshly fetched origin/<default_branch>, ensuring all subsequent audits
+        and revalidations see the merged code.
+
+        Returns one of:
+          'exhausted' — all areas clean, no blocked findings
+          'blocked'   — all areas clean, but unresolved blocked findings remain
+          'budget'    — stopped early because a budget limit was reached
+          'done'      — progress made (fixes applied or new findings) but not exhausted
         """
-        # Reset per-run counters so run-continuous can't permanently wedge
-        # once a budget limit from a previous iteration is hit.
+        # Reset per-run counters so run-continuous can't permanently wedge.
         self.ctr["codex_calls"] = 0
         self.ctr["fixes_applied"] = 0
         self.ctr["consecutive_failures"] = 0
 
-        # Recover from any crash/restart that left findings in_progress.
+        # Recover from crashes (in_progress) and clean up deferred PRs.
         self.startup_reconcile()
 
         cfg = self.cfg
@@ -356,54 +398,89 @@ class Supervisor:
             cfg["repo"]["name"],
         )
 
-        # Pull latest main — safe because the main checkout is never modified
-        # by _fix_finding (all work happens in isolated worktrees).
-        subprocess.run(
-            ["git", "pull", "origin", main],
-            cwd=str(repo),
-            capture_output=True,
-            check=False,
-        )
-
         total_new = 0
+        last_head = ""
 
-        for area in areas:
-            if self._over_budget():
-                return "partial"
-
-            head = current_commit(repo)
-            streak = self.db.clean_audit_streak(
-                area["name"], budget["max_audits_per_area"], head
-            )
-            if streak >= budget["max_audits_per_area"]:
-                LOG.info(
-                    "Area %-20s exhausted (%d clean audits at %s)",
-                    area["name"], streak, head[:7],
+        # Outer loop: restart the sweep on each successful merge so that all
+        # subsequent audits see the updated code at the new HEAD.
+        while True:
+            # Fetch origin/<main> fail-closed and create a read-only audit
+            # worktree at exactly that SHA.  Never audit from a stale or
+            # wrong-branch checkout.
+            try:
+                audit_wt = create_audit_worktree(repo, main)
+            except subprocess.CalledProcessError as exc:
+                LOG.error(
+                    "Cannot fetch origin/%s — aborting run: %s",
+                    main, exc.stderr.strip() if exc.stderr else exc,
                 )
-                continue
+                return "budget"
 
-            new = phase_audit(cfg, self.db, area, self.ctr)
-            total_new += new
+            merged_this_pass = False
+            try:
+                head = current_commit(audit_wt)
+                last_head = head
+                audit_cfg = {**cfg, "repo": {**cfg["repo"], "path": str(audit_wt)}}
 
-            if self._over_budget():
-                return "partial"
+                for area in areas:
+                    if self._over_budget():
+                        return "budget"
 
-            for finding in self.db.open_findings(area["name"]):
-                if self._over_budget():
-                    return "partial"
-                head = current_commit(repo)
-                self._fix_finding(finding, head)
+                    streak = self.db.clean_audit_streak(
+                        area["name"], budget["max_audits_per_area"], head
+                    )
+                    if streak >= budget["max_audits_per_area"]:
+                        LOG.info(
+                            "Area %-20s exhausted (%d clean audits at %s)",
+                            area["name"], streak, head[:7],
+                        )
+                        continue
 
-        head = current_commit(repo)
-        if all(
-            self.db.clean_audit_streak(a["name"], budget["max_audits_per_area"], head)
+                    new = phase_audit(audit_cfg, self.db, area, self.ctr)
+                    total_new += new
+
+                    if self._over_budget():
+                        return "budget"
+
+                    for finding in self.db.open_findings(area["name"]):
+                        if self._over_budget():
+                            return "budget"
+                        if self._fix_finding(finding, head):
+                            merged_this_pass = True
+                            break
+
+                    if merged_this_pass:
+                        break
+
+            finally:
+                remove_audit_worktree(repo, audit_wt)
+
+            if not merged_this_pass:
+                break
+
+            LOG.info(
+                "Merge occurred — restarting sweep from freshly fetched origin/%s",
+                main,
+            )
+
+        if last_head and all(
+            self.db.clean_audit_streak(a["name"], budget["max_audits_per_area"], last_head)
             >= budget["max_audits_per_area"]
             for a in areas
         ):
-            LOG.info("All audit areas exhausted at %s — repository is clean.", head[:7])
+            if self.db.blocked_findings():
+                LOG.info(
+                    "All audit areas exhausted at %s — blocked findings remain.",
+                    last_head[:7],
+                )
+                return "blocked"
+            LOG.info(
+                "All audit areas exhausted at %s — repository is clean.",
+                last_head[:7],
+            )
             return "exhausted"
 
-        return "done" if (total_new > 0 or self.ctr["fixes_applied"] > 0) else "partial"
+        return "done"
 
 
 # ── CLI display commands ───────────────────────────────────────────────────────

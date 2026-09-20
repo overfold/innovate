@@ -79,7 +79,7 @@ max_audits_per_area = 3
 max_fixes_per_run = 20
 
 # Maximum Codex review→fix cycles per PR.  Exhausting this budget closes the
-# PR and marks the finding as "paused" (not silently approved).
+# PR and marks the finding as "blocked" (not silently approved).
 max_review_rounds = 4
 
 # Abort the current run if this many operations fail back-to-back.
@@ -95,7 +95,7 @@ codex_call_budget = 100
 # You can add, remove, or reorder areas; exhaustion is tracked independently
 # per area and per HEAD commit.
 #
-# The eight areas below are the defaults built into maintain.py.
+# The nine areas below are the defaults built into maintain.py.
 # Uncomment and customise as needed (overrides the built-in defaults entirely
 # when any [[audit_areas]] entry is present in this file).
 

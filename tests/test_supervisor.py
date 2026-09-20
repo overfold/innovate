@@ -5,6 +5,7 @@ tests are deterministic and run without network access or a real repository.
 """
 from __future__ import annotations
 
+import subprocess
 import tempfile
 from pathlib import Path
 from unittest.mock import MagicMock, call, patch
@@ -12,6 +13,7 @@ from unittest.mock import MagicMock, call, patch
 import pytest
 
 from supervisor.db import DB
+from supervisor.git import GitHubAPIError
 from supervisor.phases import (
     REVIEW_APPROVED,
     REVIEW_DEFERRED_BUDGET,
@@ -710,8 +712,8 @@ class TestMalformedCodexOutput:
 # ── GitHub API failure paths ───────────────────────────────────────────────────
 
 class TestGitHubAPIFailures:
-    def test_gh_pr_state_api_error_treated_as_closed(self):
-        """During reconcile, an API error on pr state → requeue finding."""
+    def test_gh_pr_state_api_error_leaves_state_untouched(self):
+        """During reconcile, a GitHub API error → leave finding in_progress (fail-closed)."""
         db = _db()
         f = _open_finding(db)
         pr_id = db.create_pr("maint/correctness/ts")
@@ -719,17 +721,34 @@ class TestGitHubAPIFailures:
         db.mark_finding(f["id"], "in_progress", pr_id=pr_id)
 
         sup = Supervisor(_cfg(), db)
-        with patch(f"{RUNNER_MODULE}.gh_pr_state", return_value="unknown"):
+        with patch(f"{RUNNER_MODULE}.gh_pr_state",
+                   side_effect=GitHubAPIError("transient error")):
             sup.startup_reconcile()
 
-        assert db.get_finding(f["id"])["status"] == "open"
+        # State must not change — we cannot know the real PR state
+        assert db.get_finding(f["id"])["status"] == "in_progress"
 
-    def test_gh_find_pr_by_branch_api_error_requeues(self):
-        """If GitHub search fails during reconcile, finding is requeued."""
+    def test_gh_find_pr_by_branch_api_error_leaves_state_untouched(self):
+        """If the GitHub branch search fails, leave state untouched (fail-closed)."""
         db = _db()
         f = _open_finding(db)
         pr_id = db.create_pr("maint/correctness/ts")
-        # No pr_number
+        # No pr_number — simulates crash gap
+        db.mark_finding(f["id"], "in_progress", pr_id=pr_id)
+
+        sup = Supervisor(_cfg(), db)
+        with patch(f"{RUNNER_MODULE}.gh_find_pr_by_branch",
+                   side_effect=GitHubAPIError("network error")):
+            sup.startup_reconcile()
+
+        # State must not change — we cannot know whether a PR exists
+        assert db.get_finding(f["id"])["status"] == "in_progress"
+
+    def test_gh_find_pr_by_branch_not_found_requeues(self):
+        """If GitHub search returns None (no PR), finding is requeued cleanly."""
+        db = _db()
+        f = _open_finding(db)
+        pr_id = db.create_pr("maint/correctness/ts")
         db.mark_finding(f["id"], "in_progress", pr_id=pr_id)
 
         sup = Supervisor(_cfg(), db)
@@ -737,6 +756,157 @@ class TestGitHubAPIFailures:
             sup.startup_reconcile()
 
         assert db.get_finding(f["id"])["status"] == "open"
+
+
+# ── deferred reconciliation ───────────────────────────────────────────────────
+
+class TestDeferredReconcile:
+    """startup_reconcile must close deferred PRs and requeue findings as open."""
+
+    def test_deferred_with_pr_is_closed_and_requeued(self):
+        db = _db()
+        f = _open_finding(db)
+        pr_id = db.create_pr("maint/correctness/deferred-branch")
+        db.update_pr(pr_id, pr_number=99, pr_url="https://gh/99")
+        db.mark_finding(f["id"], "deferred", pr_id=pr_id)
+
+        sup = Supervisor(_cfg(), db)
+        with patch(f"{RUNNER_MODULE}.gh_close_pr") as mock_close:
+            sup.startup_reconcile()
+
+        mock_close.assert_called_once_with("org", "repo", 99)
+        assert db.get_pr(pr_id)["status"] == "closed"
+        assert db.get_finding(f["id"])["status"] == "open"
+
+    def test_deferred_without_pr_is_requeued(self):
+        """Deferred finding with no linked PR → just requeue as open."""
+        db = _db()
+        f = _open_finding(db)
+        db.mark_finding(f["id"], "deferred")
+
+        sup = Supervisor(_cfg(), db)
+        with patch(f"{RUNNER_MODULE}.gh_close_pr") as mock_close:
+            sup.startup_reconcile()
+
+        mock_close.assert_not_called()
+        assert db.get_finding(f["id"])["status"] == "open"
+
+    def test_deferred_finding_not_in_open_findings_before_reconcile(self):
+        """Verify deferred findings ARE returned by open_findings() (so the loop picks them up)."""
+        db = _db()
+        f = _open_finding(db)
+        db.mark_finding(f["id"], "deferred")
+        # Before reconcile, deferred is still in open_findings
+        assert len(db.open_findings()) == 1
+        assert db.open_findings()[0]["status"] == "deferred"
+
+
+# ── run_once return values ─────────────────────────────────────────────────────
+
+class TestRunOnceReturnValues:
+    def test_blocked_findings_prevent_exhausted_return(self):
+        """run_once returns 'blocked' (not 'exhausted') when blocked findings exist."""
+        db = _db()
+        f = _open_finding(db)
+        db.mark_finding(f["id"], "blocked", reason="rounds exhausted")
+
+        # Record enough clean audits to hit the streak threshold
+        for _ in range(3):
+            run_id = db.start_audit("correctness", "abc1234")
+            db.finish_audit(run_id, 0, 0)
+
+        sup = Supervisor(_cfg(), db)
+        sup.startup_reconcile = lambda: None  # skip real reconcile
+        with patch(f"{RUNNER_MODULE}.create_audit_worktree") as mock_wt, \
+             patch(f"{RUNNER_MODULE}.remove_audit_worktree"), \
+             patch(f"{RUNNER_MODULE}.current_commit", return_value="abc1234"), \
+             patch(f"{RUNNER_MODULE}.phase_audit", return_value=0):
+            mock_wt.return_value = "/tmp/fake-wt"
+            result = sup.run_once()
+
+        assert result == "blocked"
+
+    def test_no_blocked_findings_returns_exhausted(self):
+        """run_once returns 'exhausted' when all areas are clean and no blocked findings."""
+        db = _db()
+        for _ in range(3):
+            run_id = db.start_audit("correctness", "abc1234")
+            db.finish_audit(run_id, 0, 0)
+
+        sup = Supervisor(_cfg(), db)
+        sup.startup_reconcile = lambda: None
+        with patch(f"{RUNNER_MODULE}.create_audit_worktree") as mock_wt, \
+             patch(f"{RUNNER_MODULE}.remove_audit_worktree"), \
+             patch(f"{RUNNER_MODULE}.current_commit", return_value="abc1234"), \
+             patch(f"{RUNNER_MODULE}.phase_audit", return_value=0):
+            mock_wt.return_value = "/tmp/fake-wt"
+            result = sup.run_once()
+
+        assert result == "exhausted"
+
+    def test_fetch_failure_returns_budget(self):
+        """If origin/<main> cannot be fetched, run_once returns 'budget'."""
+        db = _db()
+        sup = Supervisor(_cfg(), db)
+        with patch(f"{RUNNER_MODULE}.create_audit_worktree",
+                   side_effect=subprocess.CalledProcessError(1, "git fetch")):
+            sup.startup_reconcile = lambda: None
+            result = sup.run_once()
+
+        assert result == "budget"
+
+    def test_merge_triggers_sweep_restart(self, tmp_path):
+        """A successful fix+merge should cause a second pass (restart)."""
+        db = _db()
+        f = _open_finding(db)
+        wt = tmp_path / "wt"
+        wt.mkdir()
+        call_count = {"n": 0}
+
+        def make_audit_wt():
+            call_count["n"] += 1
+            return wt
+
+        sup = Supervisor(_cfg(), db)
+        sup.startup_reconcile = lambda: None
+
+        # First pass: one open finding → gets fixed → merge returns True
+        # Second pass: no open findings, area is exhausted → returns exhausted
+        pass_counter = {"n": 0}
+
+        def fake_audit(cfg, db_, area, ctr):
+            pass_counter["n"] += 1
+            if pass_counter["n"] == 1:
+                # Finding already in DB from before; return 0 new
+                return 0
+            return 0
+
+        with patch(f"{RUNNER_MODULE}.create_audit_worktree",
+                   side_effect=lambda repo, main: make_audit_wt()), \
+             patch(f"{RUNNER_MODULE}.remove_audit_worktree"), \
+             patch(f"{RUNNER_MODULE}.current_commit", return_value="abc1234"), \
+             patch(f"{RUNNER_MODULE}.phase_audit", side_effect=fake_audit), \
+             patch(f"{RUNNER_MODULE}.create_worktree", return_value=wt), \
+             patch(f"{RUNNER_MODULE}.remove_worktree"), \
+             patch(f"{RUNNER_MODULE}.phase_repair", return_value=True), \
+             patch(f"{RUNNER_MODULE}.phase_verify", return_value=True), \
+             patch(f"{RUNNER_MODULE}.push_branch"), \
+             patch(f"{RUNNER_MODULE}.gh_create_pr",
+                   return_value=(77, "https://gh/77")), \
+             patch(f"{RUNNER_MODULE}.phase_review_loop",
+                   return_value=REVIEW_APPROVED), \
+             patch(f"{RUNNER_MODULE}.wait_for_ci", return_value="no_checks"), \
+             patch(f"{RUNNER_MODULE}.gh_merge_pr"):
+            # Record 3 clean audits for the second pass to hit exhaustion
+            for _ in range(3):
+                run_id = db.start_audit("correctness", "abc1234")
+                db.finish_audit(run_id, 0, 0)
+            result = sup.run_once()
+
+        # create_audit_worktree called twice: once per pass
+        assert call_count["n"] == 2
+        # Finding is fixed
+        assert db.get_finding(f["id"])["status"] == "fixed"
 
 
 # ── exhaustion logic ───────────────────────────────────────────────────────────
