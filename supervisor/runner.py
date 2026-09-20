@@ -18,6 +18,7 @@ from .git import (
     gh_create_pr,
     gh_find_pr_by_branch,
     gh_merge_pr,
+    gh_pr_base_sha,
     gh_pr_state,
     push_branch,
     remove_audit_worktree,
@@ -222,24 +223,6 @@ class Supervisor:
 
         LOG.info("[%s/%s] %s", f["severity"], f["confidence"], f["title"])
 
-        # Revalidate if HEAD has moved since the finding was recorded.
-        if f.get("commit_hash") and f["commit_hash"] != current_head:
-            LOG.info(
-                "  Finding is from %s, current HEAD is %s — revalidating",
-                f["commit_hash"][:7],
-                current_head[:7],
-            )
-            rv = phase_revalidate(cfg, f, self.ctr)
-            if rv == "stale":
-                db.mark_finding(
-                    f["id"], "stale", reason="no longer applies at current HEAD"
-                )
-                return False
-            if rv == "error":
-                LOG.warning("  Revalidation failed — skipping this run")
-                self.ctr["consecutive_failures"] += 1
-                return False
-
         # Generate branch name before touching anything so it's stable
         # for crash-recovery lookups.
         ts = datetime.now(timezone.utc).strftime("%Y%m%d-%H%M%S")
@@ -264,6 +247,25 @@ class Supervisor:
                     "base_sha": current_head,  # pins verify_diff / review diffs
                 },
             }
+
+            # Revalidate if HEAD has moved since the finding was recorded.
+            # Runs inside the worktree so it sees the exact audited commit.
+            if f.get("commit_hash") and f["commit_hash"] != current_head:
+                LOG.info(
+                    "  Finding is from %s, current HEAD is %s — revalidating",
+                    f["commit_hash"][:7],
+                    current_head[:7],
+                )
+                rv = phase_revalidate(wt_cfg, f, self.ctr)
+                if rv == "stale":
+                    db.mark_finding(
+                        f["id"], "stale", reason="no longer applies at current HEAD"
+                    )
+                    return False
+                if rv == "error":
+                    LOG.warning("  Revalidation failed — skipping this run")
+                    self.ctr["consecutive_failures"] += 1
+                    return False
 
             # Repair.
             if not phase_repair(wt_cfg, db, [f], self.ctr):
@@ -378,6 +380,36 @@ class Supervisor:
                 db.update_pr(pr_id, status="failed")
                 db.mark_finding(f["id"], "open")
                 self.ctr["consecutive_failures"] += 1
+                return False
+
+            # Freshness gate: reject if the base branch has advanced since we
+            # audited (the patch was never tested against the new commits).
+            try:
+                base_oid = gh_pr_base_sha(owner, repo_name, pr_number)
+            except GitHubAPIError as exc:
+                LOG.error("  Cannot verify base freshness: %s — re-queuing", exc)
+                db.update_pr(pr_id, status="failed")
+                db.mark_finding(f["id"], "open")
+                self.ctr["consecutive_failures"] += 1
+                return False
+
+            if base_oid != current_head:
+                LOG.warning(
+                    "  Base branch advanced to %s since audit at %s"
+                    " — closing PR and requeueing",
+                    base_oid[:7], current_head[:7],
+                )
+                try:
+                    gh_close_pr(owner, repo_name, pr_number)
+                except GitHubAPIError as exc:
+                    LOG.error(
+                        "  Failed to close PR #%d: %s"
+                        " — leaving in_progress for startup_reconcile",
+                        pr_number, exc,
+                    )
+                    return False
+                db.update_pr(pr_id, status="closed")
+                db.mark_finding(f["id"], "open")
                 return False
 
             # Merge.
