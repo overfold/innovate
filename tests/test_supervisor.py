@@ -2093,6 +2093,54 @@ class TestValidationPersistence:
         assert result is True
         mock_val.assert_called_once()
 
+    def test_crash_after_invalid_verdict_skips_revalidation(self, tmp_path):
+        """Cached invalid verdict at current HEAD → mark invalid without Codex call."""
+        db = _db()
+        f = _open_finding(db)
+        db.set_validation(f["id"], "invalid", "abc1234",
+                          reason="not a bug", evidence="guard exists")
+
+        sup = Supervisor(_cfg(), db)
+        wt = tmp_path / "wt"
+        wt.mkdir()
+
+        with patch(f"{RUNNER_MODULE}.create_worktree", return_value=wt), \
+             patch(f"{RUNNER_MODULE}.remove_worktree"), \
+             patch(f"{RUNNER_MODULE}.phase_validate") as mock_val, \
+             patch(f"{RUNNER_MODULE}.phase_repair") as mock_repair:
+            result = sup._fix_finding(db.get_finding(f["id"]), "abc1234")
+
+        assert result is False
+        mock_val.assert_not_called()
+        mock_repair.assert_not_called()
+        row = db.get_finding(f["id"])
+        assert row["status"] == "invalid"
+        assert row["validated_at_head"] == "abc1234"
+
+    def test_crash_after_uncertain_verdict_skips_revalidation(self, tmp_path):
+        """Cached uncertain verdict at current HEAD → mark blocked without Codex call."""
+        db = _db()
+        f = _open_finding(db)
+        db.set_validation(f["id"], "uncertain", "abc1234",
+                          reason="unclear", evidence="ambiguous path")
+
+        sup = Supervisor(_cfg(), db)
+        wt = tmp_path / "wt"
+        wt.mkdir()
+
+        with patch(f"{RUNNER_MODULE}.create_worktree", return_value=wt), \
+             patch(f"{RUNNER_MODULE}.remove_worktree"), \
+             patch(f"{RUNNER_MODULE}.phase_validate") as mock_val, \
+             patch(f"{RUNNER_MODULE}.phase_repair") as mock_repair:
+            result = sup._fix_finding(db.get_finding(f["id"]), "abc1234")
+
+        assert result is False
+        mock_val.assert_not_called()
+        mock_repair.assert_not_called()
+        row = db.get_finding(f["id"])
+        assert row["status"] == "blocked"
+        assert "uncertain" in row["reject_reason"]
+
 
 # ── validate vs revalidate vs verify distinction ──────────────────────────────
 
