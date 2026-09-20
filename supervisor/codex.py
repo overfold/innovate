@@ -29,8 +29,8 @@ AUDIT_SCHEMA: str = json.dumps({
                 "properties": {
                     "title":       {"type": "string"},
                     "description": {"type": "string"},
-                    "severity":    {"type": "string"},
-                    "confidence":  {"type": "string"},
+                    "severity":    {"type": "string", "enum": ["critical", "high", "medium", "low"]},
+                    "confidence":  {"type": "string", "enum": ["high", "medium", "low"]},
                     "file_path":   {"type": ["string", "null"]},
                     "line_range":  {"type": ["string", "null"]},
                 },
@@ -58,7 +58,7 @@ VERIFY_SCHEMA: str = json.dumps({
     "type": "object",
     "additionalProperties": False,
     "properties": {
-        "verdict": {"type": "string"},
+        "verdict": {"type": "string", "enum": ["approve", "reject"]},
         "reason":  {"type": ["string", "null"]},
         "issues":  {"type": ["array", "null"], "items": {"type": "string"}},
     },
@@ -69,7 +69,7 @@ REVIEW_SCHEMA: str = json.dumps({
     "type": "object",
     "additionalProperties": False,
     "properties": {
-        "verdict":  {"type": "string"},
+        "verdict":  {"type": "string", "enum": ["approve", "request_changes"]},
         "summary":  {"type": ["string", "null"]},
         "comments": {
             "type": ["array", "null"],
@@ -77,7 +77,7 @@ REVIEW_SCHEMA: str = json.dumps({
                 "type": "object",
                 "additionalProperties": False,
                 "properties": {
-                    "severity":    {"type": "string"},
+                    "severity":    {"type": "string", "enum": ["blocking", "optional"]},
                     "file":        {"type": ["string", "null"]},
                     "description": {"type": "string"},
                 },

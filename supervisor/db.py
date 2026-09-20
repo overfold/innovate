@@ -29,7 +29,9 @@ CREATE TABLE IF NOT EXISTS findings (
     resolved        TEXT,
     pr_id           INTEGER,
     reject_reason   TEXT,
-    blocked_at_head TEXT    -- commit SHA where this finding was last confirmed blocked
+    blocked_at_head  TEXT,   -- commit SHA where this finding was last confirmed blocked
+    rejected_at_head TEXT,   -- commit SHA where repair last produced no changes
+    repair_attempts  INTEGER NOT NULL DEFAULT 0
 );
 
 CREATE TABLE IF NOT EXISTS audit_runs (
@@ -86,14 +88,17 @@ class DB:
         self._conn.row_factory = sqlite3.Row
         self._conn.executescript(_SCHEMA)
         self._conn.commit()
-        # Migration: add blocked_at_head for databases created before this column.
-        try:
-            self._conn.execute(
-                "ALTER TABLE findings ADD COLUMN blocked_at_head TEXT"
-            )
-            self._conn.commit()
-        except sqlite3.OperationalError:
-            pass  # column already exists
+        # Migrations for columns added after the initial schema.
+        for _migration in [
+            "ALTER TABLE findings ADD COLUMN blocked_at_head TEXT",
+            "ALTER TABLE findings ADD COLUMN rejected_at_head TEXT",
+            "ALTER TABLE findings ADD COLUMN repair_attempts INTEGER NOT NULL DEFAULT 0",
+        ]:
+            try:
+                self._conn.execute(_migration)
+                self._conn.commit()
+            except sqlite3.OperationalError:
+                pass  # column already exists
 
     # ── key/value state ──────────────────────────────────────────────────────
 
@@ -120,30 +125,40 @@ class DB:
         open, in_progress, or paused are left untouched.
         """
         row = self._conn.execute(
-            "SELECT id, status FROM findings WHERE fingerprint=?", (f["fingerprint"],)
+            "SELECT id, status, rejected_at_head FROM findings WHERE fingerprint=?",
+            (f["fingerprint"],),
         ).fetchone()
         if row:
-            if row["status"] in ("fixed", "stale", "rejected"):
-                self._conn.execute(
-                    """UPDATE findings
-                       SET status='open', resolved=NULL, pr_id=NULL,
-                           reject_reason=NULL, commit_hash=?,
-                           severity=?, confidence=?, file_path=?,
-                           line_range=?, description=?
-                       WHERE id=?""",
-                    (
-                        f.get("commit_hash"),
-                        f.get("severity"),
-                        f.get("confidence"),
-                        f.get("file_path"),
-                        f.get("line_range"),
-                        f.get("description"),
-                        row["id"],
-                    ),
-                )
-                self._conn.commit()
-                return row["id"], True
-            return row["id"], False
+            if row["status"] == "rejected":
+                # Rejection is terminal for that HEAD: only reopen once HEAD changes.
+                rah = row["rejected_at_head"]
+                fch = f.get("commit_hash")
+                if rah and fch and rah == fch:
+                    return row["id"], False  # same HEAD — leave rejected
+                # Different (or unknown) HEAD: fall through to reopen below.
+            elif row["status"] not in ("fixed", "stale"):
+                return row["id"], False
+            # Reopen: fixed/stale regression, or rejected finding at a new HEAD.
+            self._conn.execute(
+                """UPDATE findings
+                   SET status='open', resolved=NULL, pr_id=NULL,
+                       reject_reason=NULL, commit_hash=?,
+                       severity=?, confidence=?, file_path=?,
+                       line_range=?, description=?,
+                       rejected_at_head=NULL, repair_attempts=0
+                   WHERE id=?""",
+                (
+                    f.get("commit_hash"),
+                    f.get("severity"),
+                    f.get("confidence"),
+                    f.get("file_path"),
+                    f.get("line_range"),
+                    f.get("description"),
+                    row["id"],
+                ),
+            )
+            self._conn.commit()
+            return row["id"], True
         cur = self._conn.execute(
             """INSERT INTO findings
                (fingerprint, area, severity, confidence, file_path, line_range,
@@ -207,14 +222,31 @@ class DB:
         reason: str = "",
         head: str | None = None,
     ) -> None:
-        blocked_at_head = head if status == "blocked" else None
-        self._conn.execute(
-            """UPDATE findings
-               SET status=?, resolved=datetime('now'), pr_id=?, reject_reason=?,
-                   blocked_at_head=?
-               WHERE id=?""",
-            (status, pr_id, reason, blocked_at_head, fid),
-        )
+        if status == "rejected":
+            self._conn.execute(
+                """UPDATE findings
+                   SET status=?, resolved=datetime('now'), pr_id=?, reject_reason=?,
+                       blocked_at_head=NULL, rejected_at_head=?,
+                       repair_attempts=repair_attempts + 1
+                   WHERE id=?""",
+                (status, pr_id, reason, head, fid),
+            )
+        elif status == "blocked":
+            self._conn.execute(
+                """UPDATE findings
+                   SET status=?, resolved=datetime('now'), pr_id=?, reject_reason=?,
+                       blocked_at_head=?
+                   WHERE id=?""",
+                (status, pr_id, reason, head, fid),
+            )
+        else:
+            self._conn.execute(
+                """UPDATE findings
+                   SET status=?, resolved=datetime('now'), pr_id=?, reject_reason=?,
+                       blocked_at_head=NULL
+                   WHERE id=?""",
+                (status, pr_id, reason, fid),
+            )
         self._conn.commit()
 
     def refresh_blocked_head(self, fid: int, head: str) -> None:

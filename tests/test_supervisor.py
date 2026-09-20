@@ -65,6 +65,7 @@ def _cfg(**overrides) -> dict:
             "max_review_rounds": 2,
             "max_consecutive_failures": 5,
             "codex_call_budget": 100,
+            "max_repair_attempts": 3,
         },
         "audit_areas": [{"name": "correctness", "description": "bugs"}],
     }
@@ -1273,3 +1274,161 @@ class TestExhaustion:
             "commit_hash": "def5678",
         })
         assert db.clean_audit_streak("correctness", 3, "abc1234") == 0
+
+
+# ── rejected finding HEAD-pinning ──────────────────────────────────────────────
+
+class TestRejectedHeadPinning:
+    """Rejected findings must stay rejected at the same HEAD but reopen at a new one."""
+
+    def _fp(self, f):
+        from supervisor.db import _fingerprint
+        return _fingerprint(f["area"], f["file_path"], f["title"])
+
+    def test_rejected_at_same_head_not_reopened(self):
+        db = _db()
+        f = _open_finding(db, "no-fix bug")
+        db.mark_finding(f["id"], "rejected", reason="no changes", head="abc1234")
+        assert db.get_finding(f["id"])["rejected_at_head"] == "abc1234"
+        assert db.get_finding(f["id"])["repair_attempts"] == 1
+
+        _, is_new = db.upsert_finding({**f, "fingerprint": self._fp(f), "commit_hash": "abc1234"})
+
+        assert not is_new
+        assert db.get_finding(f["id"])["status"] == "rejected"
+
+    def test_rejected_at_different_head_reopened(self):
+        db = _db()
+        f = _open_finding(db, "no-fix bug")
+        db.mark_finding(f["id"], "rejected", reason="no changes", head="abc1234")
+
+        _, is_new = db.upsert_finding({**f, "fingerprint": self._fp(f), "commit_hash": "newhead9"})
+
+        assert is_new
+        assert db.get_finding(f["id"])["status"] == "open"
+        assert db.get_finding(f["id"])["repair_attempts"] == 0
+        assert db.get_finding(f["id"])["rejected_at_head"] is None
+
+    def test_rejected_null_head_is_reopened(self):
+        """Rejected with no HEAD recorded (old row) is always reopened."""
+        db = _db()
+        f = _open_finding(db, "legacy bug")
+        db.mark_finding(f["id"], "rejected", reason="no changes")  # head=None
+
+        _, is_new = db.upsert_finding({**f, "fingerprint": self._fp(f), "commit_hash": "anyhead"})
+
+        assert is_new
+        assert db.get_finding(f["id"])["status"] == "open"
+
+    def test_repair_attempts_incremented_on_rejection(self):
+        db = _db()
+        f = _open_finding(db, "stubborn bug")
+        db.mark_finding(f["id"], "rejected", reason="no changes", head="h1")
+        assert db.get_finding(f["id"])["repair_attempts"] == 1
+        # Reopening at a new HEAD resets the counter (fresh code, worth retrying).
+        from supervisor.db import _fingerprint
+        fp = _fingerprint(f["area"], f["file_path"], f["title"])
+        db.upsert_finding({**f, "fingerprint": fp, "commit_hash": "h2"})
+        assert db.get_finding(f["id"])["repair_attempts"] == 0
+        # Rejecting at the new HEAD increments from 0 to 1.
+        db.mark_finding(f["id"], "rejected", reason="no changes", head="h2")
+        assert db.get_finding(f["id"])["repair_attempts"] == 1
+
+    def test_repair_no_changes_increments_consecutive_failures(self, tmp_path):
+        from supervisor.phases import phase_repair
+
+        db = _db()
+        f = _open_finding(db)
+        cfg = _cfg()
+        cfg["repo"]["path"] = str(tmp_path)
+        ctr = {"codex_calls": 0, "consecutive_failures": 0}
+
+        with patch("supervisor.phases.run_codex"), \
+             patch("supervisor.phases.current_commit", return_value="abc"), \
+             patch("supervisor.phases.full_diff", return_value=""):
+            ok = phase_repair(cfg, db, [f], ctr)
+
+        assert not ok
+        assert ctr["consecutive_failures"] == 1
+        assert db.get_finding(f["id"])["repair_attempts"] == 1
+        assert db.get_finding(f["id"])["rejected_at_head"] == "abc"
+
+    def test_repair_attempts_cap_marks_blocked(self, tmp_path):
+        """After max_repair_attempts rejections, _fix_finding escalates to blocked."""
+        db = _db()
+        f = _open_finding(db)
+        sup = Supervisor(_cfg(), db)
+        max_attempts = sup.cfg["budget"]["max_repair_attempts"]  # 3
+        wt = tmp_path / "wt"
+        wt.mkdir()
+
+        # Pre-seed repair_attempts to max-1 so the next rejection hits the cap.
+        db._conn.execute(
+            "UPDATE findings SET repair_attempts=? WHERE id=?",
+            (max_attempts - 1, f["id"]),
+        )
+        db._conn.commit()
+
+        def fake_repair_no_changes(cfg, db_, findings, ctr):
+            db_.mark_finding(
+                findings[0]["id"], "rejected",
+                reason="no changes", head="abc1234",
+            )
+            ctr["consecutive_failures"] += 1
+            return False
+
+        with patch(f"{RUNNER_MODULE}.create_worktree", return_value=wt), \
+             patch(f"{RUNNER_MODULE}.remove_worktree"), \
+             patch(f"{RUNNER_MODULE}.phase_repair", side_effect=fake_repair_no_changes):
+            result = sup._fix_finding(db.get_finding(f["id"]), "abc1234")
+
+        assert result is False
+        assert db.get_finding(f["id"])["status"] == "blocked"
+        assert db.open_findings() == []
+
+
+# ── review loop: empty blocking comments ──────────────────────────────────────
+
+class TestReviewLoopProtocol:
+    def _db_and_cfg(self):
+        db = _db()
+        pr_id = db.create_pr("branch")
+        db.update_pr(pr_id, pr_number=1, pr_url="u")
+        return db, pr_id, _cfg()
+
+    def test_request_changes_no_blocking_treated_as_approved(self):
+        """request_changes with zero blocking comments must not call the implement step."""
+        from supervisor.phases import phase_review_loop
+
+        db, pr_id, cfg = self._db_and_cfg()
+        f = _open_finding(db)
+        ctr = {"codex_calls": 0, "consecutive_failures": 0}
+
+        optional_only = {
+            "verdict": "request_changes",
+            "summary": "minor nit",
+            "comments": [{"severity": "optional", "file": None, "description": "style"}],
+        }
+        with patch("supervisor.phases.parse_json", return_value=optional_only), \
+             patch("supervisor.phases.run_codex", return_value="") as mock_codex, \
+             patch("supervisor.phases.full_diff", return_value="diff"):
+            outcome = phase_review_loop(cfg, db, pr_id, [f], "branch", ctr)
+
+        assert outcome == REVIEW_APPROVED
+        # Only one Codex call: the review itself; no implement call.
+        assert mock_codex.call_count == 1
+
+    def test_approve_with_no_comments_returns_approved(self):
+        from supervisor.phases import phase_review_loop
+
+        db, pr_id, cfg = self._db_and_cfg()
+        f = _open_finding(db)
+        ctr = {"codex_calls": 0, "consecutive_failures": 0}
+
+        with patch("supervisor.phases.parse_json",
+                   return_value={"verdict": "approve", "summary": "ok", "comments": []}), \
+             patch("supervisor.phases.run_codex", return_value=""), \
+             patch("supervisor.phases.full_diff", return_value="diff"):
+            outcome = phase_review_loop(cfg, db, pr_id, [f], "branch", ctr)
+
+        assert outcome == REVIEW_APPROVED

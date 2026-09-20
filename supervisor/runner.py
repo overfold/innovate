@@ -270,7 +270,23 @@ class Supervisor:
             # Repair.
             if not phase_repair(wt_cfg, db, [f], self.ctr):
                 current = db.get_finding(f["id"])
-                if not current or current["status"] != "rejected":
+                if current and current["status"] == "rejected":
+                    max_attempts = cfg["budget"].get("max_repair_attempts", 3)
+                    if current["repair_attempts"] >= max_attempts:
+                        LOG.warning(
+                            "  Repair attempt cap (%d) reached — marking blocked",
+                            max_attempts,
+                        )
+                        db.mark_finding(
+                            f["id"], "blocked",
+                            pr_id=pr_id,
+                            reason=(
+                                f"repair produced no changes after "
+                                f"{max_attempts} attempt(s)"
+                            ),
+                            head=current_head,
+                        )
+                else:
                     db.mark_finding(f["id"], "open")
                 return False
 

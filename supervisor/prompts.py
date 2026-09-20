@@ -64,14 +64,13 @@ changed and why.  Do not modify files beyond what is needed for this fix.
 """
 
 VERIFY_PROMPT = """\
-Inspect this diff and decide whether the fix is correct.
+Inspect the repository and decide whether the fix is correct.
 
 Intended fix: {title}
 Background:
 {description}
 
-Diff:
-{diff}
+Run `git diff {base}` in the repository to inspect the complete set of changes.
 
 Return ONLY a JSON object:
 {{
@@ -82,13 +81,12 @@ Return ONLY a JSON object:
 """
 
 REVIEW_PROMPT = """\
-Review this pull request diff as part of an automated maintenance workflow.
+Review this pull request as part of an automated maintenance workflow.
 
 PR title: {pr_title}
 Fixing:   {finding_titles}
 
-Diff:
-{diff}
+Run `git diff {base}` in the repository to inspect the complete set of changes.
 
 Check for: correctness of the fix, unintended regressions, scope creep
 (changes beyond the stated intent), missing test coverage, remaining

@@ -27,6 +27,7 @@ from __future__ import annotations
 import argparse
 import logging
 import os
+import subprocess
 import sys
 import time
 from pathlib import Path
@@ -36,17 +37,94 @@ from supervisor.db import DB
 from supervisor.phases import phase_audit
 from supervisor.runner import Supervisor, cmd_findings, cmd_status
 
+_MUTATING_CMDS = {"run", "run-continuous", "audit"}
 
-def _check_tools(cfg: dict) -> None:
+
+def _validate_config(cfg: dict, config_path: str) -> None:
+    """Abort with a clear error if the config is unsafe for mutating commands.
+
+    Checks owner/name, repo path, git remote, default branch, audit areas,
+    budget values, and required binaries.  Any failure hard-exits before the
+    DB is opened or Codex is invoked.
+    """
+    if not Path(config_path).exists():
+        sys.exit(
+            f"Config file not found: {config_path}\n"
+            "Copy config.toml and fill in repo.owner, repo.name, and repo.path "
+            "before running maintenance commands."
+        )
+
+    errors: list[str] = []
+
+    owner = cfg["repo"]["owner"].strip()
+    name = cfg["repo"]["name"].strip()
+    if not owner:
+        errors.append("repo.owner is empty")
+    if not name:
+        errors.append("repo.name is empty")
+
+    default_branch = cfg["repo"]["default_branch"].strip()
+    if not default_branch:
+        errors.append("repo.default_branch is empty")
+
+    repo_path = Path(cfg["repo"]["path"]).resolve()
+    if not repo_path.exists():
+        errors.append(f"repo.path does not exist: {repo_path}")
+    else:
+        r = subprocess.run(
+            ["git", "rev-parse", "--git-dir"],
+            cwd=str(repo_path),
+            capture_output=True,
+            text=True,
+        )
+        if r.returncode != 0:
+            errors.append(f"repo.path is not a Git repository: {repo_path}")
+        elif owner and name:
+            r2 = subprocess.run(
+                ["git", "remote", "get-url", "origin"],
+                cwd=str(repo_path),
+                capture_output=True,
+                text=True,
+            )
+            if r2.returncode != 0:
+                errors.append("Git remote 'origin' is not configured")
+            else:
+                remote_url = r2.stdout.strip()
+                expected = f"{owner}/{name}"
+                if expected.lower() not in remote_url.lower():
+                    errors.append(
+                        f"Git remote 'origin' ({remote_url!r}) does not contain "
+                        f"'{expected}' — check repo.owner and repo.name"
+                    )
+
+    if not cfg.get("audit_areas"):
+        errors.append("audit_areas is empty — nothing to audit")
+
+    for key in (
+        "max_audits_per_area", "max_fixes_per_run", "max_review_rounds",
+        "max_consecutive_failures", "codex_call_budget",
+    ):
+        val = cfg["budget"].get(key)
+        if not isinstance(val, int) or val <= 0:
+            errors.append(
+                f"budget.{key} must be a positive integer (got {val!r})"
+            )
+
     path_dirs = os.environ.get("PATH", "").split(os.pathsep)
-    for binary, install_hint in [
+    for binary, hint in [
         (cfg["codex"]["cmd"], "Install with: npm install -g @openai/codex"),
         ("gh", "Install from: https://cli.github.com"),
     ]:
         if not any((Path(d) / binary).is_file() for d in path_dirs):
-            logging.getLogger("supervisor").warning(
-                "Prerequisite not found: '%s'.  %s", binary, install_hint
+            errors.append(
+                f"Required binary not found in PATH: '{binary}'. {hint}"
             )
+
+    if errors:
+        sys.exit(
+            "Configuration errors — aborting before making any changes:\n"
+            + "\n".join(f"  • {e}" for e in errors)
+        )
 
 
 def main() -> None:
@@ -97,7 +175,9 @@ def main() -> None:
     )
 
     cfg = load_config(Path(args.config))
-    _check_tools(cfg)
+
+    if args.cmd in _MUTATING_CMDS:
+        _validate_config(cfg, args.config)
 
     db = DB(Path(args.db))
     try:
