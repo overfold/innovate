@@ -121,17 +121,18 @@ def phase_audit(cfg: dict, db: DB, area: dict, ctr: dict) -> int:
             timeout=cfg["codex"]["timeout"],
             output_schema=AUDIT_SCHEMA,
         )
-        raw_findings = parse_json(output)
+        parsed = parse_json(output)
     except (CodexError, ValueError) as exc:
         LOG.error("Audit failed for %s: %s", area["name"], exc)
         db.finish_audit(run_id, 0, 0, "failed")
         ctr["consecutive_failures"] += 1
         return 0
 
+    raw_findings = parsed.get("findings") if isinstance(parsed, dict) else None
     if not isinstance(raw_findings, list):
         LOG.error(
-            "Audit %s: unexpected output structure (expected list, got %s) — treating as failed",
-            area["name"], type(raw_findings).__name__,
+            "Audit %s: unexpected output structure — treating as failed",
+            area["name"],
         )
         db.finish_audit(run_id, 0, 0, "failed")
         ctr["consecutive_failures"] += 1
@@ -313,8 +314,18 @@ def phase_review_loop(
     finding_titles = "; ".join(f["title"] for f in findings)
     pr_title = f"maint: {finding_titles[:60]}"
 
+    codex_budget = cfg["budget"]["codex_call_budget"]
+
     for rnd in range(1, max_rounds + 1):
         LOG.info("  Review round %d/%d", rnd, max_rounds)
+
+        if ctr["codex_calls"] >= codex_budget:
+            LOG.warning(
+                "  Codex call budget (%d) reached — pausing PR for human review",
+                codex_budget,
+            )
+            db.update_pr(pr_id, review_rounds=rnd - 1)
+            return REVIEW_PAUSED_BUDGET
 
         diff = full_diff(repo, main)
         prompt = REVIEW_PROMPT.format(
@@ -343,7 +354,7 @@ def phase_review_loop(
         LOG.info("  Review verdict: %s — %s", verdict, review.get("summary", ""))
 
         blocking = [
-            c for c in review.get("comments", [])
+            c for c in (review.get("comments") or [])
             if c.get("severity") == "blocking"
         ]
 
@@ -359,6 +370,15 @@ def phase_review_loop(
         )
         impl_prompt = IMPLEMENT_REVIEW_PROMPT.format(comments=comments_text)
         prev_diff = diff
+
+        if ctr["codex_calls"] >= codex_budget:
+            LOG.warning(
+                "  Codex call budget (%d) reached before implementing feedback"
+                " — pausing PR for human review",
+                codex_budget,
+            )
+            db.update_pr(pr_id, review_rounds=rnd)
+            return REVIEW_PAUSED_BUDGET
 
         try:
             ctr["codex_calls"] += 1

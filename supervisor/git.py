@@ -72,6 +72,29 @@ def gh_create_pr(
     return (int(m.group(1)) if m else 0), url
 
 
+def gh_pr_state(owner: str, repo_name: str, pr_number: int) -> str:
+    """Return 'open', 'merged', 'closed', or 'unknown'."""
+    r = subprocess.run(
+        [
+            "gh", "pr", "view", str(pr_number),
+            "--repo", f"{owner}/{repo_name}",
+            "--json", "state,mergedAt",
+        ],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    if r.returncode != 0:
+        return "unknown"
+    try:
+        data = json.loads(r.stdout)
+    except json.JSONDecodeError:
+        return "unknown"
+    if data.get("mergedAt"):
+        return "merged"
+    return data.get("state", "unknown").lower()
+
+
 def gh_close_pr(owner: str, repo_name: str, pr_number: int) -> None:
     subprocess.run(
         ["gh", "pr", "close", str(pr_number), "--repo", f"{owner}/{repo_name}"],

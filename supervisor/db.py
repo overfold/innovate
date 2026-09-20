@@ -102,11 +102,37 @@ class DB:
     # ── findings ─────────────────────────────────────────────────────────────
 
     def upsert_finding(self, f: dict) -> tuple[int, bool]:
-        """Insert if fingerprint is new.  Returns (row_id, is_new)."""
+        """Insert or re-open a regressed finding.  Returns (row_id, is_new).
+
+        If a finding with the same fingerprint already exists in a terminal
+        state (fixed/stale/rejected) it is reopened with refreshed metadata and
+        treated as new, so the regression is acted on.  Findings that are still
+        open, in_progress, or paused are left untouched.
+        """
         row = self._conn.execute(
-            "SELECT id FROM findings WHERE fingerprint=?", (f["fingerprint"],)
+            "SELECT id, status FROM findings WHERE fingerprint=?", (f["fingerprint"],)
         ).fetchone()
         if row:
+            if row["status"] in ("fixed", "stale", "rejected"):
+                self._conn.execute(
+                    """UPDATE findings
+                       SET status='open', resolved=NULL, pr_id=NULL,
+                           reject_reason=NULL, commit_hash=?,
+                           severity=?, confidence=?, file_path=?,
+                           line_range=?, description=?
+                       WHERE id=?""",
+                    (
+                        f.get("commit_hash"),
+                        f.get("severity"),
+                        f.get("confidence"),
+                        f.get("file_path"),
+                        f.get("line_range"),
+                        f.get("description"),
+                        row["id"],
+                    ),
+                )
+                self._conn.commit()
+                return row["id"], True
             return row["id"], False
         cur = self._conn.execute(
             """INSERT INTO findings
@@ -141,6 +167,11 @@ class DB:
     def paused_findings(self) -> list[sqlite3.Row]:
         return self._conn.execute(
             "SELECT * FROM findings WHERE status='paused' ORDER BY id"
+        ).fetchall()
+
+    def in_progress_findings(self) -> list[sqlite3.Row]:
+        return self._conn.execute(
+            "SELECT * FROM findings WHERE status='in_progress' ORDER BY id"
         ).fetchall()
 
     def mark_finding(

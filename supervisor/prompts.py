@@ -11,8 +11,9 @@ Rules:
 - Do NOT flag issues that are clearly intentional design decisions.
 - Confidence should reflect how certain you are this is a real bug.
 
-Return ONLY a JSON array.  If there are no findings, return [].
-Each element:
+Return ONLY a JSON object with a "findings" array.  If there are no findings,
+return {{"findings": []}}.
+Each element of "findings":
 {{
   "title":       "<concise problem title, under 80 chars>",
   "description": "<detailed: what is wrong, why it matters, how to fix>",
