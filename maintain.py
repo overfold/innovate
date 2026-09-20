@@ -42,17 +42,21 @@ from supervisor.runner import Supervisor, cmd_findings, cmd_status
 _MUTATING_CMDS = {"run", "run-continuous", "audit"}
 
 
-def _parse_remote_owner_repo(remote_url: str) -> str | None:
-    """Normalize an SSH or HTTPS remote URL to lowercase 'owner/repo'."""
+def _parse_remote_owner_repo(remote_url: str) -> tuple[str, str] | None:
+    """Parse SSH or HTTPS remote URL into (host, owner/repo), lowercased.
+
+    Returns None if the URL is not a recognized SSH or HTTPS Git remote.
+    Both components are lowercased for case-insensitive comparison.
+    """
     url = remote_url.strip()
     # SSH: git@host:owner/repo[.git]
-    m = re.match(r"^git@[^:]+:(.+?)(?:\.git)?$", url)
+    m = re.match(r"^git@([^:]+):(.+?)(?:\.git)?$", url)
     if m:
-        return m.group(1).lower()
+        return m.group(1).lower(), m.group(2).lower()
     # HTTPS: https://host/owner/repo[.git]
-    m = re.match(r"^https?://[^/]+/(.+?)(?:\.git)?/?$", url)
+    m = re.match(r"^https?://([^/]+)/(.+?)(?:\.git)?/?$", url)
     if m:
-        return m.group(1).lower()
+        return m.group(1).lower(), m.group(2).lower()
     return None
 
 
@@ -86,6 +90,11 @@ def _validate_config(cfg: dict, config_path: str) -> None:
     repo_path = Path(cfg["repo"]["path"]).resolve()
     if not repo_path.exists():
         errors.append(f"repo.path does not exist: {repo_path}")
+    elif not shutil.which("git"):
+        errors.append(
+            "Required binary not found in PATH: 'git'."
+            " Install Git from: https://git-scm.com"
+        )
     else:
         r = subprocess.run(
             ["git", "rev-parse", "--git-dir"],
@@ -106,13 +115,23 @@ def _validate_config(cfg: dict, config_path: str) -> None:
                 errors.append("Git remote 'origin' is not configured")
             else:
                 remote_url = r2.stdout.strip()
-                extracted = _parse_remote_owner_repo(remote_url)
-                expected = f"{owner}/{name}".lower()
-                if extracted != expected:
+                parsed = _parse_remote_owner_repo(remote_url)
+                expected_path = f"{owner}/{name}".lower()
+                if parsed is None:
                     errors.append(
-                        f"Git remote 'origin' ({remote_url!r}) resolves to "
-                        f"'{extracted}', expected '{expected}' — "
-                        f"check repo.owner and repo.name"
+                        f"Git remote 'origin' URL is not a recognized"
+                        f" SSH or HTTPS remote: {remote_url!r}"
+                    )
+                elif parsed[0] != "github.com":
+                    errors.append(
+                        f"Git remote 'origin' host is {parsed[0]!r},"
+                        f" expected 'github.com'"
+                    )
+                elif parsed[1] != expected_path:
+                    errors.append(
+                        f"Git remote 'origin' ({remote_url!r}) points to"
+                        f" '{parsed[1]}', expected '{expected_path}' —"
+                        f" check repo.owner and repo.name"
                     )
 
     if not cfg.get("audit_areas"):
@@ -129,7 +148,6 @@ def _validate_config(cfg: dict, config_path: str) -> None:
             )
 
     for binary, hint in [
-        ("git", "Install Git from: https://git-scm.com"),
         (cfg["codex"]["cmd"], "Install with: npm install -g @openai/codex"),
         ("gh", "Install from: https://cli.github.com"),
     ]:

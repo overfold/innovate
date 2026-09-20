@@ -90,6 +90,49 @@ def _open_finding(db: DB, title: str = "Test bug", area: str = "correctness") ->
     return dict(db.get_finding(fid))
 
 
+# ── _parse_remote_owner_repo unit tests ───────────────────────────────────────
+
+class TestParseRemoteOwnerRepo:
+    def setup_method(self):
+        from maintain import _parse_remote_owner_repo
+        self.parse = _parse_remote_owner_repo
+
+    def test_ssh_github(self):
+        assert self.parse("git@github.com:owner/repo.git") == ("github.com", "owner/repo")
+
+    def test_ssh_github_no_dot_git(self):
+        assert self.parse("git@github.com:owner/repo") == ("github.com", "owner/repo")
+
+    def test_https_github(self):
+        assert self.parse("https://github.com/owner/repo.git") == ("github.com", "owner/repo")
+
+    def test_https_github_no_dot_git(self):
+        assert self.parse("https://github.com/owner/repo") == ("github.com", "owner/repo")
+
+    def test_non_github_host_ssh(self):
+        host, path = self.parse("git@gitlab.com:owner/repo.git")
+        assert host == "gitlab.com"
+        assert path == "owner/repo"
+
+    def test_non_github_host_https(self):
+        host, path = self.parse("https://example.com/owner/repo.git")
+        assert host == "example.com"
+        assert path == "owner/repo"
+
+    def test_unrecognized_url_returns_none(self):
+        assert self.parse("not-a-url") is None
+
+    def test_lowercased(self):
+        host, path = self.parse("git@GitHub.COM:Owner/Repo.git")
+        assert host == "github.com"
+        assert path == "owner/repo"
+
+    def test_trailing_slash_stripped(self):
+        host, path = self.parse("https://github.com/owner/repo/")
+        assert host == "github.com"
+        assert path == "owner/repo"
+
+
 # ── DB unit tests ──────────────────────────────────────────────────────────────
 
 class TestDB:
