@@ -31,7 +31,13 @@ CREATE TABLE IF NOT EXISTS findings (
     reject_reason   TEXT,
     blocked_at_head  TEXT,   -- commit SHA where this finding was last confirmed blocked
     rejected_at_head TEXT,   -- commit SHA where repair last produced no changes
-    repair_attempts  INTEGER NOT NULL DEFAULT 0
+    repair_attempts  INTEGER NOT NULL DEFAULT 0,
+    -- 'invalid': audit claim disproved at validated_at_head (HEAD-pinned, no repair)
+    -- 'uncertain': could not confirm; blocked for human review (same as 'blocked')
+    validation_verdict  TEXT,   -- valid | invalid | uncertain | NULL (not yet validated)
+    validated_at_head   TEXT,   -- HEAD at which the last validation was performed
+    validation_reason   TEXT,   -- validator's one-sentence conclusion
+    validation_evidence TEXT    -- validator's concrete code evidence
 );
 
 CREATE TABLE IF NOT EXISTS audit_runs (
@@ -93,6 +99,10 @@ class DB:
             "ALTER TABLE findings ADD COLUMN blocked_at_head TEXT",
             "ALTER TABLE findings ADD COLUMN rejected_at_head TEXT",
             "ALTER TABLE findings ADD COLUMN repair_attempts INTEGER NOT NULL DEFAULT 0",
+            "ALTER TABLE findings ADD COLUMN validation_verdict TEXT",
+            "ALTER TABLE findings ADD COLUMN validated_at_head TEXT",
+            "ALTER TABLE findings ADD COLUMN validation_reason TEXT",
+            "ALTER TABLE findings ADD COLUMN validation_evidence TEXT",
         ]:
             try:
                 self._conn.execute(_migration)
@@ -126,11 +136,13 @@ class DB:
         open, in_progress, or paused are left untouched.
         """
         row = self._conn.execute(
-            "SELECT id, status, rejected_at_head FROM findings WHERE fingerprint=?",
+            "SELECT id, status, rejected_at_head, validated_at_head"
+            " FROM findings WHERE fingerprint=?",
             (f["fingerprint"],),
         ).fetchone()
         if row:
             was_rejected = row["status"] == "rejected"
+            was_invalid  = row["status"] == "invalid"
             if was_rejected:
                 # Rejection is terminal for that HEAD: only reopen once HEAD changes.
                 rah = row["rejected_at_head"]
@@ -138,9 +150,16 @@ class DB:
                 if rah and fch and rah == fch:
                     return row["id"], False  # same HEAD — leave rejected
                 # Different (or unknown) HEAD: fall through to reopen below.
+            elif was_invalid:
+                # Invalidation is terminal for that HEAD: only reopen once HEAD changes.
+                iah = row["validated_at_head"]
+                fch = f.get("commit_hash")
+                if iah and fch and iah == fch:
+                    return row["id"], False  # same HEAD — leave invalid
+                # Different (or unknown) HEAD: fall through to reopen below.
             elif row["status"] not in ("fixed", "stale"):
                 return row["id"], False
-            # Reopen: fixed/stale regression, or rejected finding at a new HEAD.
+            # Reopen: fixed/stale regression, or rejected/invalid finding at a new HEAD.
             common_args = (
                 f.get("commit_hash"),
                 f.get("severity"),
@@ -159,7 +178,23 @@ class DB:
                            reject_reason=NULL, commit_hash=?,
                            severity=?, confidence=?, file_path=?,
                            line_range=?, description=?,
-                           rejected_at_head=NULL
+                           rejected_at_head=NULL,
+                           validation_verdict=NULL, validated_at_head=NULL,
+                           validation_reason=NULL, validation_evidence=NULL
+                       WHERE id=?""",
+                    common_args,
+                )
+            elif was_invalid:
+                # Invalid finding rediscovered at a new HEAD: fresh slate, re-validate.
+                self._conn.execute(
+                    """UPDATE findings
+                       SET status='open', resolved=NULL, pr_id=NULL,
+                           reject_reason=NULL, commit_hash=?,
+                           severity=?, confidence=?, file_path=?,
+                           line_range=?, description=?,
+                           validation_verdict=NULL, validated_at_head=NULL,
+                           validation_reason=NULL, validation_evidence=NULL,
+                           repair_attempts=0
                        WHERE id=?""",
                     common_args,
                 )
@@ -171,7 +206,9 @@ class DB:
                            reject_reason=NULL, commit_hash=?,
                            severity=?, confidence=?, file_path=?,
                            line_range=?, description=?,
-                           rejected_at_head=NULL, repair_attempts=0
+                           rejected_at_head=NULL, repair_attempts=0,
+                           validation_verdict=NULL, validated_at_head=NULL,
+                           validation_reason=NULL, validation_evidence=NULL
                        WHERE id=?""",
                     common_args,
                 )
@@ -240,6 +277,18 @@ class DB:
             "SELECT * FROM findings WHERE status='in_progress' ORDER BY id"
         ).fetchall()
 
+    def set_validation(
+        self, fid: int, verdict: str, head: str,
+        reason: str = "", evidence: str = "",
+    ) -> None:
+        """Record a validation result without changing the finding status."""
+        self._conn.execute(
+            "UPDATE findings SET validation_verdict=?, validated_at_head=?,"
+            " validation_reason=?, validation_evidence=? WHERE id=?",
+            (verdict, head, reason or "", evidence or "", fid),
+        )
+        self._conn.commit()
+
     def mark_finding(
         self,
         fid: int,
@@ -254,6 +303,17 @@ class DB:
                    SET status=?, resolved=datetime('now'), pr_id=?, reject_reason=?,
                        blocked_at_head=NULL, rejected_at_head=?,
                        repair_attempts=repair_attempts + 1
+                   WHERE id=?""",
+                (status, pr_id, reason, head, fid),
+            )
+        elif status == "invalid":
+            # HEAD-pinned: same-HEAD rediscovery leaves the finding invalid;
+            # a new HEAD clears validation state and reopens it.
+            self._conn.execute(
+                """UPDATE findings
+                   SET status=?, resolved=datetime('now'), pr_id=?, reject_reason=?,
+                       validation_verdict='invalid', validated_at_head=?,
+                       blocked_at_head=NULL
                    WHERE id=?""",
                 (status, pr_id, reason, head, fid),
             )

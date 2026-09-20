@@ -34,6 +34,7 @@ from .phases import (
     phase_repair,
     phase_revalidate,
     phase_review_loop,
+    phase_validate,
     phase_verify,
 )
 
@@ -266,6 +267,56 @@ class Supervisor:
                     LOG.warning("  Revalidation failed — skipping this run")
                     self.ctr["consecutive_failures"] += 1
                     return False
+
+            # Validate the finding before repair: confirm the audit claim is real.
+            # Use a persisted verdict for this exact HEAD when available (crash-safe
+            # resume).  phase_validate persists verdict+reason+evidence before returning,
+            # so any of valid/invalid/uncertain cached at current_head is authoritative.
+            finding_state = db.get_finding(f["id"])
+            cached = (
+                finding_state["validation_verdict"]
+                if finding_state["validated_at_head"] == current_head
+                   and finding_state["validation_verdict"] in ("valid", "invalid", "uncertain")
+                else None
+            )
+            if cached is not None:
+                LOG.info(
+                    "  Reusing cached validation verdict %s at %s",
+                    cached, current_head[:7],
+                )
+                val = cached
+            else:
+                LOG.info("  Validating finding at %s", current_head[:7])
+                val = phase_validate(wt_cfg, f, self.ctr, db=db)
+
+            if val == "invalid":
+                LOG.info(
+                    "  Validation: invalid — finding disproved at %s",
+                    current_head[:7],
+                )
+                db.mark_finding(f["id"], "invalid", head=current_head)
+                return False
+            elif val == "uncertain":
+                LOG.warning("  Validation: uncertain — blocking for human review")
+                db.mark_finding(
+                    f["id"], "blocked",
+                    pr_id=pr_id,
+                    reason="validation uncertain — requires human review",
+                    head=current_head,
+                )
+                return False
+            elif val == "error":
+                LOG.warning("  Validation call failed — requeueing finding")
+                db.mark_finding(f["id"], "open")
+                self.ctr["consecutive_failures"] += 1
+                return False
+            elif val == "deferred":
+                LOG.info(
+                    "  Validation deferred — Codex budget exhausted, requeueing"
+                )
+                db.mark_finding(f["id"], "open")
+                return False
+            # else: valid — proceed to repair
 
             # Repair.
             if not phase_repair(wt_cfg, db, [f], self.ctr):

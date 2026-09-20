@@ -47,6 +47,38 @@ Return ONLY a JSON object:
 }}
 """
 
+VALIDATE_PROMPT = """\
+A code audit reported the following finding.  Your task is to INDEPENDENTLY
+VALIDATE whether this finding is correct.  Do NOT propose or implement any fix.
+
+Finding:
+  Area:        {area}
+  Title:       {title}
+  File:        {file_path}
+  Lines:       {line_range}
+  Description:
+{description}
+
+Inspect the repository carefully at its current state.  Challenge the audit claim:
+1. Can the described behavior actually occur given the code paths?
+2. Do existing invariants, guards, or surrounding code already prevent the issue?
+3. Could the finding misunderstand the intended behaviour?
+4. Does the claimed impact actually follow from the code?
+
+Do NOT suggest or implement any fix.  Report only whether the issue is real.
+
+Return ONLY a JSON object:
+{{
+  "verdict":  "valid|invalid|uncertain",
+  "reason":   "<one-sentence conclusion>",
+  "evidence": "<concrete code facts supporting the verdict>"
+}}
+
+Use "valid" only when you are confident the issue exists as described.
+Use "invalid" when you are confident the issue cannot occur or was misidentified.
+Use "uncertain" when you cannot determine with confidence whether the issue exists.
+"""
+
 REPAIR_PROMPT = """\
 Fix the following maintenance issue in this repository.
 Make the MINIMAL change necessary — do not modify unrelated code.

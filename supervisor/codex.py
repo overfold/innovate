@@ -65,6 +65,17 @@ VERIFY_SCHEMA: str = json.dumps({
     "required": ["verdict", "reason", "issues"],
 })
 
+VALIDATE_SCHEMA: str = json.dumps({
+    "type": "object",
+    "additionalProperties": False,
+    "properties": {
+        "verdict":  {"type": "string", "enum": ["valid", "invalid", "uncertain"]},
+        "reason":   {"type": "string"},
+        "evidence": {"type": "string"},
+    },
+    "required": ["verdict", "reason", "evidence"],
+})
+
 REVIEW_SCHEMA: str = json.dumps({
     "type": "object",
     "additionalProperties": False,
