@@ -9,17 +9,17 @@ logic; Codex is only invoked for AI-powered analysis and code changes.
 
 Usage:
     python maintain.py run                # one full iteration
-    python maintain.py run --continuous   # loop until exhausted
+    python maintain.py run-continuous     # loop until exhausted
     python maintain.py status             # show queue and progress
     python maintain.py audit <area>       # manual single-area audit
-    python maintain.py findings           # list open findings
+    python maintain.py findings           # list open/paused findings
     python maintain.py reset              # clear all state (asks for confirmation)
 
 Prerequisites:
     - Codex CLI installed and authenticated  (npm install -g @openai/codex)
     - GitHub CLI installed and authenticated (gh auth login)
     - A local clone of the target repository
-    - config.toml (copy config.toml.example and fill in repo.owner / repo.name / repo.path)
+    - config.toml filled in with repo.owner / repo.name / repo.path
 """
 
 from __future__ import annotations
@@ -44,37 +44,51 @@ LOG = logging.getLogger("supervisor")
 
 DEFAULT_CONFIG: dict[str, Any] = {
     "repo": {
-        "owner": "",           # GitHub owner / org
-        "name": "",            # Repository name (without owner prefix)
-        "path": ".",           # Absolute or relative path to the local clone
+        "owner": "",              # GitHub owner / org
+        "name": "",               # Repository name (without owner prefix)
+        "path": ".",              # Absolute or relative path to the local clone
         "default_branch": "main",
+        # Optional one-line trailer appended to automated commit messages.
+        # Example: "Automated-by: maintain.py"
+        "commit_trailer": "",
+        # Optional footer appended to PR bodies.
+        "pr_footer": "",
     },
     "codex": {
         "cmd": "codex",
         "model": "o4-mini",
-        "timeout": 300,        # seconds per invocation
-        # Flags for read-only invocations (audit, diff-review)
-        "audit_flags": ["--quiet", "--approval-mode", "suggest"],
-        # Flags for file-editing invocations (repair, implement review feedback)
-        "repair_flags": ["--quiet", "--approval-mode", "full-auto"],
+        "timeout": 300,           # seconds per invocation
+        # Flags for read-only invocations (audit, diff-review, revalidation).
+        # "exec" is the Codex subcommand for non-interactive automation.
+        # --model is inserted automatically after the subcommand.
+        "audit_flags": ["exec", "--quiet"],
+        # Flags for file-editing invocations (repair, implement review feedback).
+        # workspace-write sandbox allows Codex to modify files.
+        "repair_flags": ["exec", "--quiet", "--sandbox", "workspace-write"],
     },
     "verify": {
-        # Optional shell command to run before opening a PR.
-        # Leave empty to skip local verification.
+        # Optional shell command run inside the repo before opening a PR.
+        # Non-zero exit discards the fix and re-queues the finding.
         "test_cmd": "",
-        # Seconds to wait for CI checks on the PR before attempting a merge.
-        # 0 = do not wait (skip CI gate — only use this on repos without CI).
+        # Seconds to wait for GitHub CI checks to report a result.
+        # The supervisor blocks until success or failure (not just "started").
+        # Only an explicit "success" result permits a merge.
         "ci_wait_timeout": 600,
+        # Set to true ONLY for repositories that genuinely have no CI.
+        # When false (the default), 'no checks', API errors, and timeouts all
+        # block the merge — the supervisor never assumes CI passed.
+        "allow_no_ci": False,
     },
     "budget": {
-        # How many consecutive clean audits (0 new findings) before an area
-        # is considered exhausted.
+        # Consecutive clean audits at the SAME HEAD before an area is exhausted.
+        # After any merge (HEAD changes), the streak resets for all areas.
         "max_audits_per_area": 3,
         # Max findings fixed in a single supervisor run (safety brake).
         "max_fixes_per_run": 20,
         # Max Codex review→fix cycles per PR.
+        # Exhausting this budget produces "paused_budget", NOT approval.
         "max_review_rounds": 4,
-        # Abort the run if this many consecutive operations fail.
+        # Abort the run after this many consecutive operation failures.
         "max_consecutive_failures": 5,
         # Total Codex invocations allowed per run.
         "codex_call_budget": 100,
@@ -140,8 +154,8 @@ DEFAULT_CONFIG: dict[str, Any] = {
     ],
 }
 
-# Priority ordering used when sorting open findings.
-_SEV_RANK = {"critical": 0, "high": 1, "medium": 2, "low": 3}
+# Priority ordering for sorting open findings.
+_SEV_RANK  = {"critical": 0, "high": 1, "medium": 2, "low": 3}
 _CONF_RANK = {"high": 0, "medium": 1, "low": 2}
 
 
@@ -151,30 +165,33 @@ def load_config(path: Path) -> dict[str, Any]:
     cfg: dict[str, Any] = {}
     _deep_merge(cfg, DEFAULT_CONFIG)
 
-    if path.exists():
-        try:
-            if sys.version_info >= (3, 11):
-                import tomllib  # stdlib in 3.11+
-                with open(path, "rb") as f:
-                    user_cfg = tomllib.load(f)
-            elif path.suffix == ".json":
-                with open(path) as f:
-                    user_cfg = json.load(f)
-            else:
-                raise RuntimeError(
-                    "Python < 3.11 requires config.json instead of config.toml. "
-                    "Either upgrade Python or rename the file and use JSON syntax."
-                )
-            _deep_merge(cfg, user_cfg)
-        except Exception as exc:
-            LOG.warning("Could not load config from %s: %s", path, exc)
-    else:
+    if not path.exists():
         LOG.warning(
-            "No config file found at %s — running with defaults. "
-            "Copy config.toml.example to config.toml and set repo.owner / repo.name / repo.path.",
+            "Config file not found at %s — running with built-in defaults. "
+            "Set repo.owner / repo.name / repo.path before running 'run'.",
             path,
         )
+        return cfg
 
+    # Config file exists — parse errors are fatal, not warnings.
+    try:
+        if sys.version_info >= (3, 11):
+            import tomllib  # stdlib in 3.11+
+            with open(path, "rb") as f:
+                user_cfg = tomllib.load(f)
+        elif path.suffix == ".json":
+            with open(path) as f:
+                user_cfg = json.load(f)
+        else:
+            sys.exit(
+                f"Error: Python < 3.11 cannot parse TOML. "
+                f"Rename {path} to config.json and use JSON syntax, "
+                "or upgrade Python to 3.11+."
+            )
+    except Exception as exc:
+        sys.exit(f"Error: cannot parse config file {path}: {exc}")
+
+    _deep_merge(cfg, user_cfg)
     return cfg
 
 
@@ -199,7 +216,9 @@ CREATE TABLE IF NOT EXISTS findings (
     line_range    TEXT,
     title         TEXT    NOT NULL,
     description   TEXT    NOT NULL,
-    -- open | in_progress | fixed | rejected | stale
+    -- open | in_progress | fixed | rejected | stale | paused
+    -- 'paused': PR hit the review-round limit; awaiting human review.
+    -- 'stale':  finding no longer applies at current HEAD.
     status        TEXT    NOT NULL DEFAULT 'open',
     discovered    TEXT    NOT NULL DEFAULT (datetime('now')),
     commit_hash   TEXT,
@@ -225,7 +244,7 @@ CREATE TABLE IF NOT EXISTS prs (
     branch        TEXT    NOT NULL,
     pr_number     INTEGER,
     pr_url        TEXT,
-    -- open | merged | closed | failed
+    -- open | paused | merged | closed | failed
     status        TEXT    NOT NULL DEFAULT 'open',
     created       TEXT    NOT NULL DEFAULT (datetime('now')),
     merged        TEXT,
@@ -239,7 +258,6 @@ CREATE TABLE IF NOT EXISTS sweeps (
     areas_covered   INTEGER DEFAULT 0,
     findings_fixed  INTEGER DEFAULT 0,
     prs_merged      INTEGER DEFAULT 0,
-    -- clean | findings_found
     result          TEXT
 );
 
@@ -262,7 +280,9 @@ class DB:
     # ── key/value state ──────────────────────────────────────────────────────
 
     def get(self, key: str, default: str = "") -> str:
-        row = self._conn.execute("SELECT value FROM kv WHERE key=?", (key,)).fetchone()
+        row = self._conn.execute(
+            "SELECT value FROM kv WHERE key=?", (key,)
+        ).fetchone()
         return row["value"] if row else default
 
     def put(self, key: str, value: str) -> None:
@@ -274,8 +294,7 @@ class DB:
     # ── findings ─────────────────────────────────────────────────────────────
 
     def upsert_finding(self, f: dict) -> tuple[int, bool]:
-        """Insert if not already present (deduped by fingerprint).
-        Returns (row_id, is_new)."""
+        """Insert if fingerprint is new.  Returns (row_id, is_new)."""
         row = self._conn.execute(
             "SELECT id FROM findings WHERE fingerprint=?", (f["fingerprint"],)
         ).fetchone()
@@ -311,6 +330,11 @@ class DB:
             ),
         )
 
+    def paused_findings(self) -> list[sqlite3.Row]:
+        return self._conn.execute(
+            "SELECT * FROM findings WHERE status='paused' ORDER BY id"
+        ).fetchall()
+
     def mark_finding(
         self,
         fid: int,
@@ -329,9 +353,7 @@ class DB:
     # ── PRs ──────────────────────────────────────────────────────────────────
 
     def create_pr(self, branch: str) -> int:
-        cur = self._conn.execute(
-            "INSERT INTO prs(branch) VALUES(?)", (branch,)
-        )
+        cur = self._conn.execute("INSERT INTO prs(branch) VALUES(?)", (branch,))
         self._conn.commit()
         return cur.lastrowid
 
@@ -367,15 +389,24 @@ class DB:
         )
         self._conn.commit()
 
-    def clean_audit_streak(self, area: str, window: int) -> int:
-        """Count consecutive recent audit runs (newest first) with 0 new findings."""
+    def clean_audit_streak(self, area: str, window: int, current_head: str) -> int:
+        """Count consecutive recent clean audits (0 new findings) for *area*.
+
+        Exhaustion is HEAD-tied: the streak is only non-zero when the MOST
+        RECENT audit for this area was performed at *current_head*.  If HEAD
+        has moved since the last audit (e.g. after a merge), the streak resets
+        to 0 and the area needs to be re-audited.
+        """
         rows = self._conn.execute(
-            """SELECT new_findings FROM audit_runs
+            """SELECT new_findings, commit_hash FROM audit_runs
                WHERE area=? AND status='completed'
                ORDER BY id DESC LIMIT ?""",
             (area, window),
         ).fetchall()
-        if len(rows) < window:
+        if not rows:
+            return 0
+        # The most recent audit must have run at the current HEAD.
+        if rows[0]["commit_hash"] != current_head:
             return 0
         return sum(1 for r in rows if r["new_findings"] == 0)
 
@@ -383,7 +414,8 @@ class DB:
 
     def finding_counts(self) -> list[sqlite3.Row]:
         return self._conn.execute(
-            "SELECT area, status, COUNT(*) AS n FROM findings GROUP BY area, status ORDER BY area, status"
+            "SELECT area, status, COUNT(*) AS n "
+            "FROM findings GROUP BY area, status ORDER BY area, status"
         ).fetchall()
 
     def recent_prs(self, limit: int = 10) -> list[sqlite3.Row]:
@@ -401,6 +433,23 @@ class CodexError(Exception):
     pass
 
 
+def _build_codex_cmd(
+    cmd: str, model: str, flags: list[str], prompt: str
+) -> list[str]:
+    """Construct the full argv for a Codex invocation.
+
+    When *flags* begins with a subcommand (e.g. "exec") rather than an option
+    flag, --model is inserted after the subcommand so the CLI sees:
+        codex exec --model <m> [other flags] <prompt>
+    rather than:
+        codex --model <m> exec [other flags] <prompt>
+    """
+    if flags and not flags[0].startswith("-"):
+        # First element is a subcommand.
+        return [cmd, flags[0], "--model", model, *flags[1:], prompt]
+    return [cmd, "--model", model, *flags, prompt]
+
+
 def run_codex(
     prompt: str,
     repo_path: Path,
@@ -409,8 +458,8 @@ def run_codex(
     model: str,
     timeout: int,
 ) -> str:
-    """Invoke the Codex CLI with a fresh context.  Returns stdout."""
-    full_cmd = [cmd, "--model", model, *flags, prompt]
+    """Invoke Codex with a fresh context.  Returns stdout.  Raises CodexError."""
+    full_cmd = _build_codex_cmd(cmd, model, flags, prompt)
     try:
         result = subprocess.run(
             full_cmd,
@@ -425,7 +474,7 @@ def run_codex(
     except FileNotFoundError:
         raise CodexError(
             f"Codex CLI not found: '{cmd}'. "
-            "Install it with: npm install -g @openai/codex"
+            "Install with: npm install -g @openai/codex"
         )
 
     if result.returncode != 0 and not result.stdout.strip():
@@ -437,7 +486,6 @@ def run_codex(
 
 def extract_json(text: str) -> Any:
     """Pull the first JSON array or object out of freeform Codex output."""
-    # Prefer fenced code blocks first.
     for pat in (r"```json\s*([\s\S]*?)```", r"```\s*([\s\S]*?)```"):
         m = re.search(pat, text)
         if m:
@@ -445,13 +493,12 @@ def extract_json(text: str) -> Any:
                 return json.loads(m.group(1))
             except json.JSONDecodeError:
                 pass
-    # Fall back to scanning for raw JSON.
     for m in re.finditer(r"(\[[\s\S]*?\]|\{[\s\S]*?\})", text):
         try:
             return json.loads(m.group(1))
         except json.JSONDecodeError:
             continue
-    raise ValueError(f"No JSON found in Codex output (first 500 chars): {text[:500]}")
+    raise ValueError(f"No JSON in Codex output (first 400 chars): {text[:400]}")
 
 
 # ── Git / GitHub CLI helpers ───────────────────────────────────────────────────
@@ -497,7 +544,9 @@ def push_branch(repo: Path, branch: str) -> None:
             raise RuntimeError(f"git push failed after 5 attempts:\n{r.stderr}")
 
 
-def gh_create_pr(owner: str, repo_name: str, branch: str, title: str, body: str) -> tuple[int, str]:
+def gh_create_pr(
+    owner: str, repo_name: str, branch: str, title: str, body: str
+) -> tuple[int, str]:
     """Returns (pr_number, pr_url)."""
     r = subprocess.run(
         [
@@ -516,8 +565,24 @@ def gh_create_pr(owner: str, repo_name: str, branch: str, title: str, body: str)
     return (int(m.group(1)) if m else 0), url
 
 
+def gh_close_pr(owner: str, repo_name: str, pr_number: int) -> None:
+    subprocess.run(
+        ["gh", "pr", "close", str(pr_number), "--repo", f"{owner}/{repo_name}"],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+
 def gh_ci_status(owner: str, repo_name: str, pr_number: int) -> str:
-    """Returns 'success' | 'failure' | 'pending' | 'unknown'."""
+    """Returns one of: 'success' | 'failure' | 'pending' | 'no_checks' | 'api_error'.
+
+    'no_checks'  — the PR exists but has no CI checks configured.
+    'api_error'  — could not reach the API or parse its response.
+
+    Both 'no_checks' and 'api_error' are treated as blocking by default.
+    Set verify.allow_no_ci=true to permit merging when there are no checks.
+    """
     r = subprocess.run(
         [
             "gh", "pr", "checks", str(pr_number),
@@ -529,20 +594,20 @@ def gh_ci_status(owner: str, repo_name: str, pr_number: int) -> str:
         check=False,
     )
     if r.returncode != 0:
-        return "unknown"
+        return "api_error"
     try:
         checks = json.loads(r.stdout)
     except json.JSONDecodeError:
-        return "unknown"
+        return "api_error"
     if not checks:
-        return "unknown"  # No CI configured — treat as passing
+        return "no_checks"
     if any(c.get("conclusion") == "failure" for c in checks):
         return "failure"
     if any(c.get("status") == "in_progress" for c in checks):
         return "pending"
     if all(c.get("conclusion") in ("success", "skipped", None) for c in checks):
         statuses = {c.get("status") for c in checks}
-        if "completed" in statuses or "success" in statuses:
+        if "completed" in statuses:
             return "success"
         return "pending"
     return "pending"
@@ -562,25 +627,48 @@ def gh_merge_pr(owner: str, repo_name: str, pr_number: int) -> None:
     )
 
 
-def wait_for_ci(owner: str, repo_name: str, pr_number: int, timeout_s: int) -> str:
+def wait_for_ci(
+    owner: str,
+    repo_name: str,
+    pr_number: int,
+    timeout_s: int,
+    allow_no_ci: bool,
+) -> str:
+    """Poll CI until a terminal state is reached.
+
+    Returns 'success', 'failure', 'no_checks', 'api_error', or 'timeout'.
+    Only 'success' (or 'no_checks' when allow_no_ci=True) permits a merge.
+    Every other return value is blocking.
+    """
     if timeout_s <= 0:
-        return "unknown"  # Caller treats 'unknown' as go-ahead
+        # Caller configured zero wait — return immediately with whatever we see.
+        return gh_ci_status(owner, repo_name, pr_number)
+
     deadline = time.monotonic() + timeout_s
     while time.monotonic() < deadline:
         status = gh_ci_status(owner, repo_name, pr_number)
-        if status in ("success", "failure", "unknown"):
+        if status != "pending":
             return status
         LOG.info("  CI pending — waiting 30 s…")
         time.sleep(30)
-    LOG.warning("  CI wait timed out after %s s", timeout_s)
-    return "pending"
+
+    LOG.warning("  CI wait timed out after %d s", timeout_s)
+    return "timeout"
+
+
+def _ci_permits_merge(ci_status: str, allow_no_ci: bool) -> bool:
+    if ci_status == "success":
+        return True
+    if ci_status == "no_checks" and allow_no_ci:
+        return True
+    return False
 
 
 # ── Prompt templates ───────────────────────────────────────────────────────────
 
 _AUDIT_PROMPT = """\
-You are a meticulous code auditor. Your task is to audit this entire repository
-for issues in ONE specific category: {area}.
+You are a meticulous code auditor.  Audit this entire repository for issues in
+ONE specific category: {area}.
 
 Category description: {description}
 
@@ -589,23 +677,46 @@ Rules:
 - Report only concrete, actionable problems with clear evidence.
 - Do NOT suggest new features, speculative refactors, or cosmetic changes.
 - Do NOT flag issues that are clearly intentional design decisions.
-- Confidence should reflect how certain you are this is a real bug (not theoretical).
+- Confidence should reflect how certain you are this is a real bug.
 
 Return ONLY a JSON array.  If there are no findings, return [].
 Each element:
 {{
-  "title":         "<concise problem title, under 80 chars>",
-  "description":   "<detailed explanation: what is wrong, why it matters, how to fix>",
-  "severity":      "critical|high|medium|low",
-  "confidence":    "high|medium|low",
-  "file_path":     "<repo-relative path or null>",
-  "line_range":    "<e.g. L10-L25, or null>"
+  "title":       "<concise problem title, under 80 chars>",
+  "description": "<detailed: what is wrong, why it matters, how to fix>",
+  "severity":    "critical|high|medium|low",
+  "confidence":  "high|medium|low",
+  "file_path":   "<repo-relative path or null>",
+  "line_range":  "<e.g. L10-L25, or null>"
+}}
+"""
+
+_REVALIDATE_PROMPT = """\
+A code finding was recorded when the repository was at a different commit.
+Determine whether it still applies to the current state of the code.
+
+Finding:
+  Area:        {area}
+  Title:       {title}
+  File:        {file_path}
+  Lines:       {line_range}
+  Description:
+{description}
+
+Inspect the current repository carefully.  Check whether:
+1. The named file still exists (if one was specified).
+2. The specific problem described still exists in the current code.
+
+Return ONLY a JSON object:
+{{
+  "still_applies": true|false,
+  "reason":        "<one sentence explaining your conclusion>"
 }}
 """
 
 _REPAIR_PROMPT = """\
 Fix the following maintenance issue in this repository.
-Make the MINIMAL change necessary — do not refactor unrelated code.
+Make the MINIMAL change necessary — do not modify unrelated code.
 
 Issue title:    {title}
 Severity:       {severity}
@@ -629,11 +740,11 @@ Background:
 Diff:
 {diff}
 
-Answer with ONLY a JSON object:
+Return ONLY a JSON object:
 {{
   "verdict": "approve|reject",
   "reason":  "<one sentence>",
-  "issues":  ["<specific problem>", ...]   // empty list if verdict is approve
+  "issues":  ["<specific problem>"]   // empty list if verdict is approve
 }}
 """
 
@@ -666,7 +777,7 @@ Return ONLY a JSON object:
 
 _IMPLEMENT_REVIEW_PROMPT = """\
 Implement the following blocking review comments on this repository.
-Address only these comments; do not make any other changes.
+Address only these specific comments; do not make any other changes.
 
 {comments}
 
@@ -681,17 +792,73 @@ def _fingerprint(area: str, file_path: str | None, title: str) -> str:
     return hashlib.sha256(key.encode()).hexdigest()[:20]
 
 
+# ── Verification helpers (shared by phase_verify and the review loop) ──────────
+
+def _run_tests(cfg: dict) -> bool:
+    """Run the configured test command.  Returns True if it passes (or not set)."""
+    test_cmd = cfg["verify"]["test_cmd"]
+    if not test_cmd:
+        return True
+    repo = Path(cfg["repo"]["path"]).resolve()
+    LOG.info("  Running: %s", test_cmd)
+    r = subprocess.run(
+        test_cmd, shell=True, cwd=str(repo), capture_output=True, text=True
+    )
+    if r.returncode != 0:
+        LOG.error("  Tests failed:\n%s", (r.stdout + r.stderr)[-1200:])
+    return r.returncode == 0
+
+
+def _verify_diff(cfg: dict, findings: list, ctr: dict) -> bool:
+    """Codex diff-review of all changes relative to the default branch.
+
+    Fail-closed: any Codex error or parse failure returns False.
+    The default verdict when the field is absent is 'reject', not 'approve'.
+    """
+    repo = Path(cfg["repo"]["path"]).resolve()
+    main = cfg["repo"]["default_branch"]
+    diff = full_diff(repo, main)
+    if not diff.strip():
+        LOG.error("  Diff is empty — nothing to verify")
+        return False
+
+    prompt = _VERIFY_PROMPT.format(
+        title=findings[0]["title"],
+        description="\n".join(f["description"] for f in findings),
+        diff=diff[:10_000],
+    )
+    try:
+        ctr["codex_calls"] += 1
+        output = run_codex(
+            prompt, repo,
+            flags=cfg["codex"]["audit_flags"],
+            cmd=cfg["codex"]["cmd"],
+            model=cfg["codex"]["model"],
+            timeout=cfg["codex"]["timeout"],
+        )
+        result = extract_json(output)
+    except (CodexError, ValueError) as exc:
+        LOG.error("  Diff verification failed: %s — treating as rejected (fail-closed)", exc)
+        return False
+
+    verdict = result.get("verdict", "reject")  # safe default: reject
+    LOG.info("  Verify verdict: %s — %s", verdict, result.get("reason", ""))
+    if verdict != "approve":
+        for issue in result.get("issues", []):
+            LOG.warning("    Issue: %s", issue)
+        return False
+    return True
+
+
 # ── Lifecycle phases ───────────────────────────────────────────────────────────
 
 def phase_audit(cfg: dict, db: DB, area: dict, ctr: dict) -> int:
-    """Run a scoped audit for *area*. Returns count of new findings stored."""
+    """Run a scoped Codex audit for *area*.  Returns count of new findings stored."""
     repo = Path(cfg["repo"]["path"]).resolve()
     commit = current_commit(repo)
     run_id = db.start_audit(area["name"], commit)
 
-    prompt = _AUDIT_PROMPT.format(
-        area=area["name"], description=area["description"]
-    )
+    prompt = _AUDIT_PROMPT.format(area=area["name"], description=area["description"])
     LOG.info("Auditing %-20s @ %s", area["name"], commit[:7])
 
     try:
@@ -731,7 +898,10 @@ def phase_audit(cfg: dict, db: DB, area: dict, ctr: dict) -> int:
             _, is_new = db.upsert_finding(finding)
             if is_new:
                 new_count += 1
-                LOG.info("  [%s/%s] %s", finding["severity"], finding["confidence"], finding["title"])
+                LOG.info(
+                    "  [%s/%s] %s",
+                    finding["severity"], finding["confidence"], finding["title"]
+                )
         except (KeyError, TypeError) as exc:
             LOG.warning("  Skipping malformed finding: %s", exc)
 
@@ -741,10 +911,56 @@ def phase_audit(cfg: dict, db: DB, area: dict, ctr: dict) -> int:
     return new_count
 
 
+def phase_revalidate(cfg: dict, finding: dict, ctr: dict) -> str:
+    """Check whether a queued finding still applies at the current HEAD.
+
+    Returns 'valid' | 'stale' | 'error'.
+
+    'error' means the revalidation call itself failed.  The caller should
+    treat this conservatively (skip the finding this run, increment failures).
+    """
+    repo = Path(cfg["repo"]["path"]).resolve()
+
+    # Fast path: if the named file no longer exists, it's stale.
+    if finding.get("file_path"):
+        fp = repo / finding["file_path"]
+        if not fp.exists():
+            LOG.info(
+                "  File no longer exists (%s) — marking stale", finding["file_path"]
+            )
+            return "stale"
+
+    prompt = _REVALIDATE_PROMPT.format(
+        area=finding["area"],
+        title=finding["title"],
+        file_path=finding["file_path"] or "(no specific file)",
+        line_range=finding["line_range"] or "(no specific lines)",
+        description=finding["description"],
+    )
+    try:
+        ctr["codex_calls"] += 1
+        output = run_codex(
+            prompt, repo,
+            flags=cfg["codex"]["audit_flags"],
+            cmd=cfg["codex"]["cmd"],
+            model=cfg["codex"]["model"],
+            timeout=cfg["codex"]["timeout"],
+        )
+        result = extract_json(output)
+    except (CodexError, ValueError) as exc:
+        LOG.warning("  Revalidation call failed: %s", exc)
+        return "error"
+
+    still_applies = result.get("still_applies", True)  # conservative default
+    reason = result.get("reason", "")
+    status = "valid" if still_applies else "stale"
+    LOG.info("  Revalidation: %s — %s", status, reason)
+    return status
+
+
 def phase_repair(cfg: dict, db: DB, findings: list, ctr: dict) -> tuple[bool, str]:
-    """Apply fixes for the given findings on a new branch.
-    Returns (success, branch_name). On failure, branch is '' and repo is
-    restored to the default branch."""
+    """Apply fixes on a new branch.  Returns (success, branch_name).
+    On failure the repo is restored to the default branch and '' is returned."""
     repo = Path(cfg["repo"]["path"]).resolve()
     main = cfg["repo"]["default_branch"]
     area = findings[0]["area"]
@@ -793,13 +1009,11 @@ def phase_repair(cfg: dict, db: DB, findings: list, ctr: dict) -> tuple[bool, st
             db.mark_finding(f["id"], "rejected", reason="repair produced no changes")
         return False, ""
 
-    # Commit all changes together.
     titles = "; ".join(f["title"] for f in findings)
-    commit_msg = (
-        f"maint({area}): {titles[:72]}\n\n"
-        "Co-Authored-By: Claude Sonnet 4.6 <noreply@anthropic.com>\n"
-        "Claude-Session: https://claude.ai/code/session_01Rk2K8VHLbCFPCpe8vzi1Mo"
-    )
+    commit_msg = f"maint({area}): {titles[:72]}"
+    trailer = cfg["repo"].get("commit_trailer", "")
+    if trailer:
+        commit_msg += f"\n\n{trailer}"
     _git(repo, "add", "-A")
     _git(repo, "commit", "-m", commit_msg)
 
@@ -808,65 +1022,40 @@ def phase_repair(cfg: dict, db: DB, findings: list, ctr: dict) -> tuple[bool, st
 
 
 def phase_verify(cfg: dict, findings: list, ctr: dict) -> bool:
-    """Run optional test suite + Codex diff-review.
-    Returns True if the fix looks good to proceed."""
-    repo = Path(cfg["repo"]["path"]).resolve()
-    main = cfg["repo"]["default_branch"]
-    test_cmd = cfg["verify"]["test_cmd"]
+    """Run test suite + Codex diff-review.  Fail-closed on any error."""
+    return _run_tests(cfg) and _verify_diff(cfg, findings, ctr)
 
-    # 1. Local test suite (optional).
-    if test_cmd:
-        LOG.info("  Running: %s", test_cmd)
-        r = subprocess.run(
-            test_cmd, shell=True, cwd=str(repo), capture_output=True, text=True
-        )
-        if r.returncode != 0:
-            LOG.error("  Tests failed:\n%s", (r.stdout + r.stderr)[-1200:])
-            return False
 
-    # 2. Codex diff-review with fresh context.
-    diff = full_diff(repo, main)
-    if not diff.strip():
-        return False
-
-    prompt = _VERIFY_PROMPT.format(
-        title=findings[0]["title"],
-        description="\n".join(f["description"] for f in findings),
-        diff=diff[:10_000],
-    )
-    try:
-        ctr["codex_calls"] += 1
-        output = run_codex(
-            prompt, repo,
-            flags=cfg["codex"]["audit_flags"],
-            cmd=cfg["codex"]["cmd"],
-            model=cfg["codex"]["model"],
-            timeout=cfg["codex"]["timeout"],
-        )
-        result = extract_json(output)
-    except (CodexError, ValueError) as exc:
-        # If verify itself fails we log a warning and proceed — don't block on it.
-        LOG.warning("  Verify call failed (%s) — proceeding anyway", exc)
-        return True
-
-    verdict = result.get("verdict", "approve")
-    LOG.info("  Verify verdict: %s — %s", verdict, result.get("reason", ""))
-    if verdict == "reject":
-        for issue in result.get("issues", []):
-            LOG.warning("    %s", issue)
-        return False
-    return True
+# Review outcomes (returned by phase_review_loop).
+_REVIEW_APPROVED      = "approved"
+_REVIEW_FAILED_ERROR  = "failed_error"   # Codex call failed or parse error
+_REVIEW_PAUSED_BUDGET = "paused_budget"  # Rounds exhausted without approval
 
 
 def phase_review_loop(
-    cfg: dict, db: DB, pr_id: int, findings: list, branch: str, ctr: dict
-) -> bool:
-    """Review the PR with Codex, implement blocking feedback, repeat.
-    Returns True once the review is exhausted (approve or max rounds reached)."""
+    cfg: dict,
+    db: DB,
+    pr_id: int,
+    findings: list,
+    branch: str,
+    ctr: dict,
+) -> str:
+    """Review the PR with Codex, implement blocking feedback, re-verify, repeat.
+
+    The full loop per round is:
+        review → implement feedback → tests → diff-verify → push → review again
+
+    Returns one of _REVIEW_APPROVED, _REVIEW_FAILED_ERROR, _REVIEW_PAUSED_BUDGET.
+
+    _REVIEW_PAUSED_BUDGET means rounds were exhausted without approval.  The
+    latest pushed changes have NOT been reviewed in a final review round.  The
+    PR is left open for human inspection; the finding is marked 'paused'.
+
+    _REVIEW_FAILED_ERROR means a Codex call failed or produced unparseable output.
+    The caller should close the PR and re-queue the finding.
+    """
     repo = Path(cfg["repo"]["path"]).resolve()
     main = cfg["repo"]["default_branch"]
-    owner = cfg["repo"]["owner"]
-    repo_name = cfg["repo"]["name"]
     max_rounds = cfg["budget"]["max_review_rounds"]
     finding_titles = "; ".join(f["title"] for f in findings)
     pr_title = f"maint: {finding_titles[:60]}"
@@ -891,19 +1080,28 @@ def phase_review_loop(
             )
             review = extract_json(output)
         except (CodexError, ValueError) as exc:
-            LOG.warning("  Review call failed (%s) — treating as approved", exc)
-            break
+            LOG.error("  Review call failed: %s — fail-closed", exc)
+            db.update_pr(pr_id, review_rounds=rnd)
+            return _REVIEW_FAILED_ERROR
 
-        verdict = review.get("verdict", "approve")
+        # Default to request_changes, not approve (fail-closed).
+        verdict = review.get("verdict", "request_changes")
         LOG.info("  Review verdict: %s — %s", verdict, review.get("summary", ""))
 
-        blocking = [c for c in review.get("comments", []) if c.get("severity") == "blocking"]
-        if verdict == "approve" or not blocking:
-            break
+        blocking = [
+            c for c in review.get("comments", [])
+            if c.get("severity") == "blocking"
+        ]
 
+        if verdict == "approve" and not blocking:
+            db.update_pr(pr_id, review_rounds=rnd)
+            return _REVIEW_APPROVED
+
+        # Log what needs to change.
         for c in blocking:
-            LOG.info("  Blocking: [%s] %s", c.get("file", "?"), c["description"])
+            LOG.info("  Blocking: [%s] %s", c.get("file", "general"), c["description"])
 
+        # Implement blocking feedback.
         comments_text = "\n".join(
             f"- [{c.get('file', 'general')}] {c['description']}" for c in blocking
         )
@@ -921,23 +1119,40 @@ def phase_review_loop(
             )
         except CodexError as exc:
             LOG.error("  Failed to implement review feedback: %s", exc)
-            break
+            db.update_pr(pr_id, review_rounds=rnd)
+            return _REVIEW_FAILED_ERROR
 
         if full_diff(repo, main) == prev_diff:
-            LOG.warning("  Review feedback produced no changes — stopping review loop")
-            break
+            LOG.warning("  Review feedback produced no changes — fail-closed")
+            db.update_pr(pr_id, review_rounds=rnd)
+            return _REVIEW_FAILED_ERROR
 
+        # Commit, then re-verify (tests + diff-review) before next round.
+        commit_msg = f"maint: address review feedback (round {rnd})"
+        trailer = cfg["repo"].get("commit_trailer", "")
+        if trailer:
+            commit_msg += f"\n\n{trailer}"
         _git(repo, "add", "-A")
-        _git(
-            repo, "commit", "-m",
-            f"maint: address review feedback (round {rnd})\n\n"
-            "Co-Authored-By: Claude Sonnet 4.6 <noreply@anthropic.com>\n"
-            "Claude-Session: https://claude.ai/code/session_01Rk2K8VHLbCFPCpe8vzi1Mo",
-        )
-        push_branch(repo, branch)
+        _git(repo, "commit", "-m", commit_msg)
 
-    db.update_pr(pr_id, review_rounds=rnd)
-    return True
+        if not _run_tests(cfg):
+            LOG.error("  Tests failed after applying review feedback")
+            db.update_pr(pr_id, review_rounds=rnd)
+            return _REVIEW_FAILED_ERROR
+
+        if not _verify_diff(cfg, findings, ctr):
+            LOG.error("  Diff verification rejected after applying review feedback")
+            db.update_pr(pr_id, review_rounds=rnd)
+            return _REVIEW_FAILED_ERROR
+
+        push_branch(repo, branch)
+        # Loop: next iteration reviews the pushed changes.
+
+    # Budget exhausted.  The most recent feedback round's changes have been
+    # committed and pushed but not reviewed in a final review pass.
+    db.update_pr(pr_id, review_rounds=max_rounds)
+    LOG.warning("  Review round budget (%d) exhausted without approval", max_rounds)
+    return _REVIEW_PAUSED_BUDGET
 
 
 # ── Supervisor orchestrator ────────────────────────────────────────────────────
@@ -979,19 +1194,21 @@ class Supervisor:
             parts.append(f"**[{f['severity'].upper()}] {f['title']}**\n")
             parts.append(f"{f['description']}\n")
             if f.get("file_path"):
-                parts.append(f"_File: {f['file_path']} {f.get('line_range') or ''}_\n")
-        parts += [
-            "\n---",
-            "🤖 Generated with [Claude Code](https://claude.com/claude-code)\n",
-            "https://claude.ai/code/session_01Rk2K8VHLbCFPCpe8vzi1Mo",
-        ]
+                parts.append(
+                    f"_File: {f['file_path']} {f.get('line_range') or ''}_\n"
+                )
+        footer = self.cfg["repo"].get("pr_footer", "")
+        if footer:
+            parts += ["\n---", footer]
         return "\n".join(parts)
 
     # ── single finding workflow ────────────────────────────────────────────────
 
-    def _fix_finding(self, finding: sqlite3.Row) -> bool:
-        """Full repair→verify→PR→review→merge cycle for one finding.
-        Returns True if the finding was successfully fixed and merged."""
+    def _fix_finding(self, finding: sqlite3.Row, current_head: str) -> bool:
+        """Full repair→verify→PR→review→CI→merge cycle for one finding.
+
+        Returns True if the finding was successfully fixed and merged.
+        """
         cfg = self.cfg
         db = self.db
         repo = Path(cfg["repo"]["path"]).resolve()
@@ -1001,6 +1218,24 @@ class Supervisor:
         f = dict(finding)
 
         LOG.info("[%s/%s] %s", f["severity"], f["confidence"], f["title"])
+
+        # ── revalidate if HEAD has moved since the finding was recorded ────────
+        if f.get("commit_hash") and f["commit_hash"] != current_head:
+            LOG.info(
+                "  Finding is from %s, current HEAD is %s — revalidating",
+                f["commit_hash"][:7],
+                current_head[:7],
+            )
+            rv = phase_revalidate(cfg, f, self.ctr)
+            if rv == "stale":
+                db.mark_finding(f["id"], "stale", reason="no longer applies at current HEAD")
+                return False
+            if rv == "error":
+                LOG.warning("  Revalidation failed — skipping this run")
+                self.ctr["consecutive_failures"] += 1
+                return False
+            # rv == "valid" → proceed
+
         db.mark_finding(f["id"], "in_progress")
 
         # ── repair ────────────────────────────────────────────────────────────
@@ -1010,8 +1245,7 @@ class Supervisor:
             return False
 
         # ── verify ────────────────────────────────────────────────────────────
-        ok = phase_verify(cfg, [f], self.ctr)
-        if not ok:
+        if not phase_verify(cfg, [f], self.ctr):
             LOG.warning("  Verify rejected — discarding branch")
             _git(repo, "checkout", main, check=False)
             _git(repo, "branch", "-D", branch, check=False)
@@ -1019,7 +1253,7 @@ class Supervisor:
             self.ctr["consecutive_failures"] += 1
             return False
 
-        # ── push + PR ─────────────────────────────────────────────────────────
+        # ── push + open PR ────────────────────────────────────────────────────
         try:
             push_branch(repo, branch)
             pr_number, pr_url = gh_create_pr(
@@ -1042,13 +1276,48 @@ class Supervisor:
         _git(repo, "checkout", branch, check=False)
 
         # ── review loop ───────────────────────────────────────────────────────
-        phase_review_loop(cfg, db, pr_id, [f], branch, self.ctr)
+        outcome = phase_review_loop(cfg, db, pr_id, [f], branch, self.ctr)
 
-        # ── wait for CI ───────────────────────────────────────────────────────
-        ci = wait_for_ci(owner, repo_name, pr_number, cfg["verify"]["ci_wait_timeout"])
+        if outcome == _REVIEW_FAILED_ERROR:
+            LOG.error("  Review loop failed — closing PR and re-queuing finding")
+            gh_close_pr(owner, repo_name, pr_number)
+            db.update_pr(pr_id, status="closed")
+            db.mark_finding(f["id"], "open")
+            _git(repo, "checkout", main, check=False)
+            self.ctr["consecutive_failures"] += 1
+            return False
+
+        if outcome == _REVIEW_PAUSED_BUDGET:
+            LOG.warning(
+                "  Review budget exhausted — PR #%d left open for human review",
+                pr_number,
+            )
+            db.update_pr(pr_id, status="paused")
+            db.mark_finding(
+                f["id"], "paused",
+                pr_id=pr_id,
+                reason=f"review budget exhausted after {cfg['budget']['max_review_rounds']} rounds",
+            )
+            _git(repo, "checkout", main, check=False)
+            # Not a failure — don't increment consecutive_failures.
+            return False
+
+        # outcome == _REVIEW_APPROVED → check CI then merge.
+
+        # ── CI gate ───────────────────────────────────────────────────────────
+        allow_no_ci = cfg["verify"]["allow_no_ci"]
+        ci = wait_for_ci(
+            owner, repo_name, pr_number,
+            cfg["verify"]["ci_wait_timeout"],
+            allow_no_ci,
+        )
         LOG.info("  CI status: %s", ci)
-        if ci == "failure":
-            LOG.error("  CI failed — not merging; marking finding open for retry")
+
+        if not _ci_permits_merge(ci, allow_no_ci):
+            LOG.error(
+                "  CI result '%s' blocks merge (allow_no_ci=%s) — re-queuing finding",
+                ci, allow_no_ci,
+            )
             db.update_pr(pr_id, status="failed")
             db.mark_finding(f["id"], "open")
             _git(repo, "checkout", main, check=False)
@@ -1077,7 +1346,7 @@ class Supervisor:
         self.ctr["fixes_applied"] += 1
         self.ctr["consecutive_failures"] = 0
 
-        # Pull merged changes back so the next iteration works on fresh HEAD.
+        # Pull merged changes so the next iteration runs on fresh HEAD.
         _git(repo, "checkout", main, check=False)
         _git(repo, "pull", "origin", main, check=False)
         return True
@@ -1099,7 +1368,6 @@ class Supervisor:
             cfg["repo"]["name"],
         )
 
-        # Ensure clean starting state on main.
         _git(repo, "checkout", main, check=False)
         _git(repo, "pull", "origin", main, check=False)
 
@@ -1109,10 +1377,18 @@ class Supervisor:
             if self._over_budget():
                 return "partial"
 
-            # Skip exhausted areas.
-            streak = db.clean_audit_streak(area["name"], budget["max_audits_per_area"])
+            # Read HEAD after each merge so exhaustion checks are up-to-date.
+            head = current_commit(repo)
+
+            # Skip areas exhausted at the current HEAD.
+            streak = self.db.clean_audit_streak(
+                area["name"], budget["max_audits_per_area"], head
+            )
             if streak >= budget["max_audits_per_area"]:
-                LOG.info("Area %-20s exhausted (%d clean audits)", area["name"], streak)
+                LOG.info(
+                    "Area %-20s exhausted (%d clean audits at %s)",
+                    area["name"], streak, head[:7],
+                )
                 continue
 
             # Audit.
@@ -1126,15 +1402,18 @@ class Supervisor:
             for finding in self.db.open_findings(area["name"]):
                 if self._over_budget():
                     return "partial"
-                self._fix_finding(finding)
+                # Re-read HEAD in case a previous finding's merge updated it.
+                head = current_commit(repo)
+                self._fix_finding(finding, head)
 
-        # Check exhaustion: all areas need `max_audits_per_area` clean streaks.
+        # Check exhaustion against the current HEAD (which may have moved).
+        head = current_commit(repo)
         if all(
-            self.db.clean_audit_streak(a["name"], budget["max_audits_per_area"])
+            self.db.clean_audit_streak(a["name"], budget["max_audits_per_area"], head)
             >= budget["max_audits_per_area"]
             for a in areas
         ):
-            LOG.info("All audit areas exhausted — repository is clean.")
+            LOG.info("All audit areas exhausted at %s — repository is clean.", head[:7])
             return "exhausted"
 
         return "done" if (total_new > 0 or self.ctr["fixes_applied"] > 0) else "partial"
@@ -1172,54 +1451,63 @@ def cmd_status(cfg: dict, db: DB) -> None:
         print("No PRs yet.")
 
     budget = cfg["budget"]
-    print("\nAudit area exhaustion:")
+    repo_path = Path(cfg["repo"]["path"]).resolve()
+    try:
+        head = current_commit(repo_path)
+    except Exception:
+        head = ""
+
+    print("\nAudit area exhaustion (HEAD-tied):")
     for area in cfg["audit_areas"]:
-        streak = db.clean_audit_streak(area["name"], budget["max_audits_per_area"])
+        streak = db.clean_audit_streak(
+            area["name"], budget["max_audits_per_area"], head
+        )
         threshold = budget["max_audits_per_area"]
-        tag = "exhausted" if streak >= threshold else f"{streak}/{threshold} clean"
+        tag = (
+            f"exhausted @ {head[:7]}"
+            if streak >= threshold
+            else f"{streak}/{threshold} clean @ {head[:7] or 'unknown'}"
+        )
         print(f"  {area['name']:22} {tag}")
 
 
 def cmd_findings(db: DB) -> None:
-    findings = db.open_findings()
-    if not findings:
-        print("No open findings.")
+    open_f = db.open_findings()
+    paused_f = db.paused_findings()
+
+    if not open_f and not paused_f:
+        print("No open or paused findings.")
         return
-    print(f"\n{len(findings)} open findings:\n")
-    for f in findings:
-        fp = f["file_path"] or ""
-        lr = f["line_range"] or ""
-        loc = f"  {fp} {lr}".rstrip() if fp else ""
-        print(f"[{f['severity']:8}/{f['confidence']:6}] {f['title']}")
-        if loc:
-            print(f"  {loc.strip()}")
-        print()
+
+    if open_f:
+        print(f"\n{len(open_f)} open findings:\n")
+        for f in open_f:
+            loc = f" ({f['file_path']})" if f["file_path"] else ""
+            print(f"  [{f['severity']:8}/{f['confidence']:6}] {f['title']}{loc}")
+
+    if paused_f:
+        print(f"\n{len(paused_f)} paused findings (PR open, awaiting human review):\n")
+        for f in paused_f:
+            reason = f["reject_reason"] or ""
+            print(f"  [{f['severity']:8}] {f['title']}  — {reason}")
 
 
 # ── Entry point ────────────────────────────────────────────────────────────────
 
 def _check_tools(cfg: dict) -> None:
-    problems: list[str] = []
-    codex_cmd = cfg["codex"]["cmd"]
-    if not any(
-        (Path(p) / codex_cmd).is_file()
-        for p in os.environ.get("PATH", "").split(os.pathsep)
-    ):
-        problems.append(
-            f"Codex CLI '{codex_cmd}' not found in PATH. "
-            "Install with: npm install -g @openai/codex"
-        )
-    if not any(
-        (Path(p) / "gh").is_file()
-        for p in os.environ.get("PATH", "").split(os.pathsep)
-    ):
-        problems.append(
-            "GitHub CLI 'gh' not found in PATH. "
-            "Install from: https://cli.github.com"
-        )
-    if problems:
-        for p in problems:
-            LOG.warning("Prerequisite missing: %s", p)
+    path_dirs = os.environ.get("PATH", "").split(os.pathsep)
+    for binary, install_hint in [
+        (
+            cfg["codex"]["cmd"],
+            "Install with: npm install -g @openai/codex",
+        ),
+        (
+            "gh",
+            "Install from: https://cli.github.com",
+        ),
+    ]:
+        if not any((Path(d) / binary).is_file() for d in path_dirs):
+            LOG.warning("Prerequisite not found: '%s'.  %s", binary, install_hint)
 
 
 def main() -> None:
@@ -1229,11 +1517,11 @@ def main() -> None:
     )
     parser.add_argument(
         "--config", default="config.toml",
-        help="Path to TOML (or JSON on Python < 3.11) config file (default: config.toml)",
+        help="Config file path (default: config.toml; use .json on Python < 3.11)",
     )
     parser.add_argument(
         "--db", default=".maintain.db",
-        help="Path to the SQLite state database (default: .maintain.db)",
+        help="SQLite state database (default: .maintain.db)",
     )
     parser.add_argument(
         "--log-level", default="INFO",
@@ -1245,7 +1533,7 @@ def main() -> None:
     sub.add_parser("run", help="Run one full maintenance iteration")
 
     run_cont = sub.add_parser(
-        "run-continuous", help="Run iterations until exhausted or budget exceeded"
+        "run-continuous", help="Loop until exhausted or budget exceeded"
     )
     run_cont.add_argument(
         "--max-iterations", type=int, default=50,
@@ -1253,13 +1541,10 @@ def main() -> None:
     )
 
     sub.add_parser("status", help="Show queue, PRs, and area exhaustion")
-    sub.add_parser("findings", help="List open findings")
+    sub.add_parser("findings", help="List open and paused findings")
 
-    audit_cmd = sub.add_parser("audit", help="Manually audit one specific area")
-    audit_cmd.add_argument(
-        "area",
-        help="Area name, e.g. correctness, security, tests",
-    )
+    audit_p = sub.add_parser("audit", help="Manually audit one area")
+    audit_p.add_argument("area", help="e.g. correctness, security, tests")
 
     sub.add_parser("reset", help="Clear all state (asks for confirmation)")
 
@@ -1272,14 +1557,9 @@ def main() -> None:
     )
 
     cfg = load_config(Path(args.config))
-
-    # Warn about missing tools without blocking.
     _check_tools(cfg)
 
-    # Make db accessible to cmd_status as a local via closure.
-    global db
     db = DB(Path(args.db))
-
     try:
         if args.cmd == "run":
             result = Supervisor(cfg, db).run_once()
@@ -1308,7 +1588,7 @@ def main() -> None:
             )
             if area_cfg is None:
                 known = [a["name"] for a in cfg["audit_areas"]]
-                sys.exit(f"Unknown area '{args.area}'.  Known areas: {known}")
+                sys.exit(f"Unknown area '{args.area}'.  Known: {known}")
             sup = Supervisor(cfg, db)
             new = phase_audit(cfg, db, area_cfg, sup.ctr)
             print(f"\n{new} new findings in area '{args.area}'")
