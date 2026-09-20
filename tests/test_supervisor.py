@@ -1432,3 +1432,88 @@ class TestReviewLoopProtocol:
             outcome = phase_review_loop(cfg, db, pr_id, [f], "branch", ctr)
 
         assert outcome == REVIEW_APPROVED
+
+
+# ── rejected-at-HEAD convergence ───────────────────────────────────────────────
+
+class TestRejectedAtHeadConvergence:
+    """A finding rejected at the current HEAD must drive run_once to 'blocked'."""
+
+    def test_rejected_at_head_terminates_blocked(self, tmp_path):
+        """State machine: audit→reject→reaudit (N times)→ run_once returns 'blocked'.
+
+        With max_audits_per_area=2, after the initial rejection the supervisor
+        needs two more audits with new_findings==0 before the area is exhausted.
+        At that point rejected_at_head_findings returns the stuck finding and
+        run_once must return 'blocked' rather than 'done'.
+        """
+        from supervisor.db import _fingerprint
+
+        HEAD = "deadbeef1234"
+        db = _db()
+        cfg = _cfg()
+        cfg["repo"]["path"] = str(tmp_path)
+        cfg["budget"]["max_audits_per_area"] = 2  # small for speed
+
+        fp = _fingerprint("correctness", None, "stubborn bug")
+        finding_proto = {
+            "fingerprint": fp,
+            "area": "correctness",
+            "severity": "high",
+            "confidence": "high",
+            "file_path": None,
+            "line_range": None,
+            "title": "stubborn bug",
+            "description": "always present",
+            "commit_hash": HEAD,
+        }
+
+        audit_wt = tmp_path / "audit_wt"
+        audit_wt.mkdir()
+
+        def fake_phase_audit(cfg_, db_, area, ctr):
+            """Re-reports the finding every audit; is_new=False once rejected."""
+            _, is_new = db_.upsert_finding(finding_proto)
+            new_count = 1 if is_new else 0
+            run_id = db_.start_audit(area["name"], HEAD)
+            db_.finish_audit(run_id, new_count, 1)  # total_found always 1
+            return new_count
+
+        def fake_repair_no_changes(cfg_, db_, findings, ctr):
+            db_.mark_finding(
+                findings[0]["id"], "rejected", reason="no changes", head=HEAD
+            )
+            ctr["consecutive_failures"] += 1
+            return False
+
+        wt = tmp_path / "wt"
+        wt.mkdir()
+
+        with patch(f"{RUNNER_MODULE}.create_audit_worktree", return_value=audit_wt), \
+             patch(f"{RUNNER_MODULE}.remove_audit_worktree"), \
+             patch(f"{RUNNER_MODULE}.current_commit", return_value=HEAD), \
+             patch(f"{RUNNER_MODULE}.phase_audit", side_effect=fake_phase_audit), \
+             patch(f"{RUNNER_MODULE}.phase_repair", side_effect=fake_repair_no_changes), \
+             patch(f"{RUNNER_MODULE}.create_worktree", return_value=wt), \
+             patch(f"{RUNNER_MODULE}.remove_worktree"):
+
+            sup = Supervisor(cfg, db)
+
+            # Run 1: audit finds X new, repair rejects it.
+            result1 = sup.run_once()
+            assert result1 == "done"
+            fid = db.open_findings() or db._conn.execute(
+                "SELECT id FROM findings LIMIT 1"
+            ).fetchone()
+            assert db._conn.execute(
+                "SELECT status FROM findings LIMIT 1"
+            ).fetchone()["status"] == "rejected"
+
+            # Run 2: X re-reported (not new), no repair attempt.  streak=1 < max=2.
+            result2 = sup.run_once()
+            assert result2 == "done"
+
+            # Run 3: X re-reported again.  streak=2 == max → all areas exhausted.
+            # rejected_at_head_findings returns X → must return 'blocked'.
+            result3 = sup.run_once()
+            assert result3 == "blocked"

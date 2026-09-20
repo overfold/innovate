@@ -213,6 +213,14 @@ class DB:
             "SELECT * FROM findings WHERE status='blocked' ORDER BY id"
         ).fetchall()
 
+    def rejected_at_head_findings(self, head: str) -> list[sqlite3.Row]:
+        """Return findings rejected at exactly *head* — unresolvable until HEAD changes."""
+        return self._conn.execute(
+            "SELECT * FROM findings WHERE status='rejected' AND rejected_at_head=?"
+            " ORDER BY id",
+            (head,),
+        ).fetchall()
+
     def stale_blocked_findings(self, current_head: str) -> list[sqlite3.Row]:
         """Return blocked findings recorded at a different (or unknown) HEAD."""
         return self._conn.execute(
@@ -326,11 +334,12 @@ class DB:
         ).fetchone()
 
     def clean_audit_streak(self, area: str, window: int, current_head: str) -> int:
-        """Count recent clean audits (total_found == 0) for *area* at *current_head*.
+        """Count recent audits with no new findings for *area* at *current_head*.
 
-        An area is not exhausted while any finding for it is open, in_progress,
-        or paused.  All audits counted must be at exactly *current_head*: audits
-        from older commits do not contribute to the streak.
+        A finding rejected at the current HEAD is terminal for that HEAD and
+        does not block the streak.  Only open, in_progress, or deferred findings
+        (all of which are actively being worked or queued) block the streak.
+        All audits counted must be at exactly *current_head*.
         """
         active = self._conn.execute(
             """SELECT COUNT(*) AS n FROM findings
@@ -341,14 +350,14 @@ class DB:
             return 0
 
         rows = self._conn.execute(
-            """SELECT total_found FROM audit_runs
+            """SELECT new_findings FROM audit_runs
                WHERE area=? AND status='completed' AND commit_hash=?
                ORDER BY id DESC LIMIT ?""",
             (area, current_head, window),
         ).fetchall()
         if not rows:
             return 0
-        return sum(1 for r in rows if r["total_found"] == 0)
+        return sum(1 for r in rows if r["new_findings"] == 0)
 
     # ── summary queries ───────────────────────────────────────────────────────
 

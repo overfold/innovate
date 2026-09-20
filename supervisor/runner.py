@@ -604,9 +604,10 @@ class Supervisor:
             >= budget["max_audits_per_area"]
             for a in areas
         ):
-            if self.db.blocked_findings():
+            if self.db.blocked_findings() or self.db.rejected_at_head_findings(last_head):
                 LOG.info(
-                    "All audit areas exhausted at %s — blocked findings remain.",
+                    "All audit areas exhausted at %s — unresolvable findings remain"
+                    " (blocked or rejected at this HEAD).",
                     last_head[:7],
                 )
                 return "blocked"
