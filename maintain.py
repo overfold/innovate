@@ -18,8 +18,10 @@ Usage:
 Prerequisites:
     - Codex CLI installed and authenticated  (npm install -g @openai/codex)
     - GitHub CLI installed and authenticated (gh auth login)
-    - A local clone of the target repository
-    - config.toml filled in with repo.owner / repo.name / repo.path
+    - config.toml filled in with repo.owner and repo.name
+    - Either repo.path pointing to an existing local clone, or leave repo.path
+      empty to let Maintain clone and manage the repository automatically under
+      ~/.maintain/workspaces/<owner>/<name> (configurable via repo.workspace).
 """
 
 from __future__ import annotations
@@ -60,19 +62,50 @@ def _parse_remote_owner_repo(remote_url: str) -> tuple[str, str] | None:
     return None
 
 
+def _managed_workspace_root(cfg: dict) -> Path:
+    """Return the root directory used for Maintain-managed clones.
+
+    Honours repo.workspace when set; otherwise ~/.maintain/workspaces.
+    """
+    ws = cfg["repo"].get("workspace", "").strip()
+    if ws:
+        return Path(ws).expanduser().resolve()
+    return Path.home() / ".maintain" / "workspaces"
+
+
+def _resolve_repo_path(cfg: dict) -> None:
+    """Populate cfg["repo"]["path"] from the managed workspace when it is empty.
+
+    Called for all commands so that every code path (including read-only
+    commands like status and findings) references the correct local path.
+    Does nothing if repo.path is already set.  Does not clone.
+    """
+    if cfg["repo"].get("path", "").strip():
+        return
+    owner = cfg["repo"].get("owner", "").strip()
+    name = cfg["repo"].get("name", "").strip()
+    if not owner or not name:
+        return
+    cfg["repo"]["path"] = str(_managed_workspace_root(cfg) / owner / name)
+
+
 def _validate_config(cfg: dict, config_path: str) -> None:
     """Abort with a clear error if the config is unsafe for mutating commands.
 
-    Checks owner/name, repo path, git remote, default branch, audit areas,
-    budget values, and required binaries.  Any failure hard-exits before the
-    DB is opened or Codex is invoked.
+    Checks owner/name, repo path (cloning a managed workspace when absent),
+    git remote, default branch, audit areas, budget values, and required
+    binaries.  Any failure hard-exits before the DB is opened or Codex is
+    invoked.
     """
     if not Path(config_path).exists():
         sys.exit(
             f"Config file not found: {config_path}\n"
-            "Copy config.toml and fill in repo.owner, repo.name, and repo.path "
+            "Copy config.toml and fill in repo.owner and repo.name "
             "before running maintenance commands."
         )
+
+    # Resolve managed path early so the rest of validation sees a concrete path.
+    _resolve_repo_path(cfg)
 
     errors: list[str] = []
 
@@ -87,52 +120,95 @@ def _validate_config(cfg: dict, config_path: str) -> None:
     if not default_branch:
         errors.append("repo.default_branch is empty")
 
-    repo_path = Path(cfg["repo"]["path"]).resolve()
-    if not repo_path.exists():
-        errors.append(f"repo.path does not exist: {repo_path}")
-    elif not shutil.which("git"):
-        errors.append(
-            "Required binary not found in PATH: 'git'."
-            " Install Git from: https://git-scm.com"
-        )
-    else:
-        r = subprocess.run(
-            ["git", "rev-parse", "--git-dir"],
-            cwd=str(repo_path),
-            capture_output=True,
-            text=True,
-        )
-        if r.returncode != 0:
-            errors.append(f"repo.path is not a Git repository: {repo_path}")
-        elif owner and name:
-            r2 = subprocess.run(
-                ["git", "remote", "get-url", "origin"],
-                cwd=str(repo_path),
-                capture_output=True,
-                text=True,
-            )
-            if r2.returncode != 0:
-                errors.append("Git remote 'origin' is not configured")
+    # ── repo path: resolve, clone if managed and absent ────────────────────
+    repo_path_str = cfg["repo"].get("path", "").strip()
+    if repo_path_str:
+        repo_path = Path(repo_path_str).resolve()
+        managed_root = _managed_workspace_root(cfg)
+        is_managed = repo_path.is_relative_to(managed_root)
+        need_git_checks = False
+
+        if not repo_path.exists():
+            if is_managed and not errors:
+                # Managed workspace — clone on first use.
+                if not shutil.which("git"):
+                    errors.append(
+                        "Required binary not found in PATH: 'git'."
+                        " Install Git from: https://git-scm.com"
+                    )
+                else:
+                    clone_url = f"https://github.com/{owner}/{name}"
+                    print(f"Cloning {clone_url} → {repo_path} …", flush=True)
+                    repo_path.parent.mkdir(parents=True, exist_ok=True)
+                    r = subprocess.run(
+                        ["git", "clone", "--", clone_url, str(repo_path)],
+                        capture_output=True,
+                        text=True,
+                    )
+                    if r.returncode != 0:
+                        errors.append(
+                            f"Failed to clone {clone_url} into {repo_path}:"
+                            f" {r.stderr.strip() or 'git clone failed'}"
+                        )
+                    else:
+                        need_git_checks = True
+            elif not is_managed:
+                errors.append(f"repo.path does not exist: {repo_path}")
+            # else: managed path but earlier errors (e.g. owner/name missing)
+            # prevented cloning — root-cause errors already recorded.
+        else:
+            need_git_checks = True
+
+        if need_git_checks:
+            if not shutil.which("git"):
+                errors.append(
+                    "Required binary not found in PATH: 'git'."
+                    " Install Git from: https://git-scm.com"
+                )
             else:
-                remote_url = r2.stdout.strip()
-                parsed = _parse_remote_owner_repo(remote_url)
-                expected_path = f"{owner}/{name}".lower()
-                if parsed is None:
-                    errors.append(
-                        f"Git remote 'origin' URL is not a recognized"
-                        f" SSH or HTTPS remote: {remote_url!r}"
+                r = subprocess.run(
+                    ["git", "rev-parse", "--git-dir"],
+                    cwd=str(repo_path),
+                    capture_output=True,
+                    text=True,
+                )
+                if r.returncode != 0:
+                    if is_managed:
+                        errors.append(
+                            f"Managed workspace at {repo_path} is not a git"
+                            f" repository; remove it to allow Maintain to reclone"
+                        )
+                    else:
+                        errors.append(f"repo.path is not a Git repository: {repo_path}")
+                elif owner and name:
+                    r2 = subprocess.run(
+                        ["git", "remote", "get-url", "origin"],
+                        cwd=str(repo_path),
+                        capture_output=True,
+                        text=True,
                     )
-                elif parsed[0] != "github.com":
-                    errors.append(
-                        f"Git remote 'origin' host is {parsed[0]!r},"
-                        f" expected 'github.com'"
-                    )
-                elif parsed[1] != expected_path:
-                    errors.append(
-                        f"Git remote 'origin' ({remote_url!r}) points to"
-                        f" '{parsed[1]}', expected '{expected_path}' —"
-                        f" check repo.owner and repo.name"
-                    )
+                    if r2.returncode != 0:
+                        errors.append("Git remote 'origin' is not configured")
+                    else:
+                        remote_url = r2.stdout.strip()
+                        parsed = _parse_remote_owner_repo(remote_url)
+                        expected_path = f"{owner}/{name}".lower()
+                        if parsed is None:
+                            errors.append(
+                                f"Git remote 'origin' URL is not a recognized"
+                                f" SSH or HTTPS remote: {remote_url!r}"
+                            )
+                        elif parsed[0] != "github.com":
+                            errors.append(
+                                f"Git remote 'origin' host is {parsed[0]!r},"
+                                f" expected 'github.com'"
+                            )
+                        elif parsed[1] != expected_path:
+                            errors.append(
+                                f"Git remote 'origin' ({remote_url!r}) points to"
+                                f" '{parsed[1]}', expected '{expected_path}' —"
+                                f" check repo.owner and repo.name"
+                            )
 
     if not cfg.get("audit_areas"):
         errors.append("audit_areas is empty — nothing to audit")
@@ -230,6 +306,7 @@ def main() -> None:
     )
 
     cfg = load_config(Path(args.config))
+    _resolve_repo_path(cfg)
 
     if args.cmd in _MUTATING_CMDS:
         _validate_config(cfg, args.config)

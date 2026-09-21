@@ -9,7 +9,8 @@ DEFAULT_CONFIG: dict[str, Any] = {
     "repo": {
         "owner": "",
         "name": "",
-        "path": ".",
+        "path": "",
+        "workspace": "",
         "default_branch": "main",
         "commit_trailer": "",
         "pr_footer": "",

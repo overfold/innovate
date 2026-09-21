@@ -25,6 +25,20 @@ def _git(repo: Path, *args: str, check: bool = True) -> subprocess.CompletedProc
     )
 
 
+def clone_repo(url: str, dest: Path) -> None:
+    """Clone url into dest, which must not already exist.
+
+    Raises RuntimeError if git clone exits non-zero.
+    """
+    result = subprocess.run(
+        ["git", "clone", "--", url, str(dest)],
+        capture_output=True,
+        text=True,
+    )
+    if result.returncode != 0:
+        raise RuntimeError(result.stderr.strip() or "git clone failed")
+
+
 def current_commit(repo: Path) -> str:
     return _git(repo, "rev-parse", "HEAD").stdout.strip()
 
