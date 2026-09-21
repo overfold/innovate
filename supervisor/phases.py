@@ -34,6 +34,14 @@ from .prompts import (
 
 LOG = logging.getLogger("supervisor")
 
+_STAGES = ("audit", "revalidate", "validate", "repair", "verify", "review")
+
+
+def model_for_stage(cfg: dict, stage: str) -> str:
+    """Return the Codex model for *stage*, falling back to ``codex.model`` when
+    the stage-specific key is absent, ``None``, or an empty string."""
+    return cfg["codex"].get(f"{stage}_model") or cfg["codex"]["model"]
+
 
 def _invoke_codex(cfg: dict, ctr: dict, prompt: str, repo: Path, **kwargs) -> str:
     """Atomically check the budget, increment the call counter, and run Codex.
@@ -100,7 +108,7 @@ def verify_diff(cfg: dict, findings: list, ctr: dict) -> bool:
             cfg, ctr, prompt, repo,
             flags=cfg["codex"]["audit_flags"],
             cmd=cfg["codex"]["cmd"],
-            model=cfg["codex"].get("verify_model") or cfg["codex"]["model"],
+            model=model_for_stage(cfg, "verify"),
             timeout=cfg["codex"]["timeout"],
             output_schema=VERIFY_SCHEMA,
         )
@@ -136,7 +144,7 @@ def phase_audit(cfg: dict, db: DB, area: dict, ctr: dict) -> int:
             cfg, ctr, prompt, repo,
             flags=cfg["codex"]["audit_flags"],
             cmd=cfg["codex"]["cmd"],
-            model=cfg["codex"].get("audit_model") or cfg["codex"]["model"],
+            model=model_for_stage(cfg, "audit"),
             timeout=cfg["codex"]["timeout"],
             output_schema=AUDIT_SCHEMA,
         )
@@ -218,7 +226,7 @@ def phase_revalidate(cfg: dict, finding: dict, ctr: dict) -> str:
             cfg, ctr, prompt, repo,
             flags=cfg["codex"]["audit_flags"],
             cmd=cfg["codex"]["cmd"],
-            model=cfg["codex"].get("revalidate_model") or cfg["codex"]["model"],
+            model=model_for_stage(cfg, "revalidate"),
             timeout=cfg["codex"]["timeout"],
             output_schema=REVALIDATE_SCHEMA,
         )
@@ -262,7 +270,7 @@ def phase_validate(cfg: dict, finding: dict, ctr: dict, *, db: DB | None = None)
             cfg, ctr, prompt, repo,
             flags=cfg["codex"]["audit_flags"],
             cmd=cfg["codex"]["cmd"],
-            model=cfg["codex"].get("validate_model") or cfg["codex"]["model"],
+            model=model_for_stage(cfg, "validate"),
             timeout=cfg["codex"]["timeout"],
             output_schema=VALIDATE_SCHEMA,
         )
@@ -319,7 +327,7 @@ def phase_repair(cfg: dict, db: DB, findings: list, ctr: dict) -> bool:
                 cfg, ctr, prompt, repo,
                 flags=cfg["codex"]["repair_flags"],
                 cmd=cfg["codex"]["cmd"],
-                model=cfg["codex"].get("repair_model") or cfg["codex"]["model"],
+                model=model_for_stage(cfg, "repair"),
                 timeout=cfg["codex"]["timeout"],
             )
         except CodexError as exc:
@@ -401,7 +409,7 @@ def phase_review_loop(
                 cfg, ctr, prompt, repo,
                 flags=cfg["codex"]["audit_flags"],
                 cmd=cfg["codex"]["cmd"],
-                model=cfg["codex"].get("review_model") or cfg["codex"]["model"],
+                model=model_for_stage(cfg, "review"),
                 timeout=cfg["codex"]["timeout"],
                 output_schema=REVIEW_SCHEMA,
             )
@@ -457,7 +465,7 @@ def phase_review_loop(
                 cfg, ctr, impl_prompt, repo,
                 flags=cfg["codex"]["repair_flags"],
                 cmd=cfg["codex"]["cmd"],
-                model=cfg["codex"].get("review_model") or cfg["codex"]["model"],
+                model=model_for_stage(cfg, "review"),
                 timeout=cfg["codex"]["timeout"],
             )
         except CodexError as exc:

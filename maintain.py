@@ -147,6 +147,19 @@ def _validate_config(cfg: dict, config_path: str) -> None:
                 f"budget.{key} must be a positive integer (got {val!r})"
             )
 
+    codex_model = cfg["codex"].get("model")
+    if not isinstance(codex_model, str) or not codex_model.strip():
+        errors.append(
+            f"codex.model must be a non-empty string (got {codex_model!r})"
+        )
+
+    for stage in ("audit", "revalidate", "validate", "repair", "verify", "review"):
+        val = cfg["codex"].get(f"{stage}_model")
+        if val is not None and not isinstance(val, str):
+            errors.append(
+                f"codex.{stage}_model must be a string or unset (got {val!r})"
+            )
+
     for binary, hint in [
         (cfg["codex"]["cmd"], "Install with: npm install -g @openai/codex"),
         ("gh", "Install from: https://cli.github.com"),
