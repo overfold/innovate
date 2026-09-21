@@ -29,6 +29,7 @@ DEFAULT_CONFIG: dict[str, Any] = {
         "review_model": None,
     },
     "verify": {
+        "setup_cmd": "",
         "test_cmd": "",
         "ci_wait_timeout": 600,
         "allow_no_ci": False,

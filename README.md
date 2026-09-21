@@ -169,9 +169,53 @@ back to `model` when its stage-specific key is absent.
 
 | Key | Description |
 |-----|-------------|
-| `test_cmd` | Shell command run inside the repo before opening a PR. Non-zero exit discards the fix. Leave empty to skip. |
+| `setup_cmd` | Shell command run inside each newly created repair worktree before Codex attempts a fix. Use it to install dependencies or otherwise prepare the environment. Leave empty to skip (the default). A non-zero exit aborts the run; see [Worktree setup](#worktree-setup) below. |
+| `test_cmd` | Shell command run inside the worktree before opening a PR. Non-zero exit discards the fix and requeues the finding. Leave empty to skip. |
 | `ci_wait_timeout` | Seconds to wait for GitHub CI after the PR is pushed. `0` skips the CI wait (implies `allow_no_ci`). |
 | `allow_no_ci` | Set to `true` only for repos that genuinely have no CI. When `false` (the default), the supervisor blocks merges when no CI checks are found, when the GitHub API returns an error, or when the wait times out. Only an explicit **success** status permits a merge. |
+
+### Worktree setup
+
+When Maintain creates a repair worktree it contains a bare checkout of the
+repository. If your project needs compiled dependencies, generated files, or
+a specific set of CLI tools, set `verify.setup_cmd` to install them before
+Codex runs.
+
+`setup_cmd` is completely generic — use whatever command your project requires:
+
+```toml
+[verify]
+setup_cmd = "npm ci"           # Node.js
+setup_cmd = "pip install -e .[dev]"   # Python
+setup_cmd = "./scripts/bootstrap.sh"  # custom script
+```
+
+**Recommended pattern — [Mise](https://mise.jdx.dev)**
+
+Mise manages per-project tool versions and tasks. With a `mise.toml` checked
+into your repository, a single `mise install` restores the exact tool versions
+(Node, Go, Python, Rust, …) each worktree needs:
+
+```toml
+[verify]
+setup_cmd = "mise install"
+test_cmd  = "mise run verify"
+```
+
+This makes every worktree reproducible regardless of what is installed
+system-wide on the machine running Maintain. Mise is only a recommendation;
+`npm ci`, a bootstrap script, direct package installation, or any other
+command works equally well.
+
+**Failure semantics**
+
+A non-zero exit from `setup_cmd` is treated as an infrastructure failure, not
+a finding defect:
+
+* The maintenance run is **aborted** rather than continuing with other findings.
+* The finding is **requeued** as open.
+* Its **repair-attempt count is not incremented**.
+* The failure command and output are **logged** at ERROR level.
 
 ### `[budget]`
 
@@ -302,6 +346,7 @@ already resolved or that no longer exist.
 * **Fail-closed throughout** — Codex errors, invalid JSON, missing CI checks,
   and timed-out CI waits all block action; they never constitute approval.
 * **Never weakens tests or CI** — if `test_cmd` fails, the fix is discarded.
+* **Setup failures abort without penalty** — if `setup_cmd` exits non-zero the run aborts, the finding is requeued, and its repair-attempt count is not incremented.
 * **Never merges with failing CI** — only an explicit GitHub "success" result
   permits a merge (or `allow_no_ci = true` with no checks present).
 * **Every fix is on its own branch and PR** — no direct pushes to the trunk.

@@ -371,6 +371,38 @@ class TestFixFinding:
         rm_wt.assert_called_once()
         assert db.get_finding(f["id"])["status"] == "open"
 
+    def test_setup_failure_raises_and_requeues_without_penalty(self, tmp_path):
+        """setup_cmd failure: finding requeued as open, repair count unchanged, run aborted."""
+        from supervisor.runner import WorktreeSetupError
+        sup, db, f, wt = self._setup(tmp_path)
+        initial_attempts = db.get_finding(f["id"])["repair_attempts"]
+
+        with patch(f"{RUNNER_MODULE}.create_worktree", return_value=wt), \
+             patch(f"{RUNNER_MODULE}.remove_worktree") as rm_wt, \
+             patch(f"{RUNNER_MODULE}.run_setup", return_value=False):
+
+            with pytest.raises(WorktreeSetupError):
+                sup._fix_finding(db.get_finding(f["id"]), "abc1234")
+
+        assert db.get_finding(f["id"])["status"] == "open"
+        assert db.get_finding(f["id"])["repair_attempts"] == initial_attempts
+        assert sup.ctr["consecutive_failures"] == 0
+        rm_wt.assert_called_once()
+
+    def test_setup_success_proceeds_to_validate(self, tmp_path):
+        """When setup_cmd succeeds, the fix cycle continues normally."""
+        sup, db, f, wt = self._setup(tmp_path)
+
+        with patch(f"{RUNNER_MODULE}.create_worktree", return_value=wt), \
+             patch(f"{RUNNER_MODULE}.remove_worktree"), \
+             patch(f"{RUNNER_MODULE}.run_setup", return_value=True), \
+             patch(f"{RUNNER_MODULE}.phase_validate", return_value="valid"), \
+             patch(f"{RUNNER_MODULE}.phase_repair", return_value=False):
+
+            result = sup._fix_finding(db.get_finding(f["id"]), "abc1234")
+
+        assert result is False  # repair failed, but setup didn't block it
+
     def test_repair_success_then_verify_fail_increments_failures(self, tmp_path):
         """repair succeeds → verify fails: consecutive_failures must still increment."""
         sup, db, f, wt = self._setup(tmp_path)
@@ -793,6 +825,51 @@ class TestPhaseRepair:
         calls = [c.args[1] for c in mock_git.call_args_list]
         assert "add" in calls
         assert "commit" in calls
+
+
+class TestRunSetup:
+    """Tests for the run_setup helper in supervisor.phases."""
+
+    def test_empty_setup_cmd_returns_true(self, tmp_path):
+        from supervisor.phases import run_setup
+        cfg = _cfg()
+        assert run_setup(cfg, tmp_path) is True
+
+    def test_setup_cmd_not_present_returns_true(self, tmp_path):
+        from supervisor.phases import run_setup
+        cfg = _cfg()
+        del cfg["verify"]["test_cmd"]  # verify section still present, no setup_cmd
+        assert run_setup(cfg, tmp_path) is True
+
+    def test_successful_setup_returns_true(self, tmp_path):
+        from supervisor.phases import run_setup
+        cfg = _cfg()
+        cfg["verify"]["setup_cmd"] = "true"  # always succeeds
+        assert run_setup(cfg, tmp_path) is True
+
+    def test_failing_setup_returns_false(self, tmp_path):
+        from supervisor.phases import run_setup
+        cfg = _cfg()
+        cfg["verify"]["setup_cmd"] = "false"  # always fails
+        assert run_setup(cfg, tmp_path) is False
+
+    def test_setup_runs_in_worktree_directory(self, tmp_path):
+        from supervisor.phases import run_setup
+        sentinel = tmp_path / "setup_ran_here"
+        cfg = _cfg()
+        cfg["verify"]["setup_cmd"] = f"touch {sentinel}"
+        result = run_setup(cfg, tmp_path)
+        assert result is True
+        assert sentinel.exists()
+
+    def test_failing_setup_logs_output(self, tmp_path, caplog):
+        import logging
+        from supervisor.phases import run_setup
+        cfg = _cfg()
+        cfg["verify"]["setup_cmd"] = "echo 'install failed'; exit 1"
+        with caplog.at_level(logging.ERROR, logger="supervisor"):
+            run_setup(cfg, tmp_path)
+        assert any("Setup command failed" in r.message for r in caplog.records)
 
 
 class TestPhaseReviewLoop:
@@ -1297,6 +1374,31 @@ class TestRunOnceReturnValues:
         assert call_count["n"] == 2
         # Finding is fixed
         assert db.get_finding(f["id"])["status"] == "fixed"
+
+    def test_setup_failure_aborts_run_with_budget(self, tmp_path):
+        """run_setup returning False causes run_once to return 'budget'."""
+        db = _db()
+        f = _open_finding(db)
+        wt = tmp_path / "wt"
+        wt.mkdir()
+
+        sup = Supervisor(_cfg(), db)
+        sup.startup_reconcile = lambda: None
+
+        with patch(f"{RUNNER_MODULE}.create_audit_worktree",
+                   side_effect=lambda repo, main: wt), \
+             patch(f"{RUNNER_MODULE}.remove_audit_worktree") as rm_awt, \
+             patch(f"{RUNNER_MODULE}.current_commit", return_value="abc1234"), \
+             patch(f"{RUNNER_MODULE}.phase_audit", return_value=1), \
+             patch(f"{RUNNER_MODULE}.create_worktree", return_value=wt), \
+             patch(f"{RUNNER_MODULE}.remove_worktree"), \
+             patch(f"{RUNNER_MODULE}.run_setup", return_value=False):
+
+            result = sup.run_once()
+
+        assert result == "budget"
+        # Audit worktree still cleaned up despite the abort
+        rm_awt.assert_called_once()
 
 
 # ── exhaustion logic ───────────────────────────────────────────────────────────

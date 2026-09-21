@@ -80,6 +80,28 @@ def run_tests(cfg: dict) -> bool:
     return r.returncode == 0
 
 
+def run_setup(cfg: dict, wt_path: Path) -> bool:
+    """Run the configured setup command inside the worktree.
+
+    Returns True immediately when setup_cmd is empty.
+    Returns True on zero exit, False on non-zero exit (logs command output).
+    """
+    setup_cmd = cfg["verify"].get("setup_cmd", "")
+    if not setup_cmd:
+        return True
+    LOG.info("  Running setup: %s", setup_cmd)
+    r = subprocess.run(
+        setup_cmd, shell=True, cwd=str(wt_path), capture_output=True, text=True
+    )
+    if r.returncode != 0:
+        LOG.error(
+            "  Setup command failed (exit %d):\n%s",
+            r.returncode,
+            (r.stdout + r.stderr)[-2000:],
+        )
+    return r.returncode == 0
+
+
 def verify_diff(cfg: dict, findings: list, ctr: dict) -> bool:
     """Codex diff-review of all changes relative to the audited base SHA.
 
