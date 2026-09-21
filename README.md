@@ -27,6 +27,10 @@ codex login          # or set OPENAI_API_KEY
 gh auth login
 ```
 
+A local clone of the target repository is **optional**: if `repo.path` is left
+empty Maintain clones and reuses it automatically (see
+[Managed clone](#managed-clone) below).
+
 ---
 
 ## Quick start
@@ -37,9 +41,10 @@ cd /path/to/supervisor
 
 # 2. Copy the example config and fill in your repo details.
 cp config.toml config.local.toml
-$EDITOR config.local.toml   # set repo.owner, repo.name, repo.path
+$EDITOR config.local.toml   # set repo.owner and repo.name at minimum
 
 # 3. Run a single maintenance iteration.
+#    Maintain clones the target repository automatically on first run.
 python maintain.py --config config.local.toml run
 
 # 4. (Optional) Run continuously until the repository is exhausted.
@@ -49,6 +54,33 @@ python maintain.py --config config.local.toml run-continuous
 The SQLite state database (`.maintain.db` by default) is created automatically
 on first run and accumulates findings, audit history, and PR records across
 runs.
+
+### Managed clone
+
+When `repo.path` is empty (the default), Maintain creates and reuses a clone
+at `~/.maintain/workspaces/<owner>/<name>`:
+
+* **First run** — the repository is cloned automatically before the audit
+  starts; no manual `git clone` step required.
+* **Subsequent runs** — the existing clone is reused.  The audit worktree
+  always fetches `origin/<default_branch>` fail-closed before auditing, so
+  Maintain always operates from the authoritative remote state.
+* **Explicit path** — set `repo.path` to an existing local clone to use that
+  checkout instead.  Maintain will never auto-clone into, replace, or delete
+  an explicitly configured path; it still fetches and creates temporary git
+  worktrees from it during normal operation.
+
+The workspace root is configurable via `repo.workspace`:
+
+```toml
+[repo]
+owner     = "my-company"
+name      = "my-repo"
+# workspace = "/data/maintain-workspaces"   # optional; default: ~/.maintain/workspaces
+```
+
+Maintain fails closed if the managed path exists but is not a valid git
+repository, or if its remote does not match `repo.owner`/`repo.name`.
 
 ---
 
@@ -138,7 +170,8 @@ Global flags accepted before the command:
 |-----|-------------|
 | `owner` | GitHub owner / org (e.g. `my-company`) |
 | `name` | Repository name without the owner prefix |
-| `path` | Absolute (or relative to cwd) path to the local clone |
+| `path` | Absolute (or relative to cwd) path to an existing local clone. **Optional** — leave empty to use the managed clone under `workspace`. When set, the directory must exist and its `origin` remote must match `owner`/`name`. |
+| `workspace` | Root directory for Maintain-managed clones. Each repository is stored at `<workspace>/<owner>/<name>`. Default: `~/.maintain/workspaces`. Ignored when `path` is set explicitly. |
 | `default_branch` | Trunk branch; PRs are opened against it (default: `main`) |
 | `commit_trailer` | Optional one-line trailer appended to every automated commit message (default: empty — no trailer added) |
 | `pr_footer` | Optional text appended to every automated PR body (default: empty) |

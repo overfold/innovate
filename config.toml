@@ -8,8 +8,17 @@ owner = "your-org"
 name  = "your-repo"
 
 # Absolute or relative path to the local clone of the repository.
-# The supervisor does all git operations here.
-path  = "/path/to/local/clone"
+# Leave empty (or omit this key) to let Maintain clone and manage the
+# repository automatically under the workspace directory below.
+# When set, Maintain uses the existing clone as-is; it will not auto-clone
+# into, replace, or delete the directory, though it does fetch from origin
+# and create temporary git worktrees inside it during normal operation.
+# path = "/path/to/local/clone"
+
+# Root directory where Maintain stores automatically managed clones.
+# Each repository is cloned into <workspace>/<owner>/<name>.
+# Leave empty (or omit) to use the default: ~/.maintain/workspaces
+# workspace = "~/.maintain/workspaces"
 
 # Branch to treat as the trunk.  PRs are opened against it.
 default_branch = "main"
