@@ -841,22 +841,51 @@ class TestRunSetup:
         # _cfg() already has no setup_cmd key; verify the absence is handled
         assert run_setup(cfg, tmp_path) is True
 
+    # ── helpers ──────────────────────────────────────────────────────────────
+
+    def _mock_clean_run(self, sha="abc1234"):
+        """Return subprocess.run side_effect for a fully successful setup."""
+        return [
+            MagicMock(returncode=0, stdout=f"{sha}\n", stderr=""),  # rev-parse HEAD (before)
+            MagicMock(returncode=0, stdout="", stderr=""),            # setup cmd
+            MagicMock(returncode=0, stdout=f"{sha}\n", stderr=""),  # rev-parse HEAD (after)
+            MagicMock(returncode=0, stdout="", stderr=""),            # git status
+        ]
+
+    @staticmethod
+    def _git_repo(path):
+        """Init a git repo with one commit at *path* and return the HEAD sha."""
+        import subprocess as _sp
+        _sp.run(["git", "init"], cwd=str(path), check=True, capture_output=True)
+        _sp.run(["git", "config", "user.email", "t@t.com"], cwd=str(path),
+                check=True, capture_output=True)
+        _sp.run(["git", "config", "user.name", "T"], cwd=str(path),
+                check=True, capture_output=True)
+        _sp.run(["git", "commit", "--allow-empty", "-m", "init"], cwd=str(path),
+                check=True, capture_output=True)
+        return _sp.run(["git", "rev-parse", "HEAD"], cwd=str(path),
+                       check=True, capture_output=True, text=True).stdout.strip()
+
+    # ── tests ─────────────────────────────────────────────────────────────────
+
     def test_successful_setup_returns_true(self, tmp_path):
         from supervisor.phases import run_setup
         cfg = _cfg()
-        cfg["verify"]["setup_cmd"] = "true"  # always succeeds, no file changes
+        cfg["verify"]["setup_cmd"] = "true"
         with patch("supervisor.phases.subprocess.run") as mock_run:
-            mock_run.side_effect = [
-                MagicMock(returncode=0, stdout="", stderr=""),  # setup cmd
-                MagicMock(returncode=0, stdout="", stderr=""),  # git status
-            ]
+            mock_run.side_effect = self._mock_clean_run()
             assert run_setup(cfg, tmp_path) is True
 
     def test_failing_setup_returns_false(self, tmp_path):
         from supervisor.phases import run_setup
         cfg = _cfg()
-        cfg["verify"]["setup_cmd"] = "false"  # always fails
-        assert run_setup(cfg, tmp_path) is False
+        cfg["verify"]["setup_cmd"] = "false"
+        with patch("supervisor.phases.subprocess.run") as mock_run:
+            mock_run.side_effect = [
+                MagicMock(returncode=0, stdout="abc1234\n", stderr=""),  # rev-parse (before)
+                MagicMock(returncode=1, stdout="", stderr=""),            # setup fails
+            ]
+            assert run_setup(cfg, tmp_path) is False
 
     def test_setup_runs_in_worktree_directory(self, tmp_path):
         """Setup command is invoked with cwd=wt_path."""
@@ -864,74 +893,94 @@ class TestRunSetup:
         cfg = _cfg()
         cfg["verify"]["setup_cmd"] = "true"
         with patch("supervisor.phases.subprocess.run") as mock_run:
-            mock_run.side_effect = [
-                MagicMock(returncode=0, stdout="", stderr=""),  # setup cmd
-                MagicMock(returncode=0, stdout="", stderr=""),  # git status
-            ]
+            mock_run.side_effect = self._mock_clean_run()
             run_setup(cfg, tmp_path)
-        setup_call_kwargs = mock_run.call_args_list[0][1]
+        # call index 1 is the setup command (0 = rev-parse HEAD before)
+        setup_call_kwargs = mock_run.call_args_list[1][1]
         assert setup_call_kwargs["cwd"] == str(tmp_path)
 
     def test_failing_setup_logs_output(self, tmp_path, caplog):
         import logging
         from supervisor.phases import run_setup
         cfg = _cfg()
-        cfg["verify"]["setup_cmd"] = "echo 'install failed'; exit 1"
-        with caplog.at_level(logging.ERROR, logger="supervisor"):
-            run_setup(cfg, tmp_path)
+        cfg["verify"]["setup_cmd"] = "false"
+        with patch("supervisor.phases.subprocess.run") as mock_run:
+            mock_run.side_effect = [
+                MagicMock(returncode=0, stdout="abc1234\n", stderr=""),
+                MagicMock(returncode=1, stdout="stdout msg\n", stderr="stderr msg\n"),
+            ]
+            with caplog.at_level(logging.ERROR, logger="supervisor"):
+                run_setup(cfg, tmp_path)
         assert any("Setup command failed" in r.message for r in caplog.records)
 
     def test_git_status_failure_returns_false(self, tmp_path):
         """If git status exits non-zero after setup, run_setup fails closed."""
-        from unittest.mock import patch as _patch
         from supervisor.phases import run_setup
         cfg = _cfg()
         cfg["verify"]["setup_cmd"] = "true"
-        broken = MagicMock(returncode=128, stdout="", stderr="fatal: not a git repo\n")
-        with _patch("supervisor.phases.subprocess.run") as mock_run:
-            # First call is the setup command (returncode=0), second is git status.
+        with patch("supervisor.phases.subprocess.run") as mock_run:
             mock_run.side_effect = [
-                MagicMock(returncode=0, stdout="", stderr=""),
-                broken,
+                MagicMock(returncode=0, stdout="abc1234\n", stderr=""),   # rev-parse (before)
+                MagicMock(returncode=0, stdout="", stderr=""),             # setup cmd
+                MagicMock(returncode=0, stdout="abc1234\n", stderr=""),   # rev-parse (after)
+                MagicMock(returncode=128, stdout="", stderr="fatal: not a git repo\n"),
             ]
             result = run_setup(cfg, tmp_path)
         assert result is False
 
+    def test_setup_changed_head_returns_false(self, tmp_path):
+        """setup_cmd that moves HEAD (e.g. accidental commit) is rejected."""
+        from supervisor.phases import run_setup
+        cfg = _cfg()
+        cfg["verify"]["setup_cmd"] = "true"
+        with patch("supervisor.phases.subprocess.run") as mock_run:
+            mock_run.side_effect = [
+                MagicMock(returncode=0, stdout="aaa111\n", stderr=""),  # rev-parse (before)
+                MagicMock(returncode=0, stdout="", stderr=""),            # setup cmd
+                MagicMock(returncode=0, stdout="bbb222\n", stderr=""),  # rev-parse (after) — changed!
+                MagicMock(returncode=0, stdout="", stderr=""),            # git status (unreached)
+            ]
+            result = run_setup(cfg, tmp_path)
+        assert result is False
+
+    def test_setup_changed_head_logs_shas(self, tmp_path, caplog):
+        """Changed-HEAD error message includes before/after SHAs."""
+        import logging
+        from supervisor.phases import run_setup
+        cfg = _cfg()
+        cfg["verify"]["setup_cmd"] = "true"
+        with patch("supervisor.phases.subprocess.run") as mock_run:
+            mock_run.side_effect = [
+                MagicMock(returncode=0, stdout="aaa111bbb222ccc333\n", stderr=""),
+                MagicMock(returncode=0, stdout="", stderr=""),
+                MagicMock(returncode=0, stdout="ddd444eee555fff666\n", stderr=""),
+                MagicMock(returncode=0, stdout="", stderr=""),
+            ]
+            with caplog.at_level(logging.ERROR, logger="supervisor"):
+                run_setup(cfg, tmp_path)
+        assert any("changed HEAD" in r.message for r in caplog.records)
+
     def test_dirty_worktree_after_setup_returns_false(self, tmp_path):
         """setup_cmd that leaves non-ignored files returns False (patch contamination)."""
-        import subprocess
-        from supervisor.phases import run_setup
-        # Initialise a real git repo so git status works
-        subprocess.run(["git", "init"], cwd=str(tmp_path), check=True,
-                       capture_output=True)
-        subprocess.run(["git", "config", "user.email", "t@t.com"], cwd=str(tmp_path),
-                       check=True, capture_output=True)
-        subprocess.run(["git", "config", "user.name", "T"], cwd=str(tmp_path),
-                       check=True, capture_output=True)
+        self._git_repo(tmp_path)
         cfg = _cfg()
         cfg["verify"]["setup_cmd"] = "echo dirty > new_file.txt"
-        result = run_setup(cfg, tmp_path)
-        assert result is False
+        from supervisor.phases import run_setup
+        assert run_setup(cfg, tmp_path) is False
 
     def test_gitignored_files_after_setup_are_allowed(self, tmp_path):
         """setup_cmd that only creates gitignored files is fine (no patch contamination)."""
         import subprocess
-        from supervisor.phases import run_setup
-        subprocess.run(["git", "init"], cwd=str(tmp_path), check=True,
-                       capture_output=True)
-        subprocess.run(["git", "config", "user.email", "t@t.com"], cwd=str(tmp_path),
-                       check=True, capture_output=True)
-        subprocess.run(["git", "config", "user.name", "T"], cwd=str(tmp_path),
-                       check=True, capture_output=True)
+        self._git_repo(tmp_path)
         (tmp_path / ".gitignore").write_text("node_modules/\n")
         subprocess.run(["git", "add", ".gitignore"], cwd=str(tmp_path), check=True,
                        capture_output=True)
-        subprocess.run(["git", "commit", "-m", "init"], cwd=str(tmp_path), check=True,
-                       capture_output=True)
+        subprocess.run(["git", "commit", "-m", "add gitignore"], cwd=str(tmp_path),
+                       check=True, capture_output=True)
         cfg = _cfg()
         cfg["verify"]["setup_cmd"] = "mkdir -p node_modules && echo ok > node_modules/pkg.js"
-        result = run_setup(cfg, tmp_path)
-        assert result is True
+        from supervisor.phases import run_setup
+        assert run_setup(cfg, tmp_path) is True
 
 
 class TestPhaseReviewLoop:
