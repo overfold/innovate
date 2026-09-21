@@ -751,7 +751,7 @@ class Supervisor:
             cfg["repo"]["name"],
         )
 
-        if not self.db.open_findings():
+        if not self.db.open_findings() and not self.db.blocked_findings():
             print("No queued findings to repair.")
             return "done"
 

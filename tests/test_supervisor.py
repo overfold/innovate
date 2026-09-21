@@ -3143,6 +3143,33 @@ class TestRepairCommand:
         mock_wt.assert_not_called()
         assert "No queued findings" in capsys.readouterr().out
 
+    def test_repair_revalidates_stale_blocked_when_no_open_findings(self, tmp_path):
+        """repair must not exit early when the only queued finding is blocked
+        at an older HEAD — that finding needs revalidation against the new HEAD."""
+        db = _db()
+        f = _open_finding(db)
+        # Finding was blocked at HEAD A; current HEAD will be HEAD B.
+        db.mark_finding(f["id"], "blocked", reason="rounds exhausted", head="headA")
+        wt = tmp_path / "wt"
+        wt.mkdir()
+
+        sup = Supervisor(_cfg(), db)
+        sup.startup_reconcile = lambda: None
+
+        with patch(f"{RUNNER_MODULE}.create_audit_worktree",
+                   side_effect=lambda repo, main: wt), \
+             patch(f"{RUNNER_MODULE}.remove_audit_worktree"), \
+             patch(f"{RUNNER_MODULE}.current_commit", return_value="headB"), \
+             patch(f"{RUNNER_MODULE}.phase_revalidate",
+                   return_value="valid") as mock_reval:
+            result = sup.run_repair()
+
+        assert result == "done"
+        # phase_revalidate must have been called for the stale blocked finding.
+        mock_reval.assert_called_once()
+        # blocked_at_head should now be refreshed to the new HEAD.
+        assert db.get_finding(f["id"])["blocked_at_head"] == "headB"
+
     def test_repair_never_advances_audit_streak_or_declares_exhausted(
         self, tmp_path
     ):
