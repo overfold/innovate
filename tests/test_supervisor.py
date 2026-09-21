@@ -838,14 +838,19 @@ class TestRunSetup:
     def test_setup_cmd_not_present_returns_true(self, tmp_path):
         from supervisor.phases import run_setup
         cfg = _cfg()
-        del cfg["verify"]["test_cmd"]  # verify section still present, no setup_cmd
+        # _cfg() already has no setup_cmd key; verify the absence is handled
         assert run_setup(cfg, tmp_path) is True
 
     def test_successful_setup_returns_true(self, tmp_path):
         from supervisor.phases import run_setup
         cfg = _cfg()
-        cfg["verify"]["setup_cmd"] = "true"  # always succeeds
-        assert run_setup(cfg, tmp_path) is True
+        cfg["verify"]["setup_cmd"] = "true"  # always succeeds, no file changes
+        with patch("supervisor.phases.subprocess.run") as mock_run:
+            mock_run.side_effect = [
+                MagicMock(returncode=0, stdout="", stderr=""),  # setup cmd
+                MagicMock(returncode=0, stdout="", stderr=""),  # git status
+            ]
+            assert run_setup(cfg, tmp_path) is True
 
     def test_failing_setup_returns_false(self, tmp_path):
         from supervisor.phases import run_setup
@@ -854,13 +859,18 @@ class TestRunSetup:
         assert run_setup(cfg, tmp_path) is False
 
     def test_setup_runs_in_worktree_directory(self, tmp_path):
+        """Setup command is invoked with cwd=wt_path."""
         from supervisor.phases import run_setup
-        sentinel = tmp_path / "setup_ran_here"
         cfg = _cfg()
-        cfg["verify"]["setup_cmd"] = f"touch {sentinel}"
-        result = run_setup(cfg, tmp_path)
-        assert result is True
-        assert sentinel.exists()
+        cfg["verify"]["setup_cmd"] = "true"
+        with patch("supervisor.phases.subprocess.run") as mock_run:
+            mock_run.side_effect = [
+                MagicMock(returncode=0, stdout="", stderr=""),  # setup cmd
+                MagicMock(returncode=0, stdout="", stderr=""),  # git status
+            ]
+            run_setup(cfg, tmp_path)
+        setup_call_kwargs = mock_run.call_args_list[0][1]
+        assert setup_call_kwargs["cwd"] == str(tmp_path)
 
     def test_failing_setup_logs_output(self, tmp_path, caplog):
         import logging
@@ -870,6 +880,22 @@ class TestRunSetup:
         with caplog.at_level(logging.ERROR, logger="supervisor"):
             run_setup(cfg, tmp_path)
         assert any("Setup command failed" in r.message for r in caplog.records)
+
+    def test_git_status_failure_returns_false(self, tmp_path):
+        """If git status exits non-zero after setup, run_setup fails closed."""
+        from unittest.mock import patch as _patch
+        from supervisor.phases import run_setup
+        cfg = _cfg()
+        cfg["verify"]["setup_cmd"] = "true"
+        broken = MagicMock(returncode=128, stdout="", stderr="fatal: not a git repo\n")
+        with _patch("supervisor.phases.subprocess.run") as mock_run:
+            # First call is the setup command (returncode=0), second is git status.
+            mock_run.side_effect = [
+                MagicMock(returncode=0, stdout="", stderr=""),
+                broken,
+            ]
+            result = run_setup(cfg, tmp_path)
+        assert result is False
 
     def test_dirty_worktree_after_setup_returns_false(self, tmp_path):
         """setup_cmd that leaves non-ignored files returns False (patch contamination)."""

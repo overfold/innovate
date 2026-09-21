@@ -106,10 +106,20 @@ def run_setup(cfg: dict, wt_path: Path) -> bool:
     # Guard against setup polluting the repair patch: git add -A will stage any
     # modified tracked file or new untracked non-ignored file, so the worktree
     # must be clean (gitignored paths are exempt and do not appear here).
+    # Fail-closed: if git status itself fails (e.g. damaged worktree metadata),
+    # we cannot verify cleanliness and must not proceed.
     status_r = subprocess.run(
         ["git", "status", "--porcelain"],
         cwd=str(wt_path), capture_output=True, text=True, check=False,
     )
+    if status_r.returncode != 0:
+        LOG.error(
+            "  'git status' failed after setup — cannot verify worktree cleanliness"
+            " (exit %d):\n%s",
+            status_r.returncode,
+            status_r.stderr[:1000],
+        )
+        return False
     if status_r.stdout.strip():
         LOG.error(
             "  Setup command left the worktree dirty —"
