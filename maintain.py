@@ -160,6 +160,12 @@ def _validate_config(cfg: dict, config_path: str) -> None:
                 f"codex.{stage}_model must be a string or unset (got {val!r})"
             )
 
+    setup_cmd = cfg["verify"].get("setup_cmd", "")
+    if not isinstance(setup_cmd, str):
+        errors.append(
+            f"verify.setup_cmd must be a string (got {type(setup_cmd).__name__})"
+        )
+
     for binary, hint in [
         (cfg["codex"]["cmd"], "Install with: npm install -g @openai/codex"),
         ("gh", "Install from: https://cli.github.com"),
@@ -251,6 +257,12 @@ def main() -> None:
                     logging.getLogger("supervisor").warning(
                         "Repository has unresolved blocked findings —"
                         " human review required.  Stopping."
+                    )
+                    break
+                if result == "setup_error":
+                    logging.getLogger("supervisor").error(
+                        "Setup command failed — fix verify.setup_cmd before"
+                        " running again.  Stopping."
                     )
                     break
                 time.sleep(5)

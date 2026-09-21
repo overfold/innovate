@@ -371,6 +371,38 @@ class TestFixFinding:
         rm_wt.assert_called_once()
         assert db.get_finding(f["id"])["status"] == "open"
 
+    def test_setup_failure_raises_and_requeues_without_penalty(self, tmp_path):
+        """setup_cmd failure: finding requeued as open, repair count unchanged, run aborted."""
+        from supervisor.runner import WorktreeSetupError
+        sup, db, f, wt = self._setup(tmp_path)
+        initial_attempts = db.get_finding(f["id"])["repair_attempts"]
+
+        with patch(f"{RUNNER_MODULE}.create_worktree", return_value=wt), \
+             patch(f"{RUNNER_MODULE}.remove_worktree") as rm_wt, \
+             patch(f"{RUNNER_MODULE}.run_setup", return_value=False):
+
+            with pytest.raises(WorktreeSetupError):
+                sup._fix_finding(db.get_finding(f["id"]), "abc1234")
+
+        assert db.get_finding(f["id"])["status"] == "open"
+        assert db.get_finding(f["id"])["repair_attempts"] == initial_attempts
+        assert sup.ctr["consecutive_failures"] == 0
+        rm_wt.assert_called_once()
+
+    def test_setup_success_proceeds_to_validate(self, tmp_path):
+        """When setup_cmd succeeds, the fix cycle continues normally."""
+        sup, db, f, wt = self._setup(tmp_path)
+
+        with patch(f"{RUNNER_MODULE}.create_worktree", return_value=wt), \
+             patch(f"{RUNNER_MODULE}.remove_worktree"), \
+             patch(f"{RUNNER_MODULE}.run_setup", return_value=True), \
+             patch(f"{RUNNER_MODULE}.phase_validate", return_value="valid"), \
+             patch(f"{RUNNER_MODULE}.phase_repair", return_value=False):
+
+            result = sup._fix_finding(db.get_finding(f["id"]), "abc1234")
+
+        assert result is False  # repair failed, but setup didn't block it
+
     def test_repair_success_then_verify_fail_increments_failures(self, tmp_path):
         """repair succeeds → verify fails: consecutive_failures must still increment."""
         sup, db, f, wt = self._setup(tmp_path)
@@ -793,6 +825,162 @@ class TestPhaseRepair:
         calls = [c.args[1] for c in mock_git.call_args_list]
         assert "add" in calls
         assert "commit" in calls
+
+
+class TestRunSetup:
+    """Tests for the run_setup helper in supervisor.phases."""
+
+    def test_empty_setup_cmd_returns_true(self, tmp_path):
+        from supervisor.phases import run_setup
+        cfg = _cfg()
+        assert run_setup(cfg, tmp_path) is True
+
+    def test_setup_cmd_not_present_returns_true(self, tmp_path):
+        from supervisor.phases import run_setup
+        cfg = _cfg()
+        # _cfg() already has no setup_cmd key; verify the absence is handled
+        assert run_setup(cfg, tmp_path) is True
+
+    # ── helpers ──────────────────────────────────────────────────────────────
+
+    def _mock_clean_run(self, sha="abc1234"):
+        """Return subprocess.run side_effect for a fully successful setup."""
+        return [
+            MagicMock(returncode=0, stdout=f"{sha}\n", stderr=""),  # rev-parse HEAD (before)
+            MagicMock(returncode=0, stdout="", stderr=""),            # setup cmd
+            MagicMock(returncode=0, stdout=f"{sha}\n", stderr=""),  # rev-parse HEAD (after)
+            MagicMock(returncode=0, stdout="", stderr=""),            # git status
+        ]
+
+    @staticmethod
+    def _git_repo(path):
+        """Init a git repo with one commit at *path* and return the HEAD sha."""
+        import subprocess as _sp
+        _sp.run(["git", "init"], cwd=str(path), check=True, capture_output=True)
+        _sp.run(["git", "config", "user.email", "t@t.com"], cwd=str(path),
+                check=True, capture_output=True)
+        _sp.run(["git", "config", "user.name", "T"], cwd=str(path),
+                check=True, capture_output=True)
+        _sp.run(["git", "commit", "--allow-empty", "-m", "init"], cwd=str(path),
+                check=True, capture_output=True)
+        return _sp.run(["git", "rev-parse", "HEAD"], cwd=str(path),
+                       check=True, capture_output=True, text=True).stdout.strip()
+
+    # ── tests ─────────────────────────────────────────────────────────────────
+
+    def test_successful_setup_returns_true(self, tmp_path):
+        from supervisor.phases import run_setup
+        cfg = _cfg()
+        cfg["verify"]["setup_cmd"] = "true"
+        with patch("supervisor.phases.subprocess.run") as mock_run:
+            mock_run.side_effect = self._mock_clean_run()
+            assert run_setup(cfg, tmp_path) is True
+
+    def test_failing_setup_returns_false(self, tmp_path):
+        from supervisor.phases import run_setup
+        cfg = _cfg()
+        cfg["verify"]["setup_cmd"] = "false"
+        with patch("supervisor.phases.subprocess.run") as mock_run:
+            mock_run.side_effect = [
+                MagicMock(returncode=0, stdout="abc1234\n", stderr=""),  # rev-parse (before)
+                MagicMock(returncode=1, stdout="", stderr=""),            # setup fails
+            ]
+            assert run_setup(cfg, tmp_path) is False
+
+    def test_setup_runs_in_worktree_directory(self, tmp_path):
+        """Setup command is invoked with cwd=wt_path."""
+        from supervisor.phases import run_setup
+        cfg = _cfg()
+        cfg["verify"]["setup_cmd"] = "true"
+        with patch("supervisor.phases.subprocess.run") as mock_run:
+            mock_run.side_effect = self._mock_clean_run()
+            run_setup(cfg, tmp_path)
+        # call index 1 is the setup command (0 = rev-parse HEAD before)
+        setup_call_kwargs = mock_run.call_args_list[1][1]
+        assert setup_call_kwargs["cwd"] == str(tmp_path)
+
+    def test_failing_setup_logs_output(self, tmp_path, caplog):
+        import logging
+        from supervisor.phases import run_setup
+        cfg = _cfg()
+        cfg["verify"]["setup_cmd"] = "false"
+        with patch("supervisor.phases.subprocess.run") as mock_run:
+            mock_run.side_effect = [
+                MagicMock(returncode=0, stdout="abc1234\n", stderr=""),
+                MagicMock(returncode=1, stdout="stdout msg\n", stderr="stderr msg\n"),
+            ]
+            with caplog.at_level(logging.ERROR, logger="supervisor"):
+                run_setup(cfg, tmp_path)
+        assert any("Setup command failed" in r.message for r in caplog.records)
+
+    def test_git_status_failure_returns_false(self, tmp_path):
+        """If git status exits non-zero after setup, run_setup fails closed."""
+        from supervisor.phases import run_setup
+        cfg = _cfg()
+        cfg["verify"]["setup_cmd"] = "true"
+        with patch("supervisor.phases.subprocess.run") as mock_run:
+            mock_run.side_effect = [
+                MagicMock(returncode=0, stdout="abc1234\n", stderr=""),   # rev-parse (before)
+                MagicMock(returncode=0, stdout="", stderr=""),             # setup cmd
+                MagicMock(returncode=0, stdout="abc1234\n", stderr=""),   # rev-parse (after)
+                MagicMock(returncode=128, stdout="", stderr="fatal: not a git repo\n"),
+            ]
+            result = run_setup(cfg, tmp_path)
+        assert result is False
+
+    def test_setup_changed_head_returns_false(self, tmp_path):
+        """setup_cmd that moves HEAD (e.g. accidental commit) is rejected."""
+        from supervisor.phases import run_setup
+        cfg = _cfg()
+        cfg["verify"]["setup_cmd"] = "true"
+        with patch("supervisor.phases.subprocess.run") as mock_run:
+            mock_run.side_effect = [
+                MagicMock(returncode=0, stdout="aaa111\n", stderr=""),  # rev-parse (before)
+                MagicMock(returncode=0, stdout="", stderr=""),            # setup cmd
+                MagicMock(returncode=0, stdout="bbb222\n", stderr=""),  # rev-parse (after) — changed!
+                MagicMock(returncode=0, stdout="", stderr=""),            # git status (unreached)
+            ]
+            result = run_setup(cfg, tmp_path)
+        assert result is False
+
+    def test_setup_changed_head_logs_shas(self, tmp_path, caplog):
+        """Changed-HEAD error message includes before/after SHAs."""
+        import logging
+        from supervisor.phases import run_setup
+        cfg = _cfg()
+        cfg["verify"]["setup_cmd"] = "true"
+        with patch("supervisor.phases.subprocess.run") as mock_run:
+            mock_run.side_effect = [
+                MagicMock(returncode=0, stdout="aaa111bbb222ccc333\n", stderr=""),
+                MagicMock(returncode=0, stdout="", stderr=""),
+                MagicMock(returncode=0, stdout="ddd444eee555fff666\n", stderr=""),
+                MagicMock(returncode=0, stdout="", stderr=""),
+            ]
+            with caplog.at_level(logging.ERROR, logger="supervisor"):
+                run_setup(cfg, tmp_path)
+        assert any("changed HEAD" in r.message for r in caplog.records)
+
+    def test_dirty_worktree_after_setup_returns_false(self, tmp_path):
+        """setup_cmd that leaves non-ignored files returns False (patch contamination)."""
+        self._git_repo(tmp_path)
+        cfg = _cfg()
+        cfg["verify"]["setup_cmd"] = "echo dirty > new_file.txt"
+        from supervisor.phases import run_setup
+        assert run_setup(cfg, tmp_path) is False
+
+    def test_gitignored_files_after_setup_are_allowed(self, tmp_path):
+        """setup_cmd that only creates gitignored files is fine (no patch contamination)."""
+        import subprocess
+        self._git_repo(tmp_path)
+        (tmp_path / ".gitignore").write_text("node_modules/\n")
+        subprocess.run(["git", "add", ".gitignore"], cwd=str(tmp_path), check=True,
+                       capture_output=True)
+        subprocess.run(["git", "commit", "-m", "add gitignore"], cwd=str(tmp_path),
+                       check=True, capture_output=True)
+        cfg = _cfg()
+        cfg["verify"]["setup_cmd"] = "mkdir -p node_modules && echo ok > node_modules/pkg.js"
+        from supervisor.phases import run_setup
+        assert run_setup(cfg, tmp_path) is True
 
 
 class TestPhaseReviewLoop:
@@ -1297,6 +1485,31 @@ class TestRunOnceReturnValues:
         assert call_count["n"] == 2
         # Finding is fixed
         assert db.get_finding(f["id"])["status"] == "fixed"
+
+    def test_setup_failure_aborts_run_with_setup_error(self, tmp_path):
+        """run_setup returning False causes run_once to return 'setup_error'."""
+        db = _db()
+        f = _open_finding(db)
+        wt = tmp_path / "wt"
+        wt.mkdir()
+
+        sup = Supervisor(_cfg(), db)
+        sup.startup_reconcile = lambda: None
+
+        with patch(f"{RUNNER_MODULE}.create_audit_worktree",
+                   side_effect=lambda repo, main: wt), \
+             patch(f"{RUNNER_MODULE}.remove_audit_worktree") as rm_awt, \
+             patch(f"{RUNNER_MODULE}.current_commit", return_value="abc1234"), \
+             patch(f"{RUNNER_MODULE}.phase_audit", return_value=1), \
+             patch(f"{RUNNER_MODULE}.create_worktree", return_value=wt), \
+             patch(f"{RUNNER_MODULE}.remove_worktree"), \
+             patch(f"{RUNNER_MODULE}.run_setup", return_value=False):
+
+            result = sup.run_once()
+
+        assert result == "setup_error"
+        # Audit worktree still cleaned up despite the abort
+        rm_awt.assert_called_once()
 
 
 # ── exhaustion logic ───────────────────────────────────────────────────────────

@@ -55,6 +55,25 @@ repair_flags = ["exec", "--sandbox", "workspace-write"]
 
 
 [verify]
+# Optional shell command run inside each newly created repair worktree before
+# Codex attempts a fix.  Use it to install dependencies or any other environment
+# setup the project needs.  Leave empty to skip (the default).
+#
+# A non-zero exit is treated as an infrastructure failure: the maintenance run
+# is aborted, the finding is requeued without penalty, and its repair-attempt
+# count is not incremented.
+#
+# Any command works here — this option is completely generic:
+#   setup_cmd = "npm ci"
+#   setup_cmd = "pip install -e .[dev]"
+#   setup_cmd = "./scripts/bootstrap.sh"
+#
+# Mise (https://mise.jdx.dev) is a convenient choice for reproducible
+# per-project tool and dependency setup:
+#   setup_cmd = "mise install"
+#   test_cmd  = "mise run verify"
+setup_cmd = ""
+
 # Optional shell command run inside the repo before opening a PR.
 # If it exits non-zero the fix is discarded and the finding is re-queued.
 # Leave empty to skip local verification.

@@ -80,6 +80,97 @@ def run_tests(cfg: dict) -> bool:
     return r.returncode == 0
 
 
+def _git_head(wt_path: Path) -> str | None:
+    """Return the current HEAD SHA for *wt_path*, or None if git fails."""
+    r = subprocess.run(
+        ["git", "rev-parse", "HEAD"],
+        cwd=str(wt_path), capture_output=True, text=True, check=False,
+    )
+    return r.stdout.strip() if r.returncode == 0 else None
+
+
+def run_setup(cfg: dict, wt_path: Path) -> bool:
+    """Run the configured setup command inside the worktree.
+
+    Returns True immediately when setup_cmd is empty.
+    Returns False (and logs the reason) if any of the following hold:
+    - the command exits non-zero;
+    - HEAD cannot be read before or after setup, or changes during setup
+      (e.g. setup accidentally commits or checks out another commit);
+    - the working tree is dirty afterwards (modified tracked files or new
+      untracked non-ignored files that git add -A would stage).
+
+    Gitignored paths (caches, installed packages, build artifacts) are
+    explicitly exempt from the working-tree check.
+
+    Invariant enforced:
+        HEAD == HEAD_before_setup  AND  git status --porcelain == ""
+    """
+    setup_cmd = cfg["verify"].get("setup_cmd", "")
+    if not setup_cmd:
+        return True
+
+    head_before = _git_head(wt_path)
+    if head_before is None:
+        LOG.error("  Cannot read HEAD before setup — aborting (fail-closed)")
+        return False
+
+    LOG.info("  Running setup: %s", setup_cmd)
+    r = subprocess.run(
+        setup_cmd, shell=True, cwd=str(wt_path), capture_output=True, text=True
+    )
+    if r.returncode != 0:
+        LOG.error(
+            "  Setup command failed (exit %d):\n%s",
+            r.returncode,
+            (r.stdout + r.stderr)[-2000:],
+        )
+        return False
+
+    # Verify HEAD is unchanged — a setup-created commit would silently become
+    # part of the repair branch history and bypass all contamination checks.
+    head_after = _git_head(wt_path)
+    if head_after is None:
+        LOG.error(
+            "  Cannot read HEAD after setup — worktree may be damaged (fail-closed)"
+        )
+        return False
+    if head_after != head_before:
+        LOG.error(
+            "  Setup command changed HEAD from %s to %s —"
+            " aborting to prevent branch contamination",
+            head_before[:12], head_after[:12],
+        )
+        return False
+
+    # Guard against setup polluting the repair patch: git add -A will stage any
+    # modified tracked file or new untracked non-ignored file, so the worktree
+    # must be clean (gitignored paths are exempt and do not appear here).
+    # Fail-closed: if git status itself fails (e.g. damaged worktree metadata),
+    # we cannot verify cleanliness and must not proceed.
+    status_r = subprocess.run(
+        ["git", "status", "--porcelain"],
+        cwd=str(wt_path), capture_output=True, text=True, check=False,
+    )
+    if status_r.returncode != 0:
+        LOG.error(
+            "  'git status' failed after setup — cannot verify worktree cleanliness"
+            " (exit %d):\n%s",
+            status_r.returncode,
+            status_r.stderr[:1000],
+        )
+        return False
+    if status_r.stdout.strip():
+        LOG.error(
+            "  Setup command left the worktree dirty —"
+            " aborting to prevent patch contamination"
+            " (add these paths to .gitignore if they are build artifacts):\n%s",
+            status_r.stdout[:1000],
+        )
+        return False
+    return True
+
+
 def verify_diff(cfg: dict, findings: list, ctr: dict) -> bool:
     """Codex diff-review of all changes relative to the audited base SHA.
 

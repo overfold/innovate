@@ -36,9 +36,18 @@ from .phases import (
     phase_review_loop,
     phase_validate,
     phase_verify,
+    run_setup,
 )
 
 LOG = logging.getLogger("supervisor")
+
+
+class WorktreeSetupError(Exception):
+    """Raised when setup_cmd fails in a repair worktree.
+
+    Signals an infrastructure failure: the run is aborted but the finding
+    is requeued without penalty and its repair-attempt count is not incremented.
+    """
 
 
 class Supervisor:
@@ -248,6 +257,17 @@ class Supervisor:
                     "base_sha": current_head,  # pins verify_diff / review diffs
                 },
             }
+
+            # Run setup command in the worktree before any Codex calls.
+            # A non-zero exit is an infrastructure failure: requeue the finding
+            # without penalty and abort the run.
+            if not run_setup(wt_cfg, wt_path):
+                LOG.error(
+                    "  Setup command failed — aborting run"
+                    " (finding requeued, repair count unchanged)"
+                )
+                db.mark_finding(f["id"], "open")
+                raise WorktreeSetupError("setup_cmd failed in worktree")
 
             # Revalidate if HEAD has moved since the finding was recorded.
             # Runs inside the worktree so it sees the exact audited commit.
@@ -538,10 +558,11 @@ class Supervisor:
         and revalidations see the merged code.
 
         Returns one of:
-          'exhausted' — all areas clean, no blocked findings
-          'blocked'   — all areas clean, but unresolved blocked findings remain
-          'budget'    — stopped early because a budget limit was reached
-          'done'      — progress made (fixes applied or new findings) but not exhausted
+          'exhausted'   — all areas clean, no blocked findings
+          'blocked'     — all areas clean, but unresolved blocked findings remain
+          'budget'      — stopped early because a budget limit was reached
+          'setup_error' — setup_cmd failed; run aborted, finding requeued without penalty
+          'done'        — progress made (fixes applied or new findings) but not exhausted
         """
         # Reset per-run counters so run-continuous can't permanently wedge.
         self.ctr["codex_calls"] = 0
@@ -610,7 +631,11 @@ class Supervisor:
                     for finding in self.db.open_findings(area["name"]):
                         if self._over_budget():
                             return "budget"
-                        if self._fix_finding(finding, head):
+                        try:
+                            result = self._fix_finding(finding, head)
+                        except WorktreeSetupError:
+                            return "setup_error"
+                        if result:
                             merged_this_pass = True
                             break
 
