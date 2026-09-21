@@ -66,8 +66,9 @@ at `~/.maintain/workspaces/<owner>/<name>`:
   always fetches `origin/<default_branch>` fail-closed before auditing, so
   Maintain always operates from the authoritative remote state.
 * **Explicit path** — set `repo.path` to an existing local clone to use that
-  checkout instead.  Maintain never modifies or deletes an explicitly
-  configured path.
+  checkout instead.  Maintain will never auto-clone into, replace, or delete
+  an explicitly configured path; it still fetches and creates temporary git
+  worktrees from it during normal operation.
 
 The workspace root is configurable via `repo.workspace`:
 

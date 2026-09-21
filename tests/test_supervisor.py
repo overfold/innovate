@@ -2810,28 +2810,23 @@ class TestManagedClone:
         cloned_path = tmp_path / "ws" / "org" / "repo"
         remote_url = "https://github.com/org/repo.git"
 
+        def fake_clone(url, dest):
+            assert url == "https://github.com/org/repo"
+            assert Path(dest) == cloned_path
+            cloned_path.mkdir(parents=True, exist_ok=True)
+
         def fake_run(cmd, **kwargs):
             r = MagicMock()
-            if "clone" in cmd:
-                cloned_path.mkdir(parents=True, exist_ok=True)
-                r.returncode = 0
-                r.stdout = r.stderr = ""
-            elif "remote" in cmd:
-                r.returncode = 0
-                r.stdout = remote_url
-            else:
-                r.returncode = 0
-                r.stdout = ".git"
+            r.returncode = 0
+            r.stdout = remote_url if "remote" in cmd else ".git"
             return r
 
         with patch("maintain.shutil.which", return_value="/usr/bin/git"), \
-             patch("maintain.subprocess.run", side_effect=fake_run) as mock_run:
+             patch("maintain.clone_repo", side_effect=fake_clone) as mock_clone, \
+             patch("maintain.subprocess.run", side_effect=fake_run):
             _validate_config(cfg, cfg_file)  # must not raise
 
-        clone_calls = [c for c in mock_run.call_args_list if "clone" in c.args[0]]
-        assert len(clone_calls) == 1
-        assert f"https://github.com/org/repo" in clone_calls[0].args[0]
-        assert str(cloned_path) in clone_calls[0].args[0]
+        mock_clone.assert_called_once()
 
     def test_validate_reuses_existing_managed_path(self, tmp_path):
         from maintain import _validate_config, _resolve_repo_path
@@ -2851,11 +2846,11 @@ class TestManagedClone:
             return r
 
         with patch("maintain.shutil.which", return_value="/usr/bin/git"), \
-             patch("maintain.subprocess.run", side_effect=fake_run) as mock_run:
+             patch("maintain.clone_repo") as mock_clone, \
+             patch("maintain.subprocess.run", side_effect=fake_run):
             _validate_config(cfg, cfg_file)
 
-        clone_calls = [c for c in mock_run.call_args_list if "clone" in c.args[0]]
-        assert clone_calls == [], "must not clone an already-present managed path"
+        mock_clone.assert_not_called()
 
     def test_validate_clone_failure_aborts(self, tmp_path):
         from maintain import _validate_config, _resolve_repo_path
@@ -2863,19 +2858,8 @@ class TestManagedClone:
         cfg_file = self._make_cfg_file(tmp_path)
         _resolve_repo_path(cfg)
 
-        def fake_run(cmd, **kwargs):
-            r = MagicMock()
-            if "clone" in cmd:
-                r.returncode = 128
-                r.stderr = "repository not found"
-                r.stdout = ""
-            else:
-                r.returncode = 0
-                r.stdout = ".git"
-            return r
-
         with patch("maintain.shutil.which", return_value="/usr/bin/git"), \
-             patch("maintain.subprocess.run", side_effect=fake_run), \
+             patch("maintain.clone_repo", side_effect=RuntimeError("repository not found")), \
              pytest.raises(SystemExit) as exc_info:
             _validate_config(cfg, cfg_file)
 
@@ -2930,7 +2914,7 @@ class TestManagedClone:
              pytest.raises(SystemExit) as exc_info:
             _validate_config(cfg, cfg_file)
 
-        assert "evil-comp/repo" in str(exc_info.value) or "evil-corp/repo" in str(exc_info.value)
+        assert "evil-corp/repo" in str(exc_info.value)
 
     # ── _validate_config: explicit path (existing behaviour preserved) ──────
 
@@ -2941,13 +2925,32 @@ class TestManagedClone:
         cfg_file = self._make_cfg_file(tmp_path)
 
         with patch("maintain.shutil.which", return_value="/usr/bin/git"), \
-             patch("maintain.subprocess.run") as mock_run, \
+             patch("maintain.clone_repo") as mock_clone, \
              pytest.raises(SystemExit) as exc_info:
             _validate_config(cfg, cfg_file)
 
         assert "does not exist" in str(exc_info.value)
-        clone_calls = [c for c in mock_run.call_args_list if "clone" in c.args[0]]
-        assert clone_calls == [], "must not clone an explicitly configured path"
+        mock_clone.assert_not_called()
+
+    def test_validate_explicit_path_inside_workspace_not_cloned(self, tmp_path):
+        """An explicit repo.path that happens to sit inside the workspace root
+        must be treated as explicitly configured — provenance wins over location."""
+        from maintain import _validate_config
+        ws_root = tmp_path / "ws"
+        # Explicit path is inside the workspace root but NOT created on disk.
+        explicit_path = ws_root / "org" / "repo"
+        cfg = _cfg()
+        cfg["repo"]["path"] = str(explicit_path)  # explicitly set
+        cfg["repo"]["workspace"] = str(ws_root)
+        cfg_file = self._make_cfg_file(tmp_path)
+
+        with patch("maintain.shutil.which", return_value="/usr/bin/git"), \
+             patch("maintain.clone_repo") as mock_clone, \
+             pytest.raises(SystemExit) as exc_info:
+            _validate_config(cfg, cfg_file)
+
+        assert "does not exist" in str(exc_info.value)
+        mock_clone.assert_not_called()
 
     # ── managed_workspace_root ──────────────────────────────────────────────
 
