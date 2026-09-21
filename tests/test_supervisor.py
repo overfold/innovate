@@ -3208,3 +3208,53 @@ class TestRepairCommand:
             "SELECT COUNT(*) AS n FROM audit_runs"
         ).fetchone()["n"]
         assert audit_run_count == 0
+
+    def test_repair_revalidates_stale_rejected_and_retries(self, tmp_path):
+        """repair must revalidate findings rejected at an older HEAD and retry
+        them when still valid at the new HEAD.
+
+        Regression test for the case where the only actionable finding is
+        rejected at HEAD A and the current HEAD is B — repair must not report
+        'No queued findings' and must revalidate, reopen, and retry the finding.
+        """
+        db = _db()
+        f = _open_finding(db)
+        # Finding was rejected at HEAD A; repair produced no changes there.
+        db.mark_finding(f["id"], "rejected", reason="no changes produced", head="headA")
+
+        wt = tmp_path / "wt"
+        wt.mkdir()
+
+        sup = Supervisor(_cfg(), db)
+        sup.startup_reconcile = lambda: None
+
+        with patch(f"{RUNNER_MODULE}.create_audit_worktree",
+                   side_effect=lambda repo, main: wt) as mock_wt, \
+             patch(f"{RUNNER_MODULE}.remove_audit_worktree"), \
+             patch(f"{RUNNER_MODULE}.current_commit", return_value="headB"), \
+             patch(f"{RUNNER_MODULE}.phase_revalidate",
+                   return_value="valid") as mock_reval, \
+             patch(f"{RUNNER_MODULE}.create_worktree", return_value=wt), \
+             patch(f"{RUNNER_MODULE}.remove_worktree"), \
+             patch(f"{RUNNER_MODULE}.phase_validate", return_value="valid"), \
+             patch(f"{RUNNER_MODULE}.phase_repair", return_value=True), \
+             patch(f"{RUNNER_MODULE}.phase_verify", return_value=True), \
+             patch(f"{RUNNER_MODULE}.push_branch"), \
+             patch(f"{RUNNER_MODULE}.gh_create_pr", return_value=(1, "u")), \
+             patch(f"{RUNNER_MODULE}.phase_review_loop",
+                   return_value=REVIEW_APPROVED), \
+             patch(f"{RUNNER_MODULE}.wait_for_ci", return_value="no_checks"), \
+             patch(f"{RUNNER_MODULE}.gh_pr_base_sha", return_value="headB"), \
+             patch(f"{RUNNER_MODULE}.gh_merge_pr"):
+            result = sup.run_repair()
+
+        assert result == "done"
+        # A worktree must have been created — the early-exit guard must not fire.
+        mock_wt.assert_called()
+        # phase_revalidate must have been called (at minimum by
+        # _revalidate_stale_rejected; _fix_finding also calls it since
+        # commit_hash differs from current HEAD).
+        assert mock_reval.call_count >= 1
+        # After revalidation confirms the finding is still valid at headB,
+        # it is reopened and repaired.
+        assert db.get_finding(f["id"])["status"] == "fixed"

@@ -590,6 +590,36 @@ class Supervisor:
             else:  # error
                 self.ctr["consecutive_failures"] += 1
 
+    def _revalidate_stale_rejected(self, head: str, audit_cfg: dict) -> None:
+        """Revalidate rejected findings recorded at a different HEAD.
+
+        A finding rejected at an older HEAD is reconsidered: if it no longer
+        applies it is marked stale; if it still applies it is reopened for
+        another repair attempt (preserving repair_attempts so
+        max_repair_attempts can eventually convert unfixable findings to blocked).
+        """
+        for finding in self.db.stale_rejected_findings(head):
+            if self._over_budget():
+                break
+            rv = phase_revalidate(audit_cfg, dict(finding), self.ctr)
+            if rv == "stale":
+                LOG.info(
+                    "  Rejected finding no longer applies at %s — stale: %s",
+                    head[:7], finding["title"],
+                )
+                self.db.mark_finding(
+                    finding["id"], "stale",
+                    reason=f"no longer applies at HEAD {head[:7]}",
+                )
+            elif rv == "valid":
+                LOG.info(
+                    "  Rejected finding still valid at %s — reopening: %s",
+                    head[:7], finding["title"],
+                )
+                self.db.reopen_rejected_finding(finding["id"])
+            else:  # error
+                self.ctr["consecutive_failures"] += 1
+
     def run_once(self) -> str:
         """Run one full sweep over all audit areas.
 
@@ -751,7 +781,9 @@ class Supervisor:
             cfg["repo"]["name"],
         )
 
-        if not self.db.open_findings() and not self.db.blocked_findings():
+        if (not self.db.open_findings()
+                and not self.db.blocked_findings()
+                and not self.db.any_rejected_findings()):
             print("No queued findings to repair.")
             return "done"
 
@@ -769,6 +801,11 @@ class Supervisor:
             try:
                 head = current_commit(audit_wt)
                 audit_cfg = {**cfg, "repo": {**cfg["repo"], "path": str(audit_wt)}}
+
+                # Revalidate rejected findings from an earlier HEAD before
+                # loading the queue: any that are still valid are reopened
+                # immediately so they are picked up by open_findings() below.
+                self._revalidate_stale_rejected(head, audit_cfg)
 
                 findings = self.db.open_findings()
                 outcome = self._fix_queue(findings, head)
