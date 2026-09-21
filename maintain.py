@@ -46,7 +46,7 @@ from supervisor.git import (
 from supervisor.phases import _STAGES, phase_audit
 from supervisor.runner import Supervisor, cmd_findings, cmd_status
 
-_MUTATING_CMDS = {"run", "run-continuous", "audit"}
+_MUTATING_CMDS = {"run", "run-continuous", "audit", "repair"}
 
 
 def _parse_remote_owner_repo(remote_url: str) -> tuple[str, str] | None:
@@ -311,6 +311,11 @@ def main() -> None:
         help="Hard limit on iterations (default: 50)",
     )
 
+    sub.add_parser(
+        "repair",
+        help="Repair queued findings without running audits",
+    )
+
     sub.add_parser("status", help="Show queue, PRs, and area exhaustion")
     sub.add_parser("findings", help="List open, deferred, and blocked findings")
 
@@ -338,6 +343,10 @@ def main() -> None:
         if args.cmd == "run":
             result = Supervisor(cfg, db).run_once()
             print(f"\nRun result: {result}")
+
+        elif args.cmd == "repair":
+            result = Supervisor(cfg, db).run_repair()
+            print(f"\nRepair result: {result}")
 
         elif args.cmd == "run-continuous":
             sup = Supervisor(cfg, db)

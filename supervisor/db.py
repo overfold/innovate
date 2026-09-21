@@ -250,6 +250,12 @@ class DB:
             "SELECT * FROM findings WHERE status='blocked' ORDER BY id"
         ).fetchall()
 
+    def any_rejected_findings(self) -> bool:
+        """Return True if any findings have status='rejected'."""
+        return self._conn.execute(
+            "SELECT 1 FROM findings WHERE status='rejected' LIMIT 1"
+        ).fetchone() is not None
+
     def rejected_at_head_findings(self, head: str) -> list[sqlite3.Row]:
         """Return findings rejected at exactly *head* — unresolvable until HEAD changes."""
         return self._conn.execute(
@@ -266,6 +272,32 @@ class DB:
             " ORDER BY id",
             (current_head,),
         ).fetchall()
+
+    def stale_rejected_findings(self, current_head: str) -> list[sqlite3.Row]:
+        """Return rejected findings recorded at a different (or unknown) HEAD."""
+        return self._conn.execute(
+            "SELECT * FROM findings WHERE status='rejected'"
+            " AND (rejected_at_head IS NULL OR rejected_at_head != ?)"
+            " ORDER BY id",
+            (current_head,),
+        ).fetchall()
+
+    def reopen_rejected_finding(self, fid: int) -> None:
+        """Reopen a rejected finding for another repair attempt at a new HEAD.
+
+        Preserves repair_attempts so max_repair_attempts can eventually
+        convert repeatedly-failing findings to blocked.
+        """
+        self._conn.execute(
+            """UPDATE findings
+               SET status='open', resolved=NULL, pr_id=NULL,
+                   reject_reason=NULL, rejected_at_head=NULL,
+                   validation_verdict=NULL, validated_at_head=NULL,
+                   validation_reason=NULL, validation_evidence=NULL
+               WHERE id=? AND status='rejected'""",
+            (fid,),
+        )
+        self._conn.commit()
 
     def deferred_findings(self) -> list[sqlite3.Row]:
         return self._conn.execute(

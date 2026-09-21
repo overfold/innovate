@@ -550,6 +550,76 @@ class Supervisor:
             if wt_path is not None:
                 remove_worktree(repo, branch, wt_path)
 
+    def _fix_queue(self, findings: list, head: str) -> str:
+        """Attempt to fix each finding in priority order.
+
+        Returns:
+          'merged'      — one fix was merged; caller should restart at a fresh HEAD
+          'budget'      — a budget limit was reached
+          'setup_error' — setup_cmd failed in a repair worktree
+          'done'        — all findings processed, no merge occurred
+        """
+        for finding in findings:
+            if self._over_budget():
+                return "budget"
+            try:
+                result = self._fix_finding(finding, head)
+            except WorktreeSetupError:
+                return "setup_error"
+            if result:
+                return "merged"
+        return "done"
+
+    def _revalidate_stale_blocked(self, head: str, audit_cfg: dict) -> None:
+        """Revalidate blocked findings recorded at a different HEAD."""
+        for finding in self.db.stale_blocked_findings(head):
+            if self._over_budget():
+                break
+            rv = phase_revalidate(audit_cfg, dict(finding), self.ctr)
+            if rv == "stale":
+                LOG.info(
+                    "  Blocked finding no longer applies at %s — stale: %s",
+                    head[:7], finding["title"],
+                )
+                self.db.mark_finding(
+                    finding["id"], "stale",
+                    reason=f"no longer applies at HEAD {head[:7]}",
+                )
+            elif rv == "valid":
+                self.db.refresh_blocked_head(finding["id"], head)
+            else:  # error
+                self.ctr["consecutive_failures"] += 1
+
+    def _revalidate_stale_rejected(self, head: str, audit_cfg: dict) -> None:
+        """Revalidate rejected findings recorded at a different HEAD.
+
+        A finding rejected at an older HEAD is reconsidered: if it no longer
+        applies it is marked stale; if it still applies it is reopened for
+        another repair attempt (preserving repair_attempts so
+        max_repair_attempts can eventually convert unfixable findings to blocked).
+        """
+        for finding in self.db.stale_rejected_findings(head):
+            if self._over_budget():
+                break
+            rv = phase_revalidate(audit_cfg, dict(finding), self.ctr)
+            if rv == "stale":
+                LOG.info(
+                    "  Rejected finding no longer applies at %s — stale: %s",
+                    head[:7], finding["title"],
+                )
+                self.db.mark_finding(
+                    finding["id"], "stale",
+                    reason=f"no longer applies at HEAD {head[:7]}",
+                )
+            elif rv == "valid":
+                LOG.info(
+                    "  Rejected finding still valid at %s — reopening: %s",
+                    head[:7], finding["title"],
+                )
+                self.db.reopen_rejected_finding(finding["id"])
+            else:  # error
+                self.ctr["consecutive_failures"] += 1
+
     def run_once(self) -> str:
         """Run one full sweep over all audit areas.
 
@@ -628,41 +698,20 @@ class Supervisor:
                     if self._over_budget():
                         return "budget"
 
-                    for finding in self.db.open_findings(area["name"]):
-                        if self._over_budget():
-                            return "budget"
-                        try:
-                            result = self._fix_finding(finding, head)
-                        except WorktreeSetupError:
-                            return "setup_error"
-                        if result:
-                            merged_this_pass = True
-                            break
-
-                    if merged_this_pass:
+                    outcome = self._fix_queue(
+                        self.db.open_findings(area["name"]), head
+                    )
+                    if outcome in ("budget", "setup_error"):
+                        return outcome
+                    if outcome == "merged":
+                        merged_this_pass = True
                         break
 
                 # Revalidate blocked findings from an earlier HEAD.
                 # Skip when a merge happened this pass — the sweep will restart
                 # at a fresh HEAD and revalidate on that pass instead.
                 if not merged_this_pass:
-                    for finding in self.db.stale_blocked_findings(head):
-                        if self._over_budget():
-                            break
-                        rv = phase_revalidate(audit_cfg, dict(finding), self.ctr)
-                        if rv == "stale":
-                            LOG.info(
-                                "  Blocked finding no longer applies at %s — stale: %s",
-                                head[:7], finding["title"],
-                            )
-                            self.db.mark_finding(
-                                finding["id"], "stale",
-                                reason=f"no longer applies at HEAD {head[:7]}",
-                            )
-                        elif rv == "valid":
-                            self.db.refresh_blocked_head(finding["id"], head)
-                        else:  # error
-                            self.ctr["consecutive_failures"] += 1
+                    self._revalidate_stale_blocked(head, audit_cfg)
 
             finally:
                 remove_audit_worktree(repo, audit_wt)
@@ -692,6 +741,92 @@ class Supervisor:
                 last_head[:7],
             )
             return "exhausted"
+
+        return "done"
+
+    def run_repair(self) -> str:
+        """Process existing queued findings without running audits.
+
+        Fetches origin/<default_branch> HEAD, loads actionable findings from
+        the DB in priority order, and drives each through the full repair
+        lifecycle (revalidate → validate → repair → verify → PR → review →
+        CI → merge).
+
+        After a successful merge the HEAD is refreshed and remaining findings
+        are revalidated against the new code.  Stale blocked findings are
+        revalidated on each pass.
+
+        Audit areas are never invoked, clean-audit streaks are not advanced,
+        and the repository is never declared exhausted or blocked — this
+        command processes what is already known.
+
+        Returns one of:
+          'done'        — all queued findings processed (some may still be open)
+          'budget'      — stopped early because a budget limit was reached
+          'setup_error' — setup_cmd failed; finding requeued without penalty
+        """
+        self.ctr["codex_calls"] = 0
+        self.ctr["fixes_applied"] = 0
+        self.ctr["consecutive_failures"] = 0
+
+        self.startup_reconcile()
+
+        cfg = self.cfg
+        repo = Path(cfg["repo"]["path"]).resolve()
+        main = cfg["repo"]["default_branch"]
+
+        LOG.info(
+            "Starting repair run on %s/%s",
+            cfg["repo"]["owner"],
+            cfg["repo"]["name"],
+        )
+
+        if (not self.db.open_findings()
+                and not self.db.blocked_findings()
+                and not self.db.any_rejected_findings()):
+            print("No queued findings to repair.")
+            return "done"
+
+        while True:
+            try:
+                audit_wt = create_audit_worktree(repo, main)
+            except subprocess.CalledProcessError as exc:
+                LOG.error(
+                    "Cannot fetch origin/%s — aborting run: %s",
+                    main, exc.stderr.strip() if exc.stderr else exc,
+                )
+                return "budget"
+
+            merged_this_pass = False
+            try:
+                head = current_commit(audit_wt)
+                audit_cfg = {**cfg, "repo": {**cfg["repo"], "path": str(audit_wt)}}
+
+                # Revalidate rejected findings from an earlier HEAD before
+                # loading the queue: any that are still valid are reopened
+                # immediately so they are picked up by open_findings() below.
+                self._revalidate_stale_rejected(head, audit_cfg)
+
+                findings = self.db.open_findings()
+                outcome = self._fix_queue(findings, head)
+                if outcome in ("budget", "setup_error"):
+                    return outcome
+                merged_this_pass = (outcome == "merged")
+
+                if not merged_this_pass:
+                    self._revalidate_stale_blocked(head, audit_cfg)
+
+            finally:
+                remove_audit_worktree(repo, audit_wt)
+
+            if not merged_this_pass:
+                break
+
+            LOG.info(
+                "Merge occurred — refreshing HEAD from origin/%s and"
+                " reconsidering remaining findings",
+                main,
+            )
 
         return "done"
 
