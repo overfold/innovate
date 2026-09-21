@@ -184,10 +184,14 @@ Codex runs.
 `setup_cmd` is completely generic — use whatever command your project requires:
 
 ```toml
-[verify]
-setup_cmd = "npm ci"           # Node.js
-setup_cmd = "pip install -e .[dev]"   # Python
-setup_cmd = "./scripts/bootstrap.sh"  # custom script
+# Node.js
+setup_cmd = "npm ci"
+
+# Python
+setup_cmd = "pip install -e .[dev]"
+
+# Custom bootstrap script
+setup_cmd = "./scripts/bootstrap.sh"
 ```
 
 **Recommended pattern — [Mise](https://mise.jdx.dev)**
@@ -209,13 +213,19 @@ command works equally well.
 
 **Failure semantics**
 
-A non-zero exit from `setup_cmd` is treated as an infrastructure failure, not
-a finding defect:
+A non-zero exit from `setup_cmd`, or a setup command that leaves the worktree
+dirty (modified tracked files or new untracked non-ignored files), is treated
+as an infrastructure failure, not a finding defect:
 
-* The maintenance run is **aborted** rather than continuing with other findings.
+* `run_once` returns `"setup_error"` and **`run-continuous` stops**.
 * The finding is **requeued** as open.
 * Its **repair-attempt count is not incremented**.
 * The failure command and output are **logged** at ERROR level.
+
+The worktree cleanliness check exists because `phase_repair` commits with
+`git add -A`. Any files setup creates that are not covered by `.gitignore`
+would contaminate the patch. Add build artifacts, caches, and installed
+packages to `.gitignore` as you would for any other commit.
 
 ### `[budget]`
 

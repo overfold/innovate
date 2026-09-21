@@ -871,6 +871,42 @@ class TestRunSetup:
             run_setup(cfg, tmp_path)
         assert any("Setup command failed" in r.message for r in caplog.records)
 
+    def test_dirty_worktree_after_setup_returns_false(self, tmp_path):
+        """setup_cmd that leaves non-ignored files returns False (patch contamination)."""
+        import subprocess
+        from supervisor.phases import run_setup
+        # Initialise a real git repo so git status works
+        subprocess.run(["git", "init"], cwd=str(tmp_path), check=True,
+                       capture_output=True)
+        subprocess.run(["git", "config", "user.email", "t@t.com"], cwd=str(tmp_path),
+                       check=True, capture_output=True)
+        subprocess.run(["git", "config", "user.name", "T"], cwd=str(tmp_path),
+                       check=True, capture_output=True)
+        cfg = _cfg()
+        cfg["verify"]["setup_cmd"] = "echo dirty > new_file.txt"
+        result = run_setup(cfg, tmp_path)
+        assert result is False
+
+    def test_gitignored_files_after_setup_are_allowed(self, tmp_path):
+        """setup_cmd that only creates gitignored files is fine (no patch contamination)."""
+        import subprocess
+        from supervisor.phases import run_setup
+        subprocess.run(["git", "init"], cwd=str(tmp_path), check=True,
+                       capture_output=True)
+        subprocess.run(["git", "config", "user.email", "t@t.com"], cwd=str(tmp_path),
+                       check=True, capture_output=True)
+        subprocess.run(["git", "config", "user.name", "T"], cwd=str(tmp_path),
+                       check=True, capture_output=True)
+        (tmp_path / ".gitignore").write_text("node_modules/\n")
+        subprocess.run(["git", "add", ".gitignore"], cwd=str(tmp_path), check=True,
+                       capture_output=True)
+        subprocess.run(["git", "commit", "-m", "init"], cwd=str(tmp_path), check=True,
+                       capture_output=True)
+        cfg = _cfg()
+        cfg["verify"]["setup_cmd"] = "mkdir -p node_modules && echo ok > node_modules/pkg.js"
+        result = run_setup(cfg, tmp_path)
+        assert result is True
+
 
 class TestPhaseReviewLoop:
     """Review loop outcome constants."""
@@ -1375,8 +1411,8 @@ class TestRunOnceReturnValues:
         # Finding is fixed
         assert db.get_finding(f["id"])["status"] == "fixed"
 
-    def test_setup_failure_aborts_run_with_budget(self, tmp_path):
-        """run_setup returning False causes run_once to return 'budget'."""
+    def test_setup_failure_aborts_run_with_setup_error(self, tmp_path):
+        """run_setup returning False causes run_once to return 'setup_error'."""
         db = _db()
         f = _open_finding(db)
         wt = tmp_path / "wt"
@@ -1396,7 +1432,7 @@ class TestRunOnceReturnValues:
 
             result = sup.run_once()
 
-        assert result == "budget"
+        assert result == "setup_error"
         # Audit worktree still cleaned up despite the abort
         rm_awt.assert_called_once()
 

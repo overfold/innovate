@@ -84,7 +84,10 @@ def run_setup(cfg: dict, wt_path: Path) -> bool:
     """Run the configured setup command inside the worktree.
 
     Returns True immediately when setup_cmd is empty.
-    Returns True on zero exit, False on non-zero exit (logs command output).
+    Returns False if the command exits non-zero or if it leaves the worktree
+    dirty (modified tracked files or new untracked non-ignored files). A dirty
+    worktree would contaminate the repair patch, since phase_repair commits
+    with 'git add -A'.  Gitignored paths are fine and are not checked.
     """
     setup_cmd = cfg["verify"].get("setup_cmd", "")
     if not setup_cmd:
@@ -99,7 +102,23 @@ def run_setup(cfg: dict, wt_path: Path) -> bool:
             r.returncode,
             (r.stdout + r.stderr)[-2000:],
         )
-    return r.returncode == 0
+        return False
+    # Guard against setup polluting the repair patch: git add -A will stage any
+    # modified tracked file or new untracked non-ignored file, so the worktree
+    # must be clean (gitignored paths are exempt and do not appear here).
+    status_r = subprocess.run(
+        ["git", "status", "--porcelain"],
+        cwd=str(wt_path), capture_output=True, text=True, check=False,
+    )
+    if status_r.stdout.strip():
+        LOG.error(
+            "  Setup command left the worktree dirty —"
+            " aborting to prevent patch contamination"
+            " (add these paths to .gitignore if they are build artifacts):\n%s",
+            status_r.stdout[:1000],
+        )
+        return False
+    return True
 
 
 def verify_diff(cfg: dict, findings: list, ctr: dict) -> bool:

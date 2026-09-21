@@ -558,10 +558,11 @@ class Supervisor:
         and revalidations see the merged code.
 
         Returns one of:
-          'exhausted' — all areas clean, no blocked findings
-          'blocked'   — all areas clean, but unresolved blocked findings remain
-          'budget'    — stopped early because a budget limit was reached
-          'done'      — progress made (fixes applied or new findings) but not exhausted
+          'exhausted'   — all areas clean, no blocked findings
+          'blocked'     — all areas clean, but unresolved blocked findings remain
+          'budget'      — stopped early because a budget limit was reached
+          'setup_error' — setup_cmd failed; run aborted, finding requeued without penalty
+          'done'        — progress made (fixes applied or new findings) but not exhausted
         """
         # Reset per-run counters so run-continuous can't permanently wedge.
         self.ctr["codex_calls"] = 0
@@ -633,7 +634,7 @@ class Supervisor:
                         try:
                             result = self._fix_finding(finding, head)
                         except WorktreeSetupError:
-                            return "budget"
+                            return "setup_error"
                         if result:
                             merged_this_pass = True
                             break

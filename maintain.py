@@ -259,6 +259,12 @@ def main() -> None:
                         " human review required.  Stopping."
                     )
                     break
+                if result == "setup_error":
+                    logging.getLogger("supervisor").error(
+                        "Setup command failed — fix verify.setup_cmd before"
+                        " running again.  Stopping."
+                    )
+                    break
                 time.sleep(5)
 
         elif args.cmd == "status":
