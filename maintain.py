@@ -75,7 +75,7 @@ def _managed_workspace_root(cfg: dict) -> Path:
     ws = cfg["repo"].get("workspace", "").strip()
     if ws:
         return Path(ws).expanduser().resolve()
-    return Path.home() / ".maintain" / "workspaces"
+    return (Path.home() / ".maintain" / "workspaces").resolve()
 
 
 def _resolve_repo_path(cfg: dict) -> None:
@@ -99,7 +99,7 @@ def _resolve_repo_path(cfg: dict) -> None:
     name = cfg["repo"].get("name", "").strip()
     if not owner or not name:
         return
-    cfg["repo"]["path"] = str(_managed_workspace_root(cfg) / owner / name)
+    cfg["repo"]["path"] = str((_managed_workspace_root(cfg) / owner / name).resolve())
 
 
 def _validate_config(cfg: dict, config_path: str) -> None:
@@ -197,6 +197,16 @@ def _validate_config(cfg: dict, config_path: str) -> None:
 
     repo_path = Path(repo_path_str).resolve()
 
+    if is_managed:
+        workspace_root = _managed_workspace_root(cfg)
+        if not repo_path.is_relative_to(workspace_root):
+            sys.exit(
+                "Configuration errors — aborting before making any changes:\n"
+                f"  • Resolved managed path {repo_path} escapes the workspace"
+                f" root {workspace_root} — check repo.owner, repo.name, and"
+                f" repo.workspace for path-traversal components"
+            )
+
     if not repo_path.exists():
         if is_managed:
             clone_url = f"https://github.com/{owner}/{name}"
@@ -206,8 +216,7 @@ def _validate_config(cfg: dict, config_path: str) -> None:
                 clone_repo(clone_url, repo_path)
             except RuntimeError as exc:
                 sys.exit(
-                    "Configuration errors — aborting before making any changes:\n"
-                    f"  • Failed to clone {clone_url} into {repo_path}: {exc}"
+                    f"Failed to clone {clone_url} into {repo_path}: {exc}"
                 )
         else:
             sys.exit(
@@ -223,11 +232,11 @@ def _validate_config(cfg: dict, config_path: str) -> None:
     )
     if r.returncode != 0:
         sys.exit(
-            "Configuration errors — aborting before making any changes:\n"
-            + (
-                f"  • Managed workspace at {repo_path} is not a git repository;"
+            (
+                f"Managed workspace at {repo_path} is not a git repository;"
                 f" remove it to allow Maintain to reclone"
                 if is_managed else
+                "Configuration errors — aborting before making any changes:\n"
                 f"  • repo.path is not a Git repository: {repo_path}"
             )
         )

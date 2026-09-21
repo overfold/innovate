@@ -2967,3 +2967,48 @@ class TestManagedClone:
         cfg["repo"]["workspace"] = str(tmp_path / "custom")
         root = _managed_workspace_root(cfg)
         assert root == (tmp_path / "custom").resolve()
+
+    def test_validate_managed_path_traversal_rejected(self, tmp_path):
+        """owner/name containing .. must not escape the workspace root."""
+        from maintain import _validate_config, _resolve_repo_path
+        ws = tmp_path / "ws"
+        ws.mkdir()
+        cfg = self._cfg_no_path(workspace=str(ws))
+        cfg["repo"]["owner"] = "../evil"
+        cfg["repo"]["name"] = "repo"
+        _resolve_repo_path(cfg)
+        cfg_file = self._make_cfg_file(tmp_path)
+
+        with patch("maintain.shutil.which", return_value="/usr/bin/git"), \
+             patch("maintain.clone_repo") as mock_clone, \
+             pytest.raises(SystemExit) as exc_info:
+            _validate_config(cfg, cfg_file)
+
+        mock_clone.assert_not_called()
+        assert "escapes" in str(exc_info.value).lower() or "traversal" in str(exc_info.value).lower() or "workspace" in str(exc_info.value).lower()
+
+    def test_validate_managed_symlink_escape_rejected(self, tmp_path):
+        """A symlink under the workspace that resolves outside it must be rejected."""
+        import os
+        from maintain import _validate_config, _resolve_repo_path
+        ws = tmp_path / "ws"
+        ws.mkdir()
+        outside = tmp_path / "outside"
+        outside.mkdir()
+        # Create a symlink inside ws that points outside
+        link = ws / "escape"
+        link.symlink_to(outside)
+
+        cfg = self._cfg_no_path(workspace=str(ws))
+        cfg["repo"]["owner"] = "escape"
+        cfg["repo"]["name"] = "repo"
+        _resolve_repo_path(cfg)
+        cfg_file = self._make_cfg_file(tmp_path)
+
+        with patch("maintain.shutil.which", return_value="/usr/bin/git"), \
+             patch("maintain.clone_repo") as mock_clone, \
+             pytest.raises(SystemExit) as exc_info:
+            _validate_config(cfg, cfg_file)
+
+        mock_clone.assert_not_called()
+        assert "escapes" in str(exc_info.value).lower() or "workspace" in str(exc_info.value).lower()
