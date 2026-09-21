@@ -43,6 +43,16 @@ audit_flags = ["exec"]
 # feedback).  workspace-write sandbox allows Codex to modify files in the repo.
 repair_flags = ["exec", "--sandbox", "workspace-write"]
 
+# Per-stage model overrides.  Each key falls back to `model` when absent or
+# empty, so existing configs that only set `model` continue to work unchanged.
+#
+# audit_model      = "o4-mini"  # scoped code audit (finding discovery)
+# revalidate_model = "o4-mini"  # stale-check before repair
+# validate_model   = "o4-mini"  # confirm a finding before attempting repair
+# repair_model     = "o4-mini"  # apply the code fix
+# verify_model     = "o4-mini"  # diff-review after repair
+# review_model     = "o4-mini"  # PR review + implement blocking feedback
+
 
 [verify]
 # Optional shell command run inside the repo before opening a PR.

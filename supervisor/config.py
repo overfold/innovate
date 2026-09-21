@@ -20,6 +20,13 @@ DEFAULT_CONFIG: dict[str, Any] = {
         "timeout": 300,
         "audit_flags": ["exec"],
         "repair_flags": ["exec", "--sandbox", "workspace-write"],
+        # Per-stage model overrides; None means fall back to `model`.
+        "audit_model": None,
+        "revalidate_model": None,
+        "validate_model": None,
+        "repair_model": None,
+        "verify_model": None,
+        "review_model": None,
     },
     "verify": {
         "test_cmd": "",

@@ -36,7 +36,7 @@ from pathlib import Path
 
 from supervisor.config import load_config
 from supervisor.db import DB
-from supervisor.phases import phase_audit
+from supervisor.phases import _STAGES, phase_audit
 from supervisor.runner import Supervisor, cmd_findings, cmd_status
 
 _MUTATING_CMDS = {"run", "run-continuous", "audit"}
@@ -145,6 +145,19 @@ def _validate_config(cfg: dict, config_path: str) -> None:
         if not isinstance(val, int) or val <= 0:
             errors.append(
                 f"budget.{key} must be a positive integer (got {val!r})"
+            )
+
+    codex_model = cfg["codex"].get("model")
+    if not isinstance(codex_model, str) or not codex_model.strip():
+        errors.append(
+            f"codex.model must be a non-empty string (got {codex_model!r})"
+        )
+
+    for stage in _STAGES:
+        val = cfg["codex"].get(f"{stage}_model")
+        if val is not None and not isinstance(val, str):
+            errors.append(
+                f"codex.{stage}_model must be a string or unset (got {val!r})"
             )
 
     for binary, hint in [
