@@ -3012,3 +3012,172 @@ class TestManagedClone:
 
         mock_clone.assert_not_called()
         assert "escapes" in str(exc_info.value).lower() or "workspace" in str(exc_info.value).lower()
+
+
+# ── repair command ─────────────────────────────────────────────────────────────
+
+class TestRepairCommand:
+    """run_repair: processes queued findings without auditing."""
+
+    def test_repair_processes_findings_without_audit(self, tmp_path):
+        """repair drives existing findings through the full fix lifecycle
+        and never calls phase_audit."""
+        db = _db()
+        f = _open_finding(db)
+        wt = tmp_path / "wt"
+        wt.mkdir()
+
+        sup = Supervisor(_cfg(), db)
+        sup.startup_reconcile = lambda: None
+
+        with patch(f"{RUNNER_MODULE}.create_audit_worktree",
+                   side_effect=lambda repo, main: wt), \
+             patch(f"{RUNNER_MODULE}.remove_audit_worktree"), \
+             patch(f"{RUNNER_MODULE}.current_commit", return_value="abc1234"), \
+             patch(f"{RUNNER_MODULE}.phase_audit") as mock_audit, \
+             patch(f"{RUNNER_MODULE}.create_worktree", return_value=wt), \
+             patch(f"{RUNNER_MODULE}.remove_worktree"), \
+             patch(f"{RUNNER_MODULE}.phase_validate", return_value="valid"), \
+             patch(f"{RUNNER_MODULE}.phase_repair", return_value=True), \
+             patch(f"{RUNNER_MODULE}.phase_verify", return_value=True), \
+             patch(f"{RUNNER_MODULE}.push_branch"), \
+             patch(f"{RUNNER_MODULE}.gh_create_pr", return_value=(1, "u")), \
+             patch(f"{RUNNER_MODULE}.phase_review_loop",
+                   return_value=REVIEW_APPROVED), \
+             patch(f"{RUNNER_MODULE}.wait_for_ci", return_value="no_checks"), \
+             patch(f"{RUNNER_MODULE}.gh_pr_base_sha", return_value="abc1234"), \
+             patch(f"{RUNNER_MODULE}.gh_merge_pr"):
+            result = sup.run_repair()
+
+        assert result == "done"
+        mock_audit.assert_not_called()
+        assert db.get_finding(f["id"])["status"] == "fixed"
+
+    def test_repair_revalidates_stale_findings(self, tmp_path):
+        """repair triggers revalidation when a finding's commit_hash differs from HEAD."""
+        db = _db()
+        f = _open_finding(db)
+        db._conn.execute(
+            "UPDATE findings SET commit_hash='oldhead' WHERE id=?", (f["id"],)
+        )
+        db._conn.commit()
+        wt = tmp_path / "wt"
+        wt.mkdir()
+
+        sup = Supervisor(_cfg(), db)
+        sup.startup_reconcile = lambda: None
+
+        with patch(f"{RUNNER_MODULE}.create_audit_worktree",
+                   side_effect=lambda repo, main: wt), \
+             patch(f"{RUNNER_MODULE}.remove_audit_worktree"), \
+             patch(f"{RUNNER_MODULE}.current_commit", return_value="newhead"), \
+             patch(f"{RUNNER_MODULE}.create_worktree", return_value=wt), \
+             patch(f"{RUNNER_MODULE}.remove_worktree"), \
+             patch(f"{RUNNER_MODULE}.phase_revalidate",
+                   return_value="stale") as mock_reval:
+            result = sup.run_repair()
+
+        assert result == "done"
+        mock_reval.assert_called_once()
+        assert db.get_finding(f["id"])["status"] == "stale"
+
+    def test_repair_restarts_after_merge(self, tmp_path):
+        """A successful merge causes run_repair to re-fetch HEAD and process
+        remaining findings against the new code."""
+        db = _db()
+        f1 = _open_finding(db, "first bug")
+        f2 = _open_finding(db, "second bug")
+        wt = tmp_path / "wt"
+        wt.mkdir()
+
+        sup = Supervisor(_cfg(), db)
+        sup.startup_reconcile = lambda: None
+
+        create_wt_calls = {"n": 0}
+
+        def make_audit_wt(repo, main):
+            create_wt_calls["n"] += 1
+            return wt
+
+        # First call to phase_repair succeeds (merges f1); second fails (f2 stays open).
+        repair_calls = {"n": 0}
+
+        def fake_repair(cfg, db_, findings, ctr):
+            repair_calls["n"] += 1
+            return repair_calls["n"] == 1
+
+        with patch(f"{RUNNER_MODULE}.create_audit_worktree",
+                   side_effect=make_audit_wt), \
+             patch(f"{RUNNER_MODULE}.remove_audit_worktree"), \
+             patch(f"{RUNNER_MODULE}.current_commit", return_value="abc1234"), \
+             patch(f"{RUNNER_MODULE}.create_worktree", return_value=wt), \
+             patch(f"{RUNNER_MODULE}.remove_worktree"), \
+             patch(f"{RUNNER_MODULE}.phase_validate", return_value="valid"), \
+             patch(f"{RUNNER_MODULE}.phase_repair", side_effect=fake_repair), \
+             patch(f"{RUNNER_MODULE}.phase_verify", return_value=True), \
+             patch(f"{RUNNER_MODULE}.push_branch"), \
+             patch(f"{RUNNER_MODULE}.gh_create_pr", return_value=(1, "u")), \
+             patch(f"{RUNNER_MODULE}.phase_review_loop",
+                   return_value=REVIEW_APPROVED), \
+             patch(f"{RUNNER_MODULE}.wait_for_ci", return_value="no_checks"), \
+             patch(f"{RUNNER_MODULE}.gh_pr_base_sha", return_value="abc1234"), \
+             patch(f"{RUNNER_MODULE}.gh_merge_pr"):
+            result = sup.run_repair()
+
+        assert result == "done"
+        # Two audit worktrees: one for the merge pass, one for the follow-up pass.
+        assert create_wt_calls["n"] == 2
+        assert db.get_finding(f1["id"])["status"] == "fixed"
+
+    def test_repair_empty_queue_exits_cleanly(self, capsys):
+        """repair exits immediately with a clear message when there are no
+        queued findings, without touching the network or creating worktrees."""
+        db = _db()
+        sup = Supervisor(_cfg(), db)
+        sup.startup_reconcile = lambda: None
+
+        with patch(f"{RUNNER_MODULE}.create_audit_worktree") as mock_wt:
+            result = sup.run_repair()
+
+        assert result == "done"
+        mock_wt.assert_not_called()
+        assert "No queued findings" in capsys.readouterr().out
+
+    def test_repair_never_advances_audit_streak_or_declares_exhausted(
+        self, tmp_path
+    ):
+        """repair never calls phase_audit, adds no audit_run records, and
+        never returns 'exhausted' or 'blocked'."""
+        db = _db()
+        f = _open_finding(db)
+        wt = tmp_path / "wt"
+        wt.mkdir()
+
+        sup = Supervisor(_cfg(), db)
+        sup.startup_reconcile = lambda: None
+
+        with patch(f"{RUNNER_MODULE}.create_audit_worktree",
+                   side_effect=lambda repo, main: wt), \
+             patch(f"{RUNNER_MODULE}.remove_audit_worktree"), \
+             patch(f"{RUNNER_MODULE}.current_commit", return_value="abc1234"), \
+             patch(f"{RUNNER_MODULE}.phase_audit") as mock_audit, \
+             patch(f"{RUNNER_MODULE}.create_worktree", return_value=wt), \
+             patch(f"{RUNNER_MODULE}.remove_worktree"), \
+             patch(f"{RUNNER_MODULE}.phase_validate", return_value="valid"), \
+             patch(f"{RUNNER_MODULE}.phase_repair", return_value=True), \
+             patch(f"{RUNNER_MODULE}.phase_verify", return_value=True), \
+             patch(f"{RUNNER_MODULE}.push_branch"), \
+             patch(f"{RUNNER_MODULE}.gh_create_pr", return_value=(1, "u")), \
+             patch(f"{RUNNER_MODULE}.phase_review_loop",
+                   return_value=REVIEW_APPROVED), \
+             patch(f"{RUNNER_MODULE}.wait_for_ci", return_value="no_checks"), \
+             patch(f"{RUNNER_MODULE}.gh_pr_base_sha", return_value="abc1234"), \
+             patch(f"{RUNNER_MODULE}.gh_merge_pr"):
+            result = sup.run_repair()
+
+        assert result not in ("exhausted", "blocked")
+        mock_audit.assert_not_called()
+        audit_run_count = db._conn.execute(
+            "SELECT COUNT(*) AS n FROM audit_runs"
+        ).fetchone()["n"]
+        assert audit_run_count == 0

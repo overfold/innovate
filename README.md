@@ -89,6 +89,7 @@ repository, or if its remote does not match `repo.owner`/`repo.name`.
 ```
 python maintain.py run                 # one full pass over all audit areas
 python maintain.py run-continuous      # loop until exhausted or budget exceeded
+python maintain.py repair              # repair queued findings without auditing
 python maintain.py status              # show queue, recent PRs, area exhaustion
 python maintain.py findings            # list open/paused findings (prioritised)
 python maintain.py audit <area>        # manually trigger one area's audit
@@ -102,6 +103,29 @@ Global flags accepted before the command:
 --db PATH          SQLite database (default: .maintain.db)
 --log-level LEVEL  DEBUG | INFO | WARNING | ERROR  (default: INFO)
 ```
+
+### `repair` vs `run`
+
+`repair` processes findings already in the queue **without running any audit**.
+It is useful when:
+
+* You have accumulated findings from previous `audit` or `run` calls and want
+  to drain the queue without paying for another full audit pass.
+* A previous run was interrupted mid-queue and you want to resume processing
+  without re-auditing.
+* You want to fix known issues before discovering new ones.
+
+`repair` respects all the same budgets, worktree isolation, failure handling,
+crash recovery, and GitHub fail-closed behaviour as `run`.  After each
+successful merge it re-fetches `origin/<default_branch>` and revalidates
+remaining findings against the new code.  Stale blocked findings are
+revalidated on every pass.
+
+Because `repair` never audits, it does **not** advance clean-audit streaks
+and will never return `exhausted` or `blocked`.  Use `run` (or
+`run-continuous`) when you also want to discover new findings and track area
+exhaustion.  If the queue is empty when `repair` starts it exits immediately
+with the message `No queued findings to repair.`
 
 ---
 
