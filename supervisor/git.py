@@ -88,6 +88,19 @@ def remove_worktree(repo: Path, branch: str, wt_path: Path) -> None:
     _git(repo, "branch", "-D", branch, check=False)
 
 
+def create_branch_worktree(repo: Path, branch: str) -> Path:
+    """Check out an existing remote branch into a fresh temporary worktree."""
+    _git(repo, "fetch", "origin", branch, check=False)
+    wt_dir = Path(tempfile.mkdtemp(prefix="maintain-wt-"))
+    _git(repo, "worktree", "add", str(wt_dir), branch)
+    return wt_dir
+
+
+def remove_branch_worktree(repo: Path, wt_path: Path) -> None:
+    """Remove a branch worktree without deleting the underlying branch."""
+    _git(repo, "worktree", "remove", "--force", str(wt_path), check=False)
+
+
 def push_branch(repo: Path, branch: str) -> None:
     """Push with up to 5 attempts and exponential back-off."""
     for attempt, delay in enumerate([0, 2, 4, 8, 16], start=1):
@@ -288,8 +301,10 @@ def gh_ci_status(owner: str, repo_name: str, pr_number: int) -> str:
     if not checks:
         return "no_checks"
     buckets = {c.get("bucket") for c in checks}
-    if "fail" in buckets or "cancel" in buckets:
+    if "fail" in buckets:
         return "failure"
+    if "cancel" in buckets:
+        return "api_error"
     if "pending" in buckets:
         return "pending"
     if buckets <= {"pass", "skipping"}:
@@ -382,7 +397,10 @@ def gh_get_failed_ci_logs(owner: str, repo_name: str, pr_number: int) -> str | N
         parts.append(chunk)
         used += len(chunk)
 
-    return "\n".join(parts) if parts else ""
+    if parts:
+        return "\n".join(parts)
+    # runs were listed but every log-fetch call failed — infrastructure error
+    return None
 
 
 def wait_for_ci(

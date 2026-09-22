@@ -39,7 +39,6 @@ Maintain fails closed if the managed path exists but is not a valid git reposito
 | `revalidate_model` | Model for the stale-check stage. Falls back to `model`. |
 | `validate_model` | Model for the finding-validation stage. Falls back to `model`. |
 | `repair_model` | Model for the repair stage. Falls back to `model`. |
-| `verify_model` | Model for the diff-review stage (run after repair, before opening a PR). Falls back to `model`. |
 | `review_model` | Model for the PR-review stage, including implementing blocking feedback. Falls back to `model`. |
 
 `--model` is inserted automatically after the first element of `audit_flags` / `repair_flags` when that element is the `exec` subcommand. Configs that only set `model` continue to work unchanged.
@@ -50,45 +49,8 @@ Maintain fails closed if the managed path exists but is not a valid git reposito
 
 | Key | Description |
 |-----|-------------|
-| `setup_cmd` | Shell command run inside each newly created repair worktree before Codex attempts a fix. Leave empty to skip. A non-zero exit aborts the run; see [Worktree setup](#worktree-setup). |
-| `test_cmd` | Shell command run inside the worktree before opening a PR. Non-zero exit discards the fix and requeues the finding. Leave empty to skip. |
-| `ci_wait_timeout` | Seconds to wait for GitHub CI after the PR is pushed. `0` skips the CI wait (implies `allow_no_ci`). |
+| `ci_wait_timeout` | Seconds to wait for GitHub CI after the PR is pushed. `0` skips the CI wait and checks the current status once. |
 | `allow_no_ci` | Set to `true` only for repos that genuinely have no CI. When `false` (the default), the supervisor blocks merges when no CI checks are found, when the GitHub API returns an error, or when the wait times out. |
-
-### Worktree setup
-
-When maintain creates a repair worktree it contains a bare checkout of the repository. If your project needs compiled dependencies, generated files, or a specific set of CLI tools, set `verify.setup_cmd` to install them before Codex runs.
-
-```toml
-# Node.js
-setup_cmd = "npm ci"
-
-# Python
-setup_cmd = "pip install -e .[dev]"
-
-# Custom bootstrap script
-setup_cmd = "./scripts/bootstrap.sh"
-```
-
-**Recommended: [Mise](https://mise.jdx.dev)**
-
-With a `mise.toml` checked into your repository, a single `mise install` restores the exact tool versions each worktree needs:
-
-```toml
-[verify]
-setup_cmd = "mise install"
-test_cmd  = "mise run verify"
-```
-
-**Failure semantics**
-
-A non-zero exit from `setup_cmd`, or a setup command that leaves the worktree dirty, is treated as an infrastructure failure:
-
-- `run_once` returns `"setup_error"` and `run-continuous` stops.
-- The finding is requeued as open.
-- Its repair-attempt count is not incremented.
-
-Add build artifacts, caches, and installed packages to `.gitignore` — `phase_repair` commits with `git add -A` and any unignored files setup creates would contaminate the patch.
 
 ---
 

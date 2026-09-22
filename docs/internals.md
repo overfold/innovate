@@ -29,19 +29,16 @@
 └──────┬──────┘  in an isolated worktree (main checkout is never modified).
        │
 ┌──────▼──────┐
-│    Verify   │  Optional test suite + fresh Codex diff-review.
-└──────┬──────┘  Reject → discard branch, re-queue finding.
-       │
-┌──────▼──────┐
-│  PR + review│  Push branch, open PR, fresh Codex reviews the diff.
-│    loop     │  Blocking comments → implement, commit, run tests, diff-verify,
-└──────┬──────┘  then review again.  Up to max_review_rounds times.
+│  PR + review│  Push branch, open PR. Unified review+CI loop (per round):
+│    loop     │  1. Codex reviews the diff.
+└──────┬──────┘  2. Blocking feedback → implement, commit, push, then review again.
+       │         3. Approve → poll GitHub CI.
+       │             CI pass  → merge immediately.
+       │             CI fail  → collect logs → reviewer sees evidence next round.
+       │                        Reviewer clears failure as unrelated → ci_paused.
+       │             CI uncertain/timeout → ci_paused (retried next run).
        │         Budget exhausted → defer to next run (close PR, requeue).
        │         Rounds exhausted → close PR, mark finding "blocked".
-┌──────▼──────┐
-│   CI gate   │  Wait for GitHub CI (configurable timeout).
-└──────┬──────┘  Only an explicit success permits merge.
-       │         Failure/timeout/no-CI → mark PR failed, re-queue finding.
 ┌──────▼──────┐
 │    Merge    │  gh pr merge --squash --delete-branch
 └──────┬──────┘
@@ -87,11 +84,11 @@ Findings are deduplicated by a SHA-256 fingerprint of `area + file_path + title`
 
 | Status | Meaning |
 |--------|---------|
-| `open` | PR is open and being reviewed |
+| `open` | PR is open and being actively reviewed |
+| `ci_paused` | Reviewer approved but CI was still red; retried by `_resume_paused_reviews` next run |
 | `deferred` | Codex budget hit; will be closed and retried next run |
 | `merged` | Successfully merged |
 | `closed` | Closed (clean retry or deferred cleanup) |
-| `failed` | CI failed or other unrecoverable error |
 
 ---
 
@@ -121,7 +118,10 @@ On the next run, `startup_reconcile()` scans for findings left in `in_progress` 
 - **in_progress, PR closed** → requeue finding as `open` for a clean retry.
 - **in_progress, PR open** → close the stale PR and requeue (the next run produces a fresh branch and PR from current HEAD).
 - **in_progress, GitHub API error** → leave state untouched; retry next run (fail-closed — never misclassify an API failure as a known state).
+- **ci_paused** → left alone by `startup_reconcile`; driven by `_resume_paused_reviews` after the current HEAD is established (see below).
 - **deferred** → close the existing PR and requeue as `open` so the next run produces a fresh branch with the full review-round budget.
+
+`_resume_paused_reviews` runs at the start of each sweep pass. For each `ci_paused` PR it: polls CI; if CI passed and the base branch hasn't advanced, merges; if CI is still uncertain, leaves it `ci_paused`; if CI definitively failed, collects the failure logs and re-enters the full `phase_review_loop` with those logs as pre-loaded evidence so the reviewer can request repairs or confirm the failure is unrelated (which returns `REVIEW_CI_UNCERTAIN` and keeps the PR `ci_paused` for another pass).
 
 Audits always run against a freshly-fetched read-only worktree at exactly `origin/<default_branch>`.
 
@@ -142,9 +142,7 @@ This prevents attempting to fix issues that an earlier PR already resolved.
 ## Safety guarantees
 
 - **Fail-closed throughout** — Codex errors, invalid JSON, missing CI checks, and timed-out CI waits all block action; they never constitute approval.
-- **Never weakens tests or CI** — if `test_cmd` fails, the fix is discarded.
-- **Setup failures abort without penalty** — if `setup_cmd` exits non-zero the run aborts, the finding is requeued, and its repair-attempt count is not incremented.
-- **Never merges with failing CI** — only an explicit GitHub "success" result permits a merge (or `allow_no_ci = true` with no checks present).
+- **Never merges with failing CI** — only an explicit GitHub "success" result permits a merge (or `allow_no_ci = true` with no checks present). Even when a reviewer explicitly clears a CI failure as unrelated, the PR is placed in `ci_paused` rather than merged immediately; the merge only happens once CI actually passes.
 - **Every fix is on its own branch and PR** — no direct pushes to the trunk.
 - **Unrelated findings stay separate** — the repair prompt instructs Codex to make the minimal targeted change.
 - **Hard budget limits** — `codex_call_budget`, `max_fixes_per_run`, and `max_consecutive_failures` prevent runaway billing or infinite loops.

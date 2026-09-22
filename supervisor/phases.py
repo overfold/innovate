@@ -298,6 +298,8 @@ def phase_review_loop(
     findings: list,
     branch: str,
     ctr: dict,
+    *,
+    initial_ci_evidence: str | None = None,
 ) -> str:
     """Review the PR, implement feedback, poll CI, and repeat within max_review_rounds.
 
@@ -332,7 +334,7 @@ def phase_review_loop(
     codex_budget = cfg["budget"]["codex_call_budget"]
 
     # Log output from a prior failed CI run, supplied to the reviewer next round.
-    ci_evidence: str | None = None
+    ci_evidence: str | None = initial_ci_evidence
 
     for rnd in range(1, max_rounds + 1):
         LOG.info("  Review round %d/%d", rnd, max_rounds)
@@ -385,12 +387,13 @@ def phase_review_loop(
         ]
 
         if verdict == "approve" and not blocking:
-            # If the reviewer saw CI failure evidence and still approved, they've
-            # explicitly cleared the failure as unrelated — trust the reviewer and
-            # do not re-poll CI (which would return the same failure again).
+            # If the reviewer saw CI failure evidence and approved, they cleared the
+            # failure as unrelated — but we still cannot merge while CI is red.
+            # Return REVIEW_CI_UNCERTAIN so the PR enters ci_paused and the next
+            # _resume_paused_reviews pass re-checks whether CI has cleared.
             if ci_evidence is not None:
                 db.update_pr(pr_id, review_rounds=rnd)
-                return REVIEW_APPROVED
+                return REVIEW_CI_UNCERTAIN
 
             # No prior CI evidence — poll CI before permitting merge.
             ci = wait_for_ci(owner, repo_name, pr_number, ci_timeout, allow_no_ci)

@@ -71,5 +71,5 @@ Global flags accepted before the command:
 
 ## Further reading
 
-- [Configuration reference](docs/configuration.md) — all config options, managed clone, worktree setup
+- [Configuration reference](docs/configuration.md) — all config options, managed clone
 - [Internals](docs/internals.md) — lifecycle, state database, exhaustion tracking, crash recovery, finding revalidation, safety guarantees

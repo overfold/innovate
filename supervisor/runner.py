@@ -12,16 +12,19 @@ from .git import (
     GitHubAPIError,
     ci_permits_merge,
     create_audit_worktree,
+    create_branch_worktree,
     create_worktree,
     current_commit,
     gh_close_pr,
     gh_create_pr,
     gh_find_pr_by_branch,
+    gh_get_failed_ci_logs,
     gh_merge_pr,
     gh_pr_base_sha,
     gh_pr_state,
     push_branch,
     remove_audit_worktree,
+    remove_branch_worktree,
     remove_worktree,
     wait_for_ci,
 )
@@ -194,47 +197,7 @@ class Supervisor:
                 db.update_pr(pr_row["id"], status="closed")
                 db.mark_finding(finding["id"], "open")
             elif pr_row["status"] == "ci_paused":
-                # CI was uncertain last run — re-poll to see if it has resolved.
-                ci_wait = cfg["verify"]["ci_wait_timeout"]
-                allow_no_ci = cfg["verify"]["allow_no_ci"]
-                ci = wait_for_ci(owner, repo_name, pr_number, ci_wait, allow_no_ci)
-                LOG.info(
-                    "  ci_paused PR #%d: CI is now %s",
-                    pr_number, ci,
-                )
-                if ci_permits_merge(ci, allow_no_ci):
-                    try:
-                        gh_merge_pr(owner, repo_name, pr_number)
-                    except Exception as exc:
-                        LOG.warning(
-                            "  Merge of ci_paused PR #%d uncertain: %s"
-                            " — leaving ci_paused for next reconcile",
-                            pr_number, exc,
-                        )
-                        continue
-                    db.update_pr(
-                        pr_row["id"],
-                        status="merged",
-                        merged=datetime.now(timezone.utc).isoformat(),
-                    )
-                    db.mark_finding(finding["id"], "fixed", pr_id=pr_row["id"])
-                    LOG.info(
-                        "  Merged ci_paused PR #%d for finding %d (%s)",
-                        pr_number, finding["id"], finding["title"],
-                    )
-                elif ci == "failure":
-                    try:
-                        gh_close_pr(owner, repo_name, pr_number)
-                    except GitHubAPIError as exc:
-                        LOG.warning(
-                            "  Failed to close ci_paused PR #%d: %s"
-                            " — leaving for next reconcile",
-                            pr_number, exc,
-                        )
-                        continue
-                    db.update_pr(pr_row["id"], status="closed")
-                    db.mark_finding(finding["id"], "open")
-                # else: still uncertain — leave ci_paused for the next run
+                pass  # handled by _resume_paused_reviews after HEAD is established
             else:  # open (unexpected) — close and requeue for a clean retry
                 try:
                     gh_close_pr(owner, repo_name, pr_number)
@@ -571,6 +534,173 @@ class Supervisor:
             else:  # error
                 self.ctr["consecutive_failures"] += 1
 
+    def _resume_paused_reviews(self, head: str) -> None:
+        """Drive ci_paused PRs through the full review/CI loop.
+
+        Called at the start of each pass after HEAD is established.  A
+        ci_paused PR is one whose last review approved the code but CI was
+        still red at the time (REVIEW_CI_UNCERTAIN returned).  We now re-check:
+        - CI passed → verify base freshness → merge.
+        - CI still uncertain/pending → leave ci_paused for the next run.
+        - CI definitively failed → collect logs → run phase_review_loop with
+          the evidence so the reviewer can request repairs or confirm the
+          failure is unrelated again (which itself returns REVIEW_CI_UNCERTAIN,
+          keeping the PR in ci_paused for another pass).
+        """
+        db = self.db
+        cfg = self.cfg
+        owner = cfg["repo"]["owner"]
+        repo_name = cfg["repo"]["name"]
+        repo = Path(cfg["repo"]["path"]).resolve()
+        ci_wait = cfg["verify"]["ci_wait_timeout"]
+        allow_no_ci = cfg["verify"]["allow_no_ci"]
+
+        paused_findings = [
+            f for f in db.in_progress_findings()
+            if f["pr_id"] and db.get_pr(f["pr_id"])
+            and db.get_pr(f["pr_id"])["status"] == "ci_paused"
+        ]
+        if not paused_findings:
+            return
+
+        LOG.info("Resuming %d ci_paused PR(s)…", len(paused_findings))
+
+        for finding in paused_findings:
+            if self._over_budget():
+                break
+            pr_row = db.get_pr(finding["pr_id"])
+            pr_id = pr_row["id"]
+            pr_number = pr_row["pr_number"]
+            branch = pr_row["branch"]
+
+            ci = wait_for_ci(owner, repo_name, pr_number, ci_wait, allow_no_ci)
+            LOG.info("  ci_paused PR #%d: CI is now %s", pr_number, ci)
+
+            if ci_permits_merge(ci, allow_no_ci):
+                try:
+                    base_oid = gh_pr_base_sha(owner, repo_name, pr_number)
+                except GitHubAPIError as exc:
+                    LOG.warning(
+                        "  Cannot verify base freshness for PR #%d: %s"
+                        " — leaving ci_paused",
+                        pr_number, exc,
+                    )
+                    self.ctr["consecutive_failures"] += 1
+                    continue
+                if base_oid != head:
+                    LOG.warning("  Base advanced — closing PR #%d and requeueing", pr_number)
+                    try:
+                        gh_close_pr(owner, repo_name, pr_number)
+                    except GitHubAPIError as exc:
+                        LOG.warning("  Failed to close PR #%d: %s", pr_number, exc)
+                        continue
+                    db.update_pr(pr_id, status="closed")
+                    db.mark_finding(finding["id"], "open")
+                    continue
+                try:
+                    gh_merge_pr(owner, repo_name, pr_number)
+                except Exception as exc:
+                    LOG.warning(
+                        "  Merge uncertain for PR #%d: %s — leaving ci_paused",
+                        pr_number, exc,
+                    )
+                    self.ctr["consecutive_failures"] += 1
+                    continue
+                db.update_pr(pr_id, status="merged", merged=datetime.now(timezone.utc).isoformat())
+                db.mark_finding(finding["id"], "fixed", pr_id=pr_id)
+                self.ctr["fixes_applied"] += 1
+                self.ctr["consecutive_failures"] = 0
+                continue
+
+            if ci != "failure":
+                LOG.warning("  CI status %r is uncertain — leaving ci_paused", ci)
+                continue
+
+            # CI definitively failed — collect logs and enter the full review loop.
+            logs = gh_get_failed_ci_logs(owner, repo_name, pr_number)
+            if not logs:
+                LOG.warning(
+                    "  CI failed but no retrievable logs for PR #%d — leaving ci_paused",
+                    pr_number,
+                )
+                if logs is None:
+                    self.ctr["consecutive_failures"] += 1
+                continue
+
+            LOG.info(
+                "  CI failed for PR #%d — entering review loop with CI evidence",
+                pr_number,
+            )
+            wt_path = None
+            try:
+                wt_path = create_branch_worktree(repo, branch)
+                wt_cfg = {**cfg, "repo": {**cfg["repo"], "path": str(wt_path), "base_sha": head}}
+                outcome = phase_review_loop(
+                    wt_cfg, db, pr_id, pr_number, [dict(finding)], branch, self.ctr,
+                    initial_ci_evidence=logs,
+                )
+            finally:
+                if wt_path is not None:
+                    remove_branch_worktree(repo, wt_path)
+
+            if outcome == REVIEW_APPROVED:
+                try:
+                    base_oid = gh_pr_base_sha(owner, repo_name, pr_number)
+                except GitHubAPIError as exc:
+                    LOG.error(
+                        "  Cannot verify base freshness for PR #%d: %s"
+                        " — leaving in_progress",
+                        pr_number, exc,
+                    )
+                    self.ctr["consecutive_failures"] += 1
+                    continue
+                if base_oid != head:
+                    try:
+                        gh_close_pr(owner, repo_name, pr_number)
+                    except GitHubAPIError:
+                        pass
+                    db.update_pr(pr_id, status="closed")
+                    db.mark_finding(finding["id"], "open")
+                    continue
+                try:
+                    gh_merge_pr(owner, repo_name, pr_number)
+                except Exception as exc:
+                    LOG.error("  Merge uncertain for PR #%d: %s", pr_number, exc)
+                    self.ctr["consecutive_failures"] += 1
+                    continue
+                db.update_pr(pr_id, status="merged", merged=datetime.now(timezone.utc).isoformat())
+                db.mark_finding(finding["id"], "fixed", pr_id=pr_id)
+                self.ctr["fixes_applied"] += 1
+                self.ctr["consecutive_failures"] = 0
+
+            elif outcome == REVIEW_CI_UNCERTAIN:
+                db.update_pr(pr_id, status="ci_paused")
+
+            elif outcome == REVIEW_FAILED_ERROR:
+                try:
+                    gh_close_pr(owner, repo_name, pr_number)
+                except GitHubAPIError as exc:
+                    LOG.warning("  Failed to close PR #%d: %s", pr_number, exc)
+                db.update_pr(pr_id, status="closed")
+                db.mark_finding(finding["id"], "open")
+                self.ctr["consecutive_failures"] += 1
+
+            elif outcome == REVIEW_PAUSED_BUDGET:
+                try:
+                    gh_close_pr(owner, repo_name, pr_number)
+                except GitHubAPIError as exc:
+                    LOG.warning("  Failed to close PR #%d: %s", pr_number, exc)
+                db.update_pr(pr_id, status="closed")
+                db.mark_finding(
+                    finding["id"], "blocked", pr_id=pr_id,
+                    reason="review rounds exhausted after ci_paused retry",
+                    head=head,
+                )
+
+            elif outcome == REVIEW_DEFERRED_BUDGET:
+                db.update_pr(pr_id, status="deferred")
+                db.mark_finding(finding["id"], "deferred", pr_id=pr_id)
+
     def _revalidate_stale_rejected(self, head: str, audit_cfg: dict) -> None:
         """Revalidate rejected findings recorded at a different HEAD.
 
@@ -657,6 +787,10 @@ class Supervisor:
                 head = current_commit(audit_wt)
                 last_head = head
                 audit_cfg = {**cfg, "repo": {**cfg["repo"], "path": str(audit_wt)}}
+
+                self._resume_paused_reviews(head)
+                if self._over_budget():
+                    return "budget"
 
                 for area in areas:
                     if self._over_budget():
@@ -779,6 +913,10 @@ class Supervisor:
             try:
                 head = current_commit(audit_wt)
                 audit_cfg = {**cfg, "repo": {**cfg["repo"], "path": str(audit_wt)}}
+
+                self._resume_paused_reviews(head)
+                if self._over_budget():
+                    return "budget"
 
                 # Revalidate rejected findings from an earlier HEAD before
                 # loading the queue: any that are still valid are reopened

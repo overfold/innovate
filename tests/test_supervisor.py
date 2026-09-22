@@ -937,9 +937,9 @@ class TestGhCiStatus:
         status = self._run(0, '[{"bucket":"fail"}]')
         assert status == "failure"
 
-    def test_cancel_bucket_returns_failure(self):
+    def test_cancel_bucket_returns_api_error(self):
         status = self._run(0, '[{"bucket":"cancel"}]')
-        assert status == "failure"
+        assert status == "api_error"
 
     def test_empty_checks_returns_no_checks(self):
         status = self._run(0, "[]")
@@ -2896,12 +2896,13 @@ class TestCIIntegration:
 
         assert outcome == REVIEW_APPROVED
 
-    def test_ci_failure_reviewer_gets_evidence_then_merges(self):
-        """approve → CI failure → reviewer gets CI evidence and approves → REVIEW_APPROVED.
+    def test_ci_failure_reviewer_clears_failure_returns_ci_uncertain(self):
+        """approve → CI failure → reviewer gets CI evidence and approves → REVIEW_CI_UNCERTAIN.
 
         When the reviewer sees CI failure evidence and still approves, they've
-        explicitly cleared the failure as unrelated.  CI is NOT re-polled; the
-        reviewer's approval is authoritative.
+        declared the failure unrelated — but we cannot merge while CI is red.
+        Return REVIEW_CI_UNCERTAIN so the PR enters ci_paused and
+        _resume_paused_reviews re-checks once CI clears.
         """
         from supervisor.phases import phase_review_loop
 
@@ -2924,9 +2925,9 @@ class TestCIIntegration:
              patch("supervisor.phases.gh_get_failed_ci_logs", return_value="::error:: test failed"):
             outcome = phase_review_loop(cfg, db, pr_id, 1, [f], "branch", ctr)
 
-        assert outcome == REVIEW_APPROVED
-        # CI is polled exactly once (round 1 fails), then skipped in round 2
-        # because the reviewer saw the evidence and still approved.
+        assert outcome == REVIEW_CI_UNCERTAIN
+        # CI is polled exactly once (round 1 fails); round 2 sees ci_evidence
+        # already set and returns REVIEW_CI_UNCERTAIN without re-polling.
         assert ci_calls["n"] == 1
 
     def test_ci_driven_edits_require_fresh_review(self):
@@ -3052,7 +3053,7 @@ class TestCIIntegration:
 
 
 class TestStartupReconcileCIPaused:
-    """Regression tests for startup_reconcile handling of ci_paused PRs (Issue 1)."""
+    """startup_reconcile leaves ci_paused PRs alone; _resume_paused_reviews handles them."""
 
     def _sup(self):
         return Supervisor(_cfg(), _db())
@@ -3066,58 +3067,18 @@ class TestStartupReconcileCIPaused:
         sup.db.mark_finding(f["id"], "in_progress", pr_id=pr_id)
         return f, pr_id
 
-    def test_ci_paused_ci_now_passes_merges(self):
-        """ci_paused PR whose CI now passes is merged in startup_reconcile."""
+    def test_ci_paused_open_pr_left_untouched_by_startup_reconcile(self):
+        """startup_reconcile never touches ci_paused PRs — _resume_paused_reviews owns them."""
         sup = self._sup()
         f, pr_id = self._make_ci_paused_pr(sup, pr_number=10)
 
         with patch(f"{RUNNER_MODULE}.gh_pr_state", return_value="open"), \
-             patch(f"{RUNNER_MODULE}.wait_for_ci", return_value="success"), \
-             patch(f"{RUNNER_MODULE}.gh_merge_pr") as mock_merge:
+             patch(f"{RUNNER_MODULE}.wait_for_ci") as mock_ci:
             sup.startup_reconcile()
 
-        mock_merge.assert_called_once_with("org", "repo", 10)
-        assert sup.db.get_finding(f["id"])["status"] == "fixed"
-        assert sup.db.get_pr(pr_id)["status"] == "merged"
-
-    def test_ci_paused_ci_now_fails_closes_and_requeues(self):
-        """ci_paused PR whose CI now definitively fails is closed and finding requeued."""
-        sup = self._sup()
-        f, pr_id = self._make_ci_paused_pr(sup, pr_number=11)
-
-        with patch(f"{RUNNER_MODULE}.gh_pr_state", return_value="open"), \
-             patch(f"{RUNNER_MODULE}.wait_for_ci", return_value="failure"), \
-             patch(f"{RUNNER_MODULE}.gh_close_pr") as mock_close:
-            sup.startup_reconcile()
-
-        mock_close.assert_called_once_with("org", "repo", 11)
-        assert sup.db.get_finding(f["id"])["status"] == "open"
-        assert sup.db.get_pr(pr_id)["status"] == "closed"
-
-    def test_ci_paused_ci_still_uncertain_left_alone(self):
-        """ci_paused PR with still-uncertain CI is left untouched."""
-        sup = self._sup()
-        f, pr_id = self._make_ci_paused_pr(sup, pr_number=12)
-
-        with patch(f"{RUNNER_MODULE}.gh_pr_state", return_value="open"), \
-             patch(f"{RUNNER_MODULE}.wait_for_ci", return_value="timeout"):
-            sup.startup_reconcile()
-
-        assert sup.db.get_finding(f["id"])["status"] == "in_progress"
-        assert sup.db.get_pr(pr_id)["status"] == "ci_paused"
-
-    def test_ci_paused_merge_failure_left_for_next_run(self):
-        """ci_paused PR that passes CI but fails to merge is left ci_paused for next run."""
-        sup = self._sup()
-        f, pr_id = self._make_ci_paused_pr(sup, pr_number=13)
-
-        with patch(f"{RUNNER_MODULE}.gh_pr_state", return_value="open"), \
-             patch(f"{RUNNER_MODULE}.wait_for_ci", return_value="success"), \
-             patch(f"{RUNNER_MODULE}.gh_merge_pr",
-                   side_effect=Exception("merge conflict")):
-            sup.startup_reconcile()
-
-        # Left ci_paused — next run will retry
+        # wait_for_ci must NOT have been called for this ci_paused PR
+        mock_ci.assert_not_called()
+        # PR and finding state are unchanged
         assert sup.db.get_finding(f["id"])["status"] == "in_progress"
         assert sup.db.get_pr(pr_id)["status"] == "ci_paused"
 
@@ -3147,3 +3108,203 @@ class TestStartupReconcileCIPaused:
         # The PR should be marked ci_paused, not plain open
         prs = db.recent_prs(1)
         assert prs[0]["status"] == "ci_paused"
+
+
+# ── gh_get_failed_ci_logs ─────────────────────────────────────────────────────
+
+class TestGhGetFailedCiLogs:
+    """Unit tests for gh_get_failed_ci_logs fail-open/fail-closed behaviour."""
+
+    def _run(self, responses: list) -> "str | None":
+        """Call gh_get_failed_ci_logs with mocked subprocess.run calls."""
+        from supervisor.git import gh_get_failed_ci_logs
+
+        call_iter = iter(responses)
+
+        def fake_run(cmd, **kwargs):
+            r = MagicMock()
+            rc, stdout = next(call_iter)
+            r.returncode = rc
+            r.stdout = stdout
+            return r
+
+        with patch("supervisor.git.subprocess.run", side_effect=fake_run):
+            return gh_get_failed_ci_logs("org", "repo", 1)
+
+    def test_all_log_fetches_fail_returns_none(self):
+        """When runs exist but every log-fetch call fails, return None (fail-closed)."""
+        # pr view → headRefOid
+        head_resp = (0, '{"headRefOid": "abc"}')
+        # run list → two failed runs
+        runs_resp = (0, '[{"databaseId": 1}, {"databaseId": 2}]')
+        # both gh run view calls fail
+        log1_resp = (1, "")
+        log2_resp = (1, "")
+        result = self._run([head_resp, runs_resp, log1_resp, log2_resp])
+        assert result is None
+
+    def test_some_log_fetches_succeed_returns_logs(self):
+        """When at least one log fetch succeeds, return the concatenated output."""
+        head_resp = (0, '{"headRefOid": "abc"}')
+        runs_resp = (0, '[{"databaseId": 1}, {"databaseId": 2}]')
+        log1_resp = (1, "")          # first fetch fails
+        log2_resp = (0, "log line")  # second succeeds
+        result = self._run([head_resp, runs_resp, log1_resp, log2_resp])
+        assert result is not None
+        assert "log line" in result
+
+    def test_no_failed_runs_returns_empty_string(self):
+        """When the run list is empty, return '' (not None — no infrastructure error)."""
+        head_resp = (0, '{"headRefOid": "abc"}')
+        runs_resp = (0, "[]")
+        result = self._run([head_resp, runs_resp])
+        assert result == ""
+
+
+# ── _resume_paused_reviews ────────────────────────────────────────────────────
+
+class TestResumePausedReviews:
+    """Tests for Supervisor._resume_paused_reviews."""
+
+    def _sup_with_paused_pr(self, pr_number: int = 20):
+        """Return (sup, finding, pr_id) with one ci_paused PR."""
+        db = _db()
+        sup = Supervisor(_cfg(), db)
+        f = _open_finding(db)
+        pr_id = db.create_pr("maint/correctness/ts")
+        db.update_pr(pr_id, pr_number=pr_number, branch="fix/branch",
+                     pr_url=f"https://gh/{pr_number}", status="ci_paused")
+        db.mark_finding(f["id"], "in_progress", pr_id=pr_id)
+        return sup, f, pr_id
+
+    def test_no_paused_prs_is_noop(self):
+        """_resume_paused_reviews does nothing when there are no ci_paused PRs."""
+        db = _db()
+        sup = Supervisor(_cfg(), db)
+        _open_finding(db)  # open, not in_progress
+        with patch(f"{RUNNER_MODULE}.wait_for_ci") as mock_ci:
+            sup._resume_paused_reviews("abc1234")
+        mock_ci.assert_not_called()
+
+    def test_ci_passes_base_fresh_merges(self):
+        """CI success + base fresh → merge, mark fixed."""
+        sup, f, pr_id = self._sup_with_paused_pr(20)
+        with patch(f"{RUNNER_MODULE}.wait_for_ci", return_value="success"), \
+             patch(f"{RUNNER_MODULE}.gh_pr_base_sha", return_value="abc1234"), \
+             patch(f"{RUNNER_MODULE}.gh_merge_pr") as mock_merge:
+            sup._resume_paused_reviews("abc1234")
+        mock_merge.assert_called_once_with("org", "repo", 20)
+        assert sup.db.get_finding(f["id"])["status"] == "fixed"
+        assert sup.db.get_pr(pr_id)["status"] == "merged"
+
+    def test_ci_passes_base_advanced_closes_and_requeues(self):
+        """CI success + base advanced → close PR, requeue finding."""
+        sup, f, pr_id = self._sup_with_paused_pr(21)
+        with patch(f"{RUNNER_MODULE}.wait_for_ci", return_value="success"), \
+             patch(f"{RUNNER_MODULE}.gh_pr_base_sha", return_value="different_sha"), \
+             patch(f"{RUNNER_MODULE}.gh_close_pr") as mock_close, \
+             patch(f"{RUNNER_MODULE}.gh_merge_pr") as mock_merge:
+            sup._resume_paused_reviews("abc1234")
+        mock_close.assert_called_once_with("org", "repo", 21)
+        mock_merge.assert_not_called()
+        assert sup.db.get_finding(f["id"])["status"] == "open"
+        assert sup.db.get_pr(pr_id)["status"] == "closed"
+
+    def test_ci_uncertain_leaves_paused(self):
+        """Uncertain CI leaves PR ci_paused for the next run."""
+        sup, f, pr_id = self._sup_with_paused_pr(22)
+        with patch(f"{RUNNER_MODULE}.wait_for_ci", return_value="timeout"):
+            sup._resume_paused_reviews("abc1234")
+        assert sup.db.get_finding(f["id"])["status"] == "in_progress"
+        assert sup.db.get_pr(pr_id)["status"] == "ci_paused"
+
+    def test_ci_failure_log_retrieval_fails_leaves_paused(self):
+        """CI failure but log retrieval returns None → leave ci_paused, count failure."""
+        sup, f, pr_id = self._sup_with_paused_pr(23)
+        with patch(f"{RUNNER_MODULE}.wait_for_ci", return_value="failure"), \
+             patch(f"{RUNNER_MODULE}.gh_get_failed_ci_logs", return_value=None):
+            sup._resume_paused_reviews("abc1234")
+        assert sup.db.get_pr(pr_id)["status"] == "ci_paused"
+        assert sup.ctr["consecutive_failures"] == 1
+
+    def test_ci_failure_empty_logs_leaves_paused_no_failure_count(self):
+        """CI failure but logs == '' (no failed runs) → leave ci_paused, no failure bump."""
+        sup, f, pr_id = self._sup_with_paused_pr(24)
+        with patch(f"{RUNNER_MODULE}.wait_for_ci", return_value="failure"), \
+             patch(f"{RUNNER_MODULE}.gh_get_failed_ci_logs", return_value=""):
+            sup._resume_paused_reviews("abc1234")
+        assert sup.db.get_pr(pr_id)["status"] == "ci_paused"
+        assert sup.ctr["consecutive_failures"] == 0
+
+    def test_ci_failure_review_loop_approved_merges(self, tmp_path):
+        """CI failure → logs retrieved → review loop returns REVIEW_APPROVED → merge."""
+        sup, f, pr_id = self._sup_with_paused_pr(25)
+        wt = tmp_path / "wt"
+        wt.mkdir()
+        with patch(f"{RUNNER_MODULE}.wait_for_ci", return_value="failure"), \
+             patch(f"{RUNNER_MODULE}.gh_get_failed_ci_logs", return_value="::error::"), \
+             patch(f"{RUNNER_MODULE}.create_branch_worktree", return_value=wt), \
+             patch(f"{RUNNER_MODULE}.remove_branch_worktree"), \
+             patch(f"{RUNNER_MODULE}.phase_review_loop", return_value=REVIEW_APPROVED), \
+             patch(f"{RUNNER_MODULE}.gh_pr_base_sha", return_value="abc1234"), \
+             patch(f"{RUNNER_MODULE}.gh_merge_pr") as mock_merge:
+            sup._resume_paused_reviews("abc1234")
+        mock_merge.assert_called_once_with("org", "repo", 25)
+        assert sup.db.get_finding(f["id"])["status"] == "fixed"
+
+    def test_ci_failure_review_loop_ci_uncertain_leaves_paused(self, tmp_path):
+        """CI failure → review loop returns REVIEW_CI_UNCERTAIN → leave ci_paused."""
+        sup, f, pr_id = self._sup_with_paused_pr(26)
+        wt = tmp_path / "wt"
+        wt.mkdir()
+        with patch(f"{RUNNER_MODULE}.wait_for_ci", return_value="failure"), \
+             patch(f"{RUNNER_MODULE}.gh_get_failed_ci_logs", return_value="::error::"), \
+             patch(f"{RUNNER_MODULE}.create_branch_worktree", return_value=wt), \
+             patch(f"{RUNNER_MODULE}.remove_branch_worktree"), \
+             patch(f"{RUNNER_MODULE}.phase_review_loop", return_value=REVIEW_CI_UNCERTAIN):
+            sup._resume_paused_reviews("abc1234")
+        assert sup.db.get_pr(pr_id)["status"] == "ci_paused"
+
+    def test_ci_failure_review_loop_failed_error_closes_and_requeues(self, tmp_path):
+        """CI failure → review loop returns REVIEW_FAILED_ERROR → close PR, requeue."""
+        sup, f, pr_id = self._sup_with_paused_pr(27)
+        wt = tmp_path / "wt"
+        wt.mkdir()
+        with patch(f"{RUNNER_MODULE}.wait_for_ci", return_value="failure"), \
+             patch(f"{RUNNER_MODULE}.gh_get_failed_ci_logs", return_value="::error::"), \
+             patch(f"{RUNNER_MODULE}.create_branch_worktree", return_value=wt), \
+             patch(f"{RUNNER_MODULE}.remove_branch_worktree"), \
+             patch(f"{RUNNER_MODULE}.phase_review_loop", return_value=REVIEW_FAILED_ERROR), \
+             patch(f"{RUNNER_MODULE}.gh_close_pr"):
+            sup._resume_paused_reviews("abc1234")
+        assert sup.db.get_finding(f["id"])["status"] == "open"
+        assert sup.db.get_pr(pr_id)["status"] == "closed"
+
+    def test_ci_failure_review_loop_paused_budget_blocks(self, tmp_path):
+        """CI failure → review loop returns REVIEW_PAUSED_BUDGET → close PR, mark blocked."""
+        sup, f, pr_id = self._sup_with_paused_pr(28)
+        wt = tmp_path / "wt"
+        wt.mkdir()
+        with patch(f"{RUNNER_MODULE}.wait_for_ci", return_value="failure"), \
+             patch(f"{RUNNER_MODULE}.gh_get_failed_ci_logs", return_value="::error::"), \
+             patch(f"{RUNNER_MODULE}.create_branch_worktree", return_value=wt), \
+             patch(f"{RUNNER_MODULE}.remove_branch_worktree"), \
+             patch(f"{RUNNER_MODULE}.phase_review_loop", return_value=REVIEW_PAUSED_BUDGET), \
+             patch(f"{RUNNER_MODULE}.gh_close_pr"):
+            sup._resume_paused_reviews("abc1234")
+        assert sup.db.get_finding(f["id"])["status"] == "blocked"
+        assert sup.db.get_pr(pr_id)["status"] == "closed"
+
+    def test_ci_failure_review_loop_deferred_budget_defers(self, tmp_path):
+        """CI failure → review loop returns REVIEW_DEFERRED_BUDGET → defer PR and finding."""
+        sup, f, pr_id = self._sup_with_paused_pr(29)
+        wt = tmp_path / "wt"
+        wt.mkdir()
+        with patch(f"{RUNNER_MODULE}.wait_for_ci", return_value="failure"), \
+             patch(f"{RUNNER_MODULE}.gh_get_failed_ci_logs", return_value="::error::"), \
+             patch(f"{RUNNER_MODULE}.create_branch_worktree", return_value=wt), \
+             patch(f"{RUNNER_MODULE}.remove_branch_worktree"), \
+             patch(f"{RUNNER_MODULE}.phase_review_loop", return_value=REVIEW_DEFERRED_BUDGET):
+            sup._resume_paused_reviews("abc1234")
+        assert sup.db.get_finding(f["id"])["status"] == "deferred"
+        assert sup.db.get_pr(pr_id)["status"] == "deferred"
