@@ -2897,7 +2897,12 @@ class TestCIIntegration:
         assert outcome == REVIEW_APPROVED
 
     def test_ci_failure_reviewer_gets_evidence_then_merges(self):
-        """approve → CI failure → reviewer gets CI evidence → approve → CI success → REVIEW_APPROVED."""
+        """approve → CI failure → reviewer gets CI evidence and approves → REVIEW_APPROVED.
+
+        When the reviewer sees CI failure evidence and still approves, they've
+        explicitly cleared the failure as unrelated.  CI is NOT re-polled; the
+        reviewer's approval is authoritative.
+        """
         from supervisor.phases import phase_review_loop
 
         db, pr_id, cfg = self._db_and_cfg()
@@ -2906,65 +2911,81 @@ class TestCIIntegration:
         ctr = self._ctr()
 
         ci_calls = {"n": 0}
-        codex_calls = {"n": 0}
 
         def fake_ci(*args, **kwargs):
             ci_calls["n"] += 1
-            return "failure" if ci_calls["n"] == 1 else "success"
-
-        def fake_codex(*args, **kwargs):
-            codex_calls["n"] += 1
-            return ""
+            return "failure"
 
         with patch("supervisor.phases.parse_json",
                    return_value={"verdict": "approve", "summary": "ok", "comments": []}), \
-             patch("supervisor.phases.run_codex", side_effect=fake_codex), \
+             patch("supervisor.phases.run_codex", return_value=""), \
              patch("supervisor.phases.full_diff", return_value="diff"), \
              patch("supervisor.phases.wait_for_ci", side_effect=fake_ci), \
              patch("supervisor.phases.gh_get_failed_ci_logs", return_value="::error:: test failed"):
             outcome = phase_review_loop(cfg, db, pr_id, 1, [f], "branch", ctr)
 
         assert outcome == REVIEW_APPROVED
-        assert ci_calls["n"] == 2  # first failure, then success
+        # CI is polled exactly once (round 1 fails), then skipped in round 2
+        # because the reviewer saw the evidence and still approved.
+        assert ci_calls["n"] == 1
 
     def test_ci_driven_edits_require_fresh_review(self):
-        """After implementing review feedback, ci_evidence is cleared so next round is a fresh review."""
+        """CI failure → reviewer sees evidence → requests changes → implementation →
+        fresh review (no CI evidence) → CI success → REVIEW_APPROVED.
+
+        This is the key regression test for the CI-feedback-driven edit path:
+        proves that after a CI-triggered code change, the modified revision
+        receives a fresh review before CI can permit merge.
+        """
         from supervisor.phases import phase_review_loop
 
         db, pr_id, cfg = self._db_and_cfg()
-        cfg["budget"]["max_review_rounds"] = 3
+        cfg["budget"]["max_review_rounds"] = 4
         f = _open_finding(db)
         ctr = self._ctr()
 
-        review_prompts = []
+        review_call = {"n": 0}
         parse_responses = [
-            # Round 1: request_changes (blocking)
-            {"verdict": "request_changes", "summary": "fix it",
-             "comments": [{"severity": "blocking", "description": "bad code"}]},
-            # Round 2: approve (after implementing feedback)
-            {"verdict": "approve", "summary": "ok", "comments": []},
+            # Round 1: approve (no CI evidence yet)
+            {"verdict": "approve", "summary": "lgtm", "comments": []},
+            # Round 2: reviewer sees CI evidence → requests changes
+            {"verdict": "request_changes", "summary": "ci failure is related",
+             "comments": [{"severity": "blocking", "file": None,
+                           "description": "fix the broken test"}]},
+            # Round 3: fresh review after implementation → approve
+            {"verdict": "approve", "summary": "all good", "comments": []},
         ]
-        parse_call = {"n": 0}
 
         def fake_parse(output):
-            resp = parse_responses[min(parse_call["n"], len(parse_responses) - 1)]
-            parse_call["n"] += 1
+            resp = parse_responses[min(review_call["n"], len(parse_responses) - 1)]
+            review_call["n"] += 1
             return resp
+
+        ci_call = {"n": 0}
+
+        def fake_ci(*args, **kwargs):
+            ci_call["n"] += 1
+            return "failure" if ci_call["n"] == 1 else "success"
 
         with patch("supervisor.phases.parse_json", side_effect=fake_parse), \
              patch("supervisor.phases.run_codex", return_value=""), \
              patch("supervisor.phases.full_diff",
-                   side_effect=["diff1", "diff2", "diff3"]), \
+                   side_effect=["diff1", "diff2", "diff3", "diff4"]), \
              patch("supervisor.phases.push_branch"), \
              patch("supervisor.phases._git"), \
-             patch("supervisor.phases.wait_for_ci", return_value="success"):
+             patch("supervisor.phases.wait_for_ci", side_effect=fake_ci), \
+             patch("supervisor.phases.gh_get_failed_ci_logs",
+                   return_value="::error:: flaky_test failed"):
             outcome = phase_review_loop(cfg, db, pr_id, 1, [f], "branch", ctr)
 
-        # Round 1 requests changes; round 2 approves; CI passes.
         assert outcome == REVIEW_APPROVED
+        assert review_call["n"] == 3   # all three rounds reviewed
+        # CI polled twice: failing in round 1, then succeeding in round 3
+        # (round 2 requests changes and implements, so no CI poll there).
+        assert ci_call["n"] == 2
 
-    def test_repeated_ci_rounds_exhaust_budget_and_block(self):
-        """CI keeps failing → rounds exhausted → REVIEW_PAUSED_BUDGET."""
+    def test_repeated_review_requests_exhaust_budget_and_block(self):
+        """Reviewer requests changes every round → rounds exhausted → REVIEW_PAUSED_BUDGET."""
         from supervisor.phases import phase_review_loop
 
         db, pr_id, cfg = self._db_and_cfg()
@@ -2973,14 +2994,17 @@ class TestCIIntegration:
         ctr = self._ctr()
 
         with patch("supervisor.phases.parse_json",
-                   return_value={"verdict": "approve", "summary": "ok", "comments": []}), \
+                   return_value={"verdict": "request_changes", "summary": "still bad",
+                                 "comments": [{"severity": "blocking", "file": None,
+                                               "description": "still needs work"}]}), \
              patch("supervisor.phases.run_codex", return_value=""), \
-             patch("supervisor.phases.full_diff", return_value="diff"), \
-             patch("supervisor.phases.wait_for_ci", return_value="failure"), \
-             patch("supervisor.phases.gh_get_failed_ci_logs", return_value="error log"):
+             patch("supervisor.phases.full_diff",
+                   side_effect=["diff1", "diff2", "diff3", "diff4"]), \
+             patch("supervisor.phases.push_branch"), \
+             patch("supervisor.phases._git"):
             outcome = phase_review_loop(cfg, db, pr_id, 1, [f], "branch", ctr)
 
-        # Both rounds approved then hit CI failure; budget exhausted.
+        # Both rounds request changes and implement; budget exhausted → blocked.
         assert outcome == REVIEW_PAUSED_BUDGET
 
     def test_uncertain_ci_state_preserves_pr_no_code_changes(self):
@@ -3007,3 +3031,119 @@ class TestCIIntegration:
         assert outcome == REVIEW_CI_UNCERTAIN
         # No git commits or pushes should have been made.
         assert not any("commit" in str(c) for c in git_calls)
+
+    def test_ci_log_retrieval_failure_is_uncertain(self):
+        """CI fails but log retrieval returns None → REVIEW_CI_UNCERTAIN (not passed to reviewer)."""
+        from supervisor.phases import phase_review_loop
+
+        db, pr_id, cfg = self._db_and_cfg()
+        f = _open_finding(db)
+        ctr = self._ctr()
+
+        with patch("supervisor.phases.parse_json",
+                   return_value={"verdict": "approve", "summary": "ok", "comments": []}), \
+             patch("supervisor.phases.run_codex", return_value=""), \
+             patch("supervisor.phases.full_diff", return_value="diff"), \
+             patch("supervisor.phases.wait_for_ci", return_value="failure"), \
+             patch("supervisor.phases.gh_get_failed_ci_logs", return_value=None):
+            outcome = phase_review_loop(cfg, db, pr_id, 1, [f], "branch", ctr)
+
+        assert outcome == REVIEW_CI_UNCERTAIN
+
+
+class TestStartupReconcileCIPaused:
+    """Regression tests for startup_reconcile handling of ci_paused PRs (Issue 1)."""
+
+    def _sup(self):
+        return Supervisor(_cfg(), _db())
+
+    def _make_ci_paused_pr(self, sup, pr_number: int = 10):
+        """Create a finding + ci_paused PR row and return (finding, pr_id)."""
+        f = _open_finding(sup.db)
+        pr_id = sup.db.create_pr("maint/correctness/ts")
+        sup.db.update_pr(pr_id, pr_number=pr_number, pr_url=f"https://gh/{pr_number}",
+                         status="ci_paused")
+        sup.db.mark_finding(f["id"], "in_progress", pr_id=pr_id)
+        return f, pr_id
+
+    def test_ci_paused_ci_now_passes_merges(self):
+        """ci_paused PR whose CI now passes is merged in startup_reconcile."""
+        sup = self._sup()
+        f, pr_id = self._make_ci_paused_pr(sup, pr_number=10)
+
+        with patch(f"{RUNNER_MODULE}.gh_pr_state", return_value="open"), \
+             patch(f"{RUNNER_MODULE}.wait_for_ci", return_value="success"), \
+             patch(f"{RUNNER_MODULE}.gh_merge_pr") as mock_merge:
+            sup.startup_reconcile()
+
+        mock_merge.assert_called_once_with("org", "repo", 10)
+        assert sup.db.get_finding(f["id"])["status"] == "fixed"
+        assert sup.db.get_pr(pr_id)["status"] == "merged"
+
+    def test_ci_paused_ci_now_fails_closes_and_requeues(self):
+        """ci_paused PR whose CI now definitively fails is closed and finding requeued."""
+        sup = self._sup()
+        f, pr_id = self._make_ci_paused_pr(sup, pr_number=11)
+
+        with patch(f"{RUNNER_MODULE}.gh_pr_state", return_value="open"), \
+             patch(f"{RUNNER_MODULE}.wait_for_ci", return_value="failure"), \
+             patch(f"{RUNNER_MODULE}.gh_close_pr") as mock_close:
+            sup.startup_reconcile()
+
+        mock_close.assert_called_once_with("org", "repo", 11)
+        assert sup.db.get_finding(f["id"])["status"] == "open"
+        assert sup.db.get_pr(pr_id)["status"] == "closed"
+
+    def test_ci_paused_ci_still_uncertain_left_alone(self):
+        """ci_paused PR with still-uncertain CI is left untouched."""
+        sup = self._sup()
+        f, pr_id = self._make_ci_paused_pr(sup, pr_number=12)
+
+        with patch(f"{RUNNER_MODULE}.gh_pr_state", return_value="open"), \
+             patch(f"{RUNNER_MODULE}.wait_for_ci", return_value="timeout"):
+            sup.startup_reconcile()
+
+        assert sup.db.get_finding(f["id"])["status"] == "in_progress"
+        assert sup.db.get_pr(pr_id)["status"] == "ci_paused"
+
+    def test_ci_paused_merge_failure_left_for_next_run(self):
+        """ci_paused PR that passes CI but fails to merge is left ci_paused for next run."""
+        sup = self._sup()
+        f, pr_id = self._make_ci_paused_pr(sup, pr_number=13)
+
+        with patch(f"{RUNNER_MODULE}.gh_pr_state", return_value="open"), \
+             patch(f"{RUNNER_MODULE}.wait_for_ci", return_value="success"), \
+             patch(f"{RUNNER_MODULE}.gh_merge_pr",
+                   side_effect=Exception("merge conflict")):
+            sup.startup_reconcile()
+
+        # Left ci_paused — next run will retry
+        assert sup.db.get_finding(f["id"])["status"] == "in_progress"
+        assert sup.db.get_pr(pr_id)["status"] == "ci_paused"
+
+    def test_fix_finding_marks_pr_ci_paused_on_uncertain_ci(self, tmp_path):
+        """_fix_finding marks PR ci_paused (not just in_progress) when CI is uncertain."""
+        db = _db()
+        f = _open_finding(db)
+        sup = Supervisor(_cfg(), db)
+        wt = tmp_path / "wt"
+        wt.mkdir()
+
+        with patch(f"{RUNNER_MODULE}.create_worktree", return_value=wt), \
+             patch(f"{RUNNER_MODULE}.remove_worktree"), \
+             patch(f"{RUNNER_MODULE}.phase_validate", return_value="valid"), \
+             patch(f"{RUNNER_MODULE}.phase_repair", return_value=True), \
+             patch(f"{RUNNER_MODULE}.push_branch"), \
+             patch(f"{RUNNER_MODULE}.gh_create_pr",
+                   return_value=(20, "https://gh/20")), \
+             patch(f"{RUNNER_MODULE}.phase_review_loop",
+                   return_value=REVIEW_CI_UNCERTAIN):
+            result = sup._fix_finding(db.get_finding(f["id"]), "abc1234")
+
+        assert result is False
+        pr_row = db.find_pr_by_branch(db.get_finding(f["id"])["pr_id"] and
+                                       db.get_pr(db.get_finding(f["id"])["pr_id"])["branch"]
+                                       or "")
+        # The PR should be marked ci_paused, not plain open
+        prs = db.recent_prs(1)
+        assert prs[0]["status"] == "ci_paused"

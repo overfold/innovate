@@ -10,6 +10,7 @@ from pathlib import Path
 from .db import DB
 from .git import (
     GitHubAPIError,
+    ci_permits_merge,
     create_audit_worktree,
     create_worktree,
     current_commit,
@@ -22,6 +23,7 @@ from .git import (
     push_branch,
     remove_audit_worktree,
     remove_worktree,
+    wait_for_ci,
 )
 from .phases import (
     REVIEW_APPROVED,
@@ -191,7 +193,49 @@ class Supervisor:
             elif state == "closed":
                 db.update_pr(pr_row["id"], status="closed")
                 db.mark_finding(finding["id"], "open")
-            else:  # open — close and requeue for a clean retry
+            elif pr_row["status"] == "ci_paused":
+                # CI was uncertain last run — re-poll to see if it has resolved.
+                ci_wait = cfg["verify"]["ci_wait_timeout"]
+                allow_no_ci = cfg["verify"]["allow_no_ci"]
+                ci = wait_for_ci(owner, repo_name, pr_number, ci_wait, allow_no_ci)
+                LOG.info(
+                    "  ci_paused PR #%d: CI is now %s",
+                    pr_number, ci,
+                )
+                if ci_permits_merge(ci, allow_no_ci):
+                    try:
+                        gh_merge_pr(owner, repo_name, pr_number)
+                    except Exception as exc:
+                        LOG.warning(
+                            "  Merge of ci_paused PR #%d uncertain: %s"
+                            " — leaving ci_paused for next reconcile",
+                            pr_number, exc,
+                        )
+                        continue
+                    db.update_pr(
+                        pr_row["id"],
+                        status="merged",
+                        merged=datetime.now(timezone.utc).isoformat(),
+                    )
+                    db.mark_finding(finding["id"], "fixed", pr_id=pr_row["id"])
+                    LOG.info(
+                        "  Merged ci_paused PR #%d for finding %d (%s)",
+                        pr_number, finding["id"], finding["title"],
+                    )
+                elif ci == "failure":
+                    try:
+                        gh_close_pr(owner, repo_name, pr_number)
+                    except GitHubAPIError as exc:
+                        LOG.warning(
+                            "  Failed to close ci_paused PR #%d: %s"
+                            " — leaving for next reconcile",
+                            pr_number, exc,
+                        )
+                        continue
+                    db.update_pr(pr_row["id"], status="closed")
+                    db.mark_finding(finding["id"], "open")
+                # else: still uncertain — leave ci_paused for the next run
+            else:  # open (unexpected) — close and requeue for a clean retry
                 try:
                     gh_close_pr(owner, repo_name, pr_number)
                 except GitHubAPIError as exc:
@@ -422,11 +466,12 @@ class Supervisor:
 
             if outcome == REVIEW_CI_UNCERTAIN:
                 # CI returned an ambiguous result (timeout, api_error, no_checks when
-                # not allowed). Do not make code changes; leave the PR open so
-                # startup_reconcile can retry on the next run.
+                # not allowed). Do not make code changes; mark the PR ci_paused so
+                # startup_reconcile can re-poll CI on the next run.
                 LOG.warning(
-                    "  CI result uncertain — leaving PR in_progress for startup_reconcile"
+                    "  CI result uncertain — marking PR ci_paused for startup_reconcile"
                 )
+                db.update_pr(pr_id, status="ci_paused")
                 self.ctr["consecutive_failures"] += 1
                 return False
 

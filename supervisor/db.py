@@ -57,7 +57,9 @@ CREATE TABLE IF NOT EXISTS prs (
     branch        TEXT    NOT NULL,
     pr_number     INTEGER,
     pr_url        TEXT,
-    -- open | deferred | merged | closed | failed
+    -- open | ci_paused | deferred | merged | closed | failed
+    -- 'ci_paused': review approved but CI result was uncertain (timeout/api_error);
+    --              startup_reconcile re-polls CI on next run.
     status        TEXT    NOT NULL DEFAULT 'open',
     created       TEXT    NOT NULL DEFAULT (datetime('now')),
     merged        TEXT,

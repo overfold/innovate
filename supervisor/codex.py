@@ -54,17 +54,6 @@ REVALIDATE_SCHEMA: str = json.dumps({
     "required": ["still_applies", "reason"],
 })
 
-VERIFY_SCHEMA: str = json.dumps({
-    "type": "object",
-    "additionalProperties": False,
-    "properties": {
-        "verdict": {"type": "string", "enum": ["approve", "reject"]},
-        "reason":  {"type": ["string", "null"]},
-        "issues":  {"type": ["array", "null"], "items": {"type": "string"}},
-    },
-    "required": ["verdict", "reason", "issues"],
-})
-
 VALIDATE_SCHEMA: str = json.dumps({
     "type": "object",
     "additionalProperties": False,

@@ -385,7 +385,14 @@ def phase_review_loop(
         ]
 
         if verdict == "approve" and not blocking:
-            # Poll CI before permitting merge.
+            # If the reviewer saw CI failure evidence and still approved, they've
+            # explicitly cleared the failure as unrelated — trust the reviewer and
+            # do not re-poll CI (which would return the same failure again).
+            if ci_evidence is not None:
+                db.update_pr(pr_id, review_rounds=rnd)
+                return REVIEW_APPROVED
+
+            # No prior CI evidence — poll CI before permitting merge.
             ci = wait_for_ci(owner, repo_name, pr_number, ci_timeout, allow_no_ci)
             LOG.info("  CI status: %s", ci)
 
@@ -395,7 +402,16 @@ def phase_review_loop(
 
             if ci == "failure":
                 # Definite CI failure: collect logs and pass to reviewer next round.
-                ci_evidence = gh_get_failed_ci_logs(owner, repo_name, pr_number)
+                logs = gh_get_failed_ci_logs(owner, repo_name, pr_number)
+                if logs is None:
+                    # API failure retrieving CI logs — treat as uncertain state.
+                    LOG.warning(
+                        "  CI failed but log retrieval failed"
+                        " — treating as uncertain infrastructure state"
+                    )
+                    db.update_pr(pr_id, review_rounds=rnd)
+                    return REVIEW_CI_UNCERTAIN
+                ci_evidence = logs
                 LOG.info(
                     "  CI failed — collecting evidence for reviewer"
                     " (%d/%d rounds used, %d remaining)",

@@ -109,8 +109,7 @@ def _validate_config(cfg: dict, config_path: str) -> None:
     happens after all pure configuration checks pass.
 
     Phase 1 — pure config: owner/name, default branch, audit areas, budget,
-    model strings, verify.setup_cmd, and required binaries.  No filesystem
-    side effects.
+    model strings, and required binaries.  No filesystem side effects.
 
     Phase 2 — repository: clone a managed workspace when absent, then verify
     the directory is a git repo whose origin points at owner/name.
@@ -165,12 +164,6 @@ def _validate_config(cfg: dict, config_path: str) -> None:
             errors.append(
                 f"codex.{stage}_model must be a string or unset (got {val!r})"
             )
-
-    setup_cmd = cfg["verify"].get("setup_cmd", "")
-    if not isinstance(setup_cmd, str):
-        errors.append(
-            f"verify.setup_cmd must be a string (got {type(setup_cmd).__name__})"
-        )
 
     for binary, hint in [
         ("git", "Install Git from: https://git-scm.com"),
@@ -365,12 +358,6 @@ def main() -> None:
                     logging.getLogger("supervisor").warning(
                         "Repository has unresolved blocked findings —"
                         " human review required.  Stopping."
-                    )
-                    break
-                if result == "setup_error":
-                    logging.getLogger("supervisor").error(
-                        "Setup command failed — fix verify.setup_cmd before"
-                        " running again.  Stopping."
                     )
                     break
                 time.sleep(5)

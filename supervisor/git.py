@@ -311,12 +311,13 @@ def gh_merge_pr(owner: str, repo_name: str, pr_number: int) -> None:
     )
 
 
-def gh_get_failed_ci_logs(owner: str, repo_name: str, pr_number: int) -> str:
-    """Return log output from the most recent failed CI run for this PR.
+def gh_get_failed_ci_logs(owner: str, repo_name: str, pr_number: int) -> str | None:
+    """Return log output from all failed CI runs for the current PR head.
 
-    Fetches the head commit SHA, finds the most recent failed workflow run for
-    that commit, and returns up to 3 000 characters of --log-failed output.
-    Returns "" on any API error (fail-open: callers must not treat "" as success).
+    Returns None on any API or parse failure (fail-closed: callers must treat
+    None as an infrastructure error, not as an absence of CI evidence).
+    Returns "" if the API call succeeded but no failed runs were found.
+    Returns concatenated log output (up to 6 000 chars total) on success.
     """
     r = subprocess.run(
         [
@@ -327,14 +328,14 @@ def gh_get_failed_ci_logs(owner: str, repo_name: str, pr_number: int) -> str:
         capture_output=True, text=True, check=False,
     )
     if r.returncode != 0:
-        return ""
+        return None
     try:
         data = json.loads(r.stdout)
     except json.JSONDecodeError:
-        return ""
+        return None
     sha = data.get("headRefOid", "")
     if not sha:
-        return ""
+        return None
 
     r = subprocess.run(
         [
@@ -343,34 +344,45 @@ def gh_get_failed_ci_logs(owner: str, repo_name: str, pr_number: int) -> str:
             "--commit", sha,
             "--status", "failure",
             "--json", "databaseId",
-            "--limit", "1",
         ],
         capture_output=True, text=True, check=False,
     )
     if r.returncode != 0:
-        return ""
+        return None
     try:
         runs = json.loads(r.stdout)
     except json.JSONDecodeError:
-        return ""
+        return None
     if not runs:
         return ""
-    run_id = runs[0].get("databaseId")
-    if not run_id:
-        return ""
 
-    r = subprocess.run(
-        [
-            "gh", "run", "view", str(run_id),
-            "--repo", f"{owner}/{repo_name}",
-            "--log-failed",
-        ],
-        capture_output=True, text=True, check=False,
-    )
-    if r.returncode != 0:
-        return ""
-    log = r.stdout
-    return log[-3000:] if len(log) > 3000 else log
+    cap = 6000
+    parts: list[str] = []
+    used = 0
+    for entry in runs:
+        if used >= cap:
+            break
+        run_id = entry.get("databaseId")
+        if not run_id:
+            continue
+        r = subprocess.run(
+            [
+                "gh", "run", "view", str(run_id),
+                "--repo", f"{owner}/{repo_name}",
+                "--log-failed",
+            ],
+            capture_output=True, text=True, check=False,
+        )
+        if r.returncode != 0:
+            continue
+        chunk = f"=== run {run_id} ===\n{r.stdout}"
+        remaining = cap - used
+        if len(chunk) > remaining:
+            chunk = chunk[-remaining:]
+        parts.append(chunk)
+        used += len(chunk)
+
+    return "\n".join(parts) if parts else ""
 
 
 def wait_for_ci(
