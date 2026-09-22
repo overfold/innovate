@@ -10,7 +10,6 @@ from pathlib import Path
 from .db import DB
 from .git import (
     GitHubAPIError,
-    ci_permits_merge,
     create_audit_worktree,
     create_worktree,
     current_commit,
@@ -23,10 +22,10 @@ from .git import (
     push_branch,
     remove_audit_worktree,
     remove_worktree,
-    wait_for_ci,
 )
 from .phases import (
     REVIEW_APPROVED,
+    REVIEW_CI_UNCERTAIN,
     REVIEW_DEFERRED_BUDGET,
     REVIEW_FAILED_ERROR,
     REVIEW_PAUSED_BUDGET,
@@ -35,19 +34,9 @@ from .phases import (
     phase_revalidate,
     phase_review_loop,
     phase_validate,
-    phase_verify,
-    run_setup,
 )
 
 LOG = logging.getLogger("supervisor")
-
-
-class WorktreeSetupError(Exception):
-    """Raised when setup_cmd fails in a repair worktree.
-
-    Signals an infrastructure failure: the run is aborted but the finding
-    is requeued without penalty and its repair-attempt count is not incremented.
-    """
 
 
 class Supervisor:
@@ -216,7 +205,7 @@ class Supervisor:
                 db.mark_finding(finding["id"], "open")
 
     def _fix_finding(self, finding: sqlite3.Row, current_head: str) -> bool:
-        """Full repair→verify→PR→review→CI→merge cycle for one finding.
+        """Full repair→PR→review→CI→merge cycle for one finding.
 
         Uses a disposable git worktree so the main checkout is never touched
         and a crash can never leave the repo dirty.
@@ -257,17 +246,6 @@ class Supervisor:
                     "base_sha": current_head,  # pins verify_diff / review diffs
                 },
             }
-
-            # Run setup command in the worktree before any Codex calls.
-            # A non-zero exit is an infrastructure failure: requeue the finding
-            # without penalty and abort the run.
-            if not run_setup(wt_cfg, wt_path):
-                LOG.error(
-                    "  Setup command failed — aborting run"
-                    " (finding requeued, repair count unchanged)"
-                )
-                db.mark_finding(f["id"], "open")
-                raise WorktreeSetupError("setup_cmd failed in worktree")
 
             # Revalidate if HEAD has moved since the finding was recorded.
             # Runs inside the worktree so it sees the exact audited commit.
@@ -361,13 +339,6 @@ class Supervisor:
                     db.mark_finding(f["id"], "open")
                 return False
 
-            # Verify.
-            if not phase_verify(wt_cfg, [f], self.ctr):
-                LOG.warning("  Verify rejected — discarding worktree")
-                db.mark_finding(f["id"], "open")
-                self.ctr["consecutive_failures"] += 1
-                return False
-
             # Push branch — recorded in DB before gh pr create so reconcile
             # can find this PR if we crash between push and DB update.
             try:
@@ -395,8 +366,8 @@ class Supervisor:
 
             db.update_pr(pr_id, pr_number=pr_number, pr_url=pr_url)
 
-            # Review loop.
-            outcome = phase_review_loop(wt_cfg, db, pr_id, [f], branch, self.ctr)
+            # Review loop (includes CI polling; REVIEW_APPROVED means CI passed).
+            outcome = phase_review_loop(wt_cfg, db, pr_id, pr_number, [f], branch, self.ctr)
 
             if outcome == REVIEW_FAILED_ERROR:
                 LOG.error("  Review loop failed — closing PR and re-queuing finding")
@@ -449,47 +420,17 @@ class Supervisor:
                 )
                 return False
 
-            # outcome == REVIEW_APPROVED — check CI then merge.
-            allow_no_ci = cfg["verify"]["allow_no_ci"]
-            ci = wait_for_ci(
-                owner, repo_name, pr_number,
-                cfg["verify"]["ci_wait_timeout"],
-                allow_no_ci,
-            )
-            LOG.info("  CI status: %s", ci)
-
-            if not ci_permits_merge(ci, allow_no_ci):
-                if ci in ("failure",):
-                    # Definite CI failure: close the PR so it can't be merged
-                    # accidentally, then requeue the finding for a fresh attempt.
-                    LOG.error(
-                        "  CI failed — closing PR #%d and re-queuing finding",
-                        pr_number,
-                    )
-                    try:
-                        gh_close_pr(owner, repo_name, pr_number)
-                    except GitHubAPIError as exc:
-                        LOG.error(
-                            "  Failed to close PR #%d: %s"
-                            " — leaving in_progress for startup_reconcile",
-                            pr_number, exc,
-                        )
-                        self.ctr["consecutive_failures"] += 1
-                        return False
-                    db.update_pr(pr_id, status="closed")
-                    db.mark_finding(f["id"], "open")
-                    self.ctr["consecutive_failures"] += 1
-                else:
-                    # Uncertain outcome (timeout, api_error): leave in_progress
-                    # so startup_reconcile can retry safely on the next run.
-                    LOG.error(
-                        "  CI result '%s' is uncertain (allow_no_ci=%s)"
-                        " — leaving in_progress for startup_reconcile",
-                        ci, allow_no_ci,
-                    )
-                    self.ctr["consecutive_failures"] += 1
+            if outcome == REVIEW_CI_UNCERTAIN:
+                # CI returned an ambiguous result (timeout, api_error, no_checks when
+                # not allowed). Do not make code changes; leave the PR open so
+                # startup_reconcile can retry on the next run.
+                LOG.warning(
+                    "  CI result uncertain — leaving PR in_progress for startup_reconcile"
+                )
+                self.ctr["consecutive_failures"] += 1
                 return False
 
+            # outcome == REVIEW_APPROVED — CI already passed inside phase_review_loop.
             # Freshness gate: reject if the base branch has advanced since we
             # audited (the patch was never tested against the new commits).
             try:
@@ -554,19 +495,14 @@ class Supervisor:
         """Attempt to fix each finding in priority order.
 
         Returns:
-          'merged'      — one fix was merged; caller should restart at a fresh HEAD
-          'budget'      — a budget limit was reached
-          'setup_error' — setup_cmd failed in a repair worktree
-          'done'        — all findings processed, no merge occurred
+          'merged' — one fix was merged; caller should restart at a fresh HEAD
+          'budget' — a budget limit was reached
+          'done'   — all findings processed, no merge occurred
         """
         for finding in findings:
             if self._over_budget():
                 return "budget"
-            try:
-                result = self._fix_finding(finding, head)
-            except WorktreeSetupError:
-                return "setup_error"
-            if result:
+            if self._fix_finding(finding, head):
                 return "merged"
         return "done"
 
@@ -628,11 +564,10 @@ class Supervisor:
         and revalidations see the merged code.
 
         Returns one of:
-          'exhausted'   — all areas clean, no blocked findings
-          'blocked'     — all areas clean, but unresolved blocked findings remain
-          'budget'      — stopped early because a budget limit was reached
-          'setup_error' — setup_cmd failed; run aborted, finding requeued without penalty
-          'done'        — progress made (fixes applied or new findings) but not exhausted
+          'exhausted' — all areas clean, no blocked findings
+          'blocked'   — all areas clean, but unresolved blocked findings remain
+          'budget'    — stopped early because a budget limit was reached
+          'done'      — progress made (fixes applied or new findings) but not exhausted
         """
         # Reset per-run counters so run-continuous can't permanently wedge.
         self.ctr["codex_calls"] = 0
@@ -701,7 +636,7 @@ class Supervisor:
                     outcome = self._fix_queue(
                         self.db.open_findings(area["name"]), head
                     )
-                    if outcome in ("budget", "setup_error"):
+                    if outcome == "budget":
                         return outcome
                     if outcome == "merged":
                         merged_this_pass = True
@@ -749,8 +684,7 @@ class Supervisor:
 
         Fetches origin/<default_branch> HEAD, loads actionable findings from
         the DB in priority order, and drives each through the full repair
-        lifecycle (revalidate → validate → repair → verify → PR → review →
-        CI → merge).
+        lifecycle (revalidate → validate → repair → PR → review → CI → merge).
 
         After a successful merge the HEAD is refreshed and remaining findings
         are revalidated against the new code.  Stale blocked findings are
@@ -761,9 +695,8 @@ class Supervisor:
         command processes what is already known.
 
         Returns one of:
-          'done'        — all queued findings processed (some may still be open)
-          'budget'      — stopped early because a budget limit was reached
-          'setup_error' — setup_cmd failed; finding requeued without penalty
+          'done'   — all queued findings processed (some may still be open)
+          'budget' — stopped early because a budget limit was reached
         """
         self.ctr["codex_calls"] = 0
         self.ctr["fixes_applied"] = 0
@@ -809,7 +742,7 @@ class Supervisor:
 
                 findings = self.db.open_findings()
                 outcome = self._fix_queue(findings, head)
-                if outcome in ("budget", "setup_error"):
+                if outcome == "budget":
                     return outcome
                 merged_this_pass = (outcome == "merged")
 

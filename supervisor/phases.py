@@ -1,8 +1,6 @@
 from __future__ import annotations
 
 import logging
-import subprocess
-from datetime import datetime, timezone
 from pathlib import Path
 
 from .codex import (
@@ -10,7 +8,6 @@ from .codex import (
     REVALIDATE_SCHEMA,
     REVIEW_SCHEMA,
     VALIDATE_SCHEMA,
-    VERIFY_SCHEMA,
     CodexError,
     parse_json,
     run_codex,
@@ -18,23 +15,26 @@ from .codex import (
 from .db import DB, _fingerprint
 from .git import (
     _git,
+    ci_permits_merge,
     current_commit,
     full_diff,
+    gh_get_failed_ci_logs,
     push_branch,
+    wait_for_ci,
 )
 from .prompts import (
     AUDIT_PROMPT,
     IMPLEMENT_REVIEW_PROMPT,
     REPAIR_PROMPT,
     REVALIDATE_PROMPT,
+    REVIEW_CI_PROMPT,
     REVIEW_PROMPT,
     VALIDATE_PROMPT,
-    VERIFY_PROMPT,
 )
 
 LOG = logging.getLogger("supervisor")
 
-_STAGES = ("audit", "revalidate", "validate", "repair", "verify", "review")
+_STAGES = ("audit", "revalidate", "validate", "repair", "review")
 
 
 def model_for_stage(cfg: dict, stage: str) -> str:
@@ -61,162 +61,7 @@ REVIEW_APPROVED        = "approved"
 REVIEW_FAILED_ERROR    = "failed_error"    # Codex call failed or parse error
 REVIEW_PAUSED_BUDGET   = "paused_budget"   # Review rounds exhausted (blocked)
 REVIEW_DEFERRED_BUDGET = "deferred_budget" # Per-run Codex budget hit; resume next run
-
-
-# ── Shared verify helpers ──────────────────────────────────────────────────────
-
-def run_tests(cfg: dict) -> bool:
-    """Run the configured test command.  Returns True if it passes (or not set)."""
-    test_cmd = cfg["verify"]["test_cmd"]
-    if not test_cmd:
-        return True
-    repo = Path(cfg["repo"]["path"]).resolve()
-    LOG.info("  Running: %s", test_cmd)
-    r = subprocess.run(
-        test_cmd, shell=True, cwd=str(repo), capture_output=True, text=True
-    )
-    if r.returncode != 0:
-        LOG.error("  Tests failed:\n%s", (r.stdout + r.stderr)[-1200:])
-    return r.returncode == 0
-
-
-def _git_head(wt_path: Path) -> str | None:
-    """Return the current HEAD SHA for *wt_path*, or None if git fails."""
-    r = subprocess.run(
-        ["git", "rev-parse", "HEAD"],
-        cwd=str(wt_path), capture_output=True, text=True, check=False,
-    )
-    return r.stdout.strip() if r.returncode == 0 else None
-
-
-def run_setup(cfg: dict, wt_path: Path) -> bool:
-    """Run the configured setup command inside the worktree.
-
-    Returns True immediately when setup_cmd is empty.
-    Returns False (and logs the reason) if any of the following hold:
-    - the command exits non-zero;
-    - HEAD cannot be read before or after setup, or changes during setup
-      (e.g. setup accidentally commits or checks out another commit);
-    - the working tree is dirty afterwards (modified tracked files or new
-      untracked non-ignored files that git add -A would stage).
-
-    Gitignored paths (caches, installed packages, build artifacts) are
-    explicitly exempt from the working-tree check.
-
-    Invariant enforced:
-        HEAD == HEAD_before_setup  AND  git status --porcelain == ""
-    """
-    setup_cmd = cfg["verify"].get("setup_cmd", "")
-    if not setup_cmd:
-        return True
-
-    head_before = _git_head(wt_path)
-    if head_before is None:
-        LOG.error("  Cannot read HEAD before setup — aborting (fail-closed)")
-        return False
-
-    LOG.info("  Running setup: %s", setup_cmd)
-    r = subprocess.run(
-        setup_cmd, shell=True, cwd=str(wt_path), capture_output=True, text=True
-    )
-    if r.returncode != 0:
-        LOG.error(
-            "  Setup command failed (exit %d):\n%s",
-            r.returncode,
-            (r.stdout + r.stderr)[-2000:],
-        )
-        return False
-
-    # Verify HEAD is unchanged — a setup-created commit would silently become
-    # part of the repair branch history and bypass all contamination checks.
-    head_after = _git_head(wt_path)
-    if head_after is None:
-        LOG.error(
-            "  Cannot read HEAD after setup — worktree may be damaged (fail-closed)"
-        )
-        return False
-    if head_after != head_before:
-        LOG.error(
-            "  Setup command changed HEAD from %s to %s —"
-            " aborting to prevent branch contamination",
-            head_before[:12], head_after[:12],
-        )
-        return False
-
-    # Guard against setup polluting the repair patch: git add -A will stage any
-    # modified tracked file or new untracked non-ignored file, so the worktree
-    # must be clean (gitignored paths are exempt and do not appear here).
-    # Fail-closed: if git status itself fails (e.g. damaged worktree metadata),
-    # we cannot verify cleanliness and must not proceed.
-    status_r = subprocess.run(
-        ["git", "status", "--porcelain"],
-        cwd=str(wt_path), capture_output=True, text=True, check=False,
-    )
-    if status_r.returncode != 0:
-        LOG.error(
-            "  'git status' failed after setup — cannot verify worktree cleanliness"
-            " (exit %d):\n%s",
-            status_r.returncode,
-            status_r.stderr[:1000],
-        )
-        return False
-    if status_r.stdout.strip():
-        LOG.error(
-            "  Setup command left the worktree dirty —"
-            " aborting to prevent patch contamination"
-            " (add these paths to .gitignore if they are build artifacts):\n%s",
-            status_r.stdout[:1000],
-        )
-        return False
-    return True
-
-
-def verify_diff(cfg: dict, findings: list, ctr: dict) -> bool:
-    """Codex diff-review of all changes relative to the audited base SHA.
-
-    Uses cfg["repo"]["base_sha"] when set (the exact SHA audited this run)
-    so the diff is pinned to the same commit the finding was found at, not a
-    potentially-stale local branch ref.  Falls back to default_branch for
-    contexts that do not set base_sha (e.g. manual phase_verify calls).
-
-    Fail-closed: any Codex error or parse failure returns False.
-    The default verdict when the field is absent is 'reject', not 'approve'.
-    """
-    repo = Path(cfg["repo"]["path"]).resolve()
-    base = cfg["repo"].get("base_sha") or cfg["repo"]["default_branch"]
-    diff = full_diff(repo, base)
-    if not diff.strip():
-        LOG.error("  Diff is empty — nothing to verify")
-        return False
-
-    prompt = VERIFY_PROMPT.format(
-        title=findings[0]["title"],
-        description="\n".join(f["description"] for f in findings),
-        base=base,
-    )
-    try:
-        output = _invoke_codex(
-            cfg, ctr, prompt, repo,
-            flags=cfg["codex"]["audit_flags"],
-            cmd=cfg["codex"]["cmd"],
-            model=model_for_stage(cfg, "verify"),
-            timeout=cfg["codex"]["timeout"],
-            output_schema=VERIFY_SCHEMA,
-        )
-        result = parse_json(output)
-    except (CodexError, ValueError) as exc:
-        LOG.error(
-            "  Diff verification failed: %s — treating as rejected (fail-closed)", exc
-        )
-        return False
-
-    verdict = result.get("verdict", "reject")  # safe default: reject
-    LOG.info("  Verify verdict: %s — %s", verdict, result.get("reason", ""))
-    if verdict != "approve":
-        for issue in result.get("issues", []):
-            LOG.warning("    Issue: %s", issue)
-        return False
-    return True
+REVIEW_CI_UNCERTAIN    = "ci_uncertain"    # CI state unknown; leave PR for startup_reconcile
 
 
 # ── Lifecycle phases ───────────────────────────────────────────────────────────
@@ -445,38 +290,49 @@ def phase_repair(cfg: dict, db: DB, findings: list, ctr: dict) -> bool:
     return True
 
 
-def phase_verify(cfg: dict, findings: list, ctr: dict) -> bool:
-    """Run test suite + Codex diff-review.  Fail-closed on any error."""
-    return run_tests(cfg) and verify_diff(cfg, findings, ctr)
-
-
 def phase_review_loop(
     cfg: dict,
     db: DB,
     pr_id: int,
+    pr_number: int,
     findings: list,
     branch: str,
     ctr: dict,
 ) -> str:
-    """Review the PR with Codex, implement blocking feedback, re-verify, repeat.
+    """Review the PR, implement feedback, poll CI, and repeat within max_review_rounds.
 
     Full loop per round:
-        review → implement feedback → tests → diff-verify → push → review again
+        review → [implement blocking feedback → push →] poll CI
+        → CI passes: REVIEW_APPROVED
+        → CI fails:  collect logs → loop back with CI evidence (next round)
+        → CI uncertain: REVIEW_CI_UNCERTAIN
 
-    Returns REVIEW_APPROVED, REVIEW_FAILED_ERROR, or REVIEW_PAUSED_BUDGET.
+    CI-driven code changes always receive a fresh review before CI is polled again.
+    All review passes (code review and CI-triggered) share the max_review_rounds budget.
 
-    REVIEW_PAUSED_BUDGET means rounds were exhausted without approval; the PR
-    is left open for human inspection.
-    REVIEW_FAILED_ERROR means a Codex call failed; the caller should close the
-    PR and re-queue the finding.
+    Returns one of REVIEW_APPROVED, REVIEW_FAILED_ERROR, REVIEW_PAUSED_BUDGET,
+    REVIEW_DEFERRED_BUDGET, or REVIEW_CI_UNCERTAIN.
+
+    REVIEW_PAUSED_BUDGET means rounds were exhausted without merge; the PR is
+    left open and the caller marks the finding blocked.
+    REVIEW_FAILED_ERROR means a Codex call or parse failed; caller should close
+    the PR and re-queue the finding.
+    REVIEW_CI_UNCERTAIN means CI returned an ambiguous result; the PR is left
+    in_progress for startup_reconcile to retry on the next run.
     """
     repo = Path(cfg["repo"]["path"]).resolve()
     base = cfg["repo"].get("base_sha") or cfg["repo"]["default_branch"]
+    owner = cfg["repo"]["owner"]
+    repo_name = cfg["repo"]["name"]
     max_rounds = cfg["budget"]["max_review_rounds"]
+    ci_timeout = cfg["verify"]["ci_wait_timeout"]
+    allow_no_ci = cfg["verify"]["allow_no_ci"]
     finding_titles = "; ".join(f["title"] for f in findings)
     pr_title = f"maint: {finding_titles[:60]}"
-
     codex_budget = cfg["budget"]["codex_call_budget"]
+
+    # Log output from a prior failed CI run, supplied to the reviewer next round.
+    ci_evidence: str | None = None
 
     for rnd in range(1, max_rounds + 1):
         LOG.info("  Review round %d/%d", rnd, max_rounds)
@@ -490,11 +346,20 @@ def phase_review_loop(
             return REVIEW_DEFERRED_BUDGET
 
         diff = full_diff(repo, base)
-        prompt = REVIEW_PROMPT.format(
-            pr_title=pr_title,
-            finding_titles=finding_titles,
-            base=base,
-        )
+        if ci_evidence is not None:
+            prompt = REVIEW_CI_PROMPT.format(
+                pr_title=pr_title,
+                finding_titles=finding_titles,
+                base=base,
+                ci_logs=ci_evidence,
+            )
+        else:
+            prompt = REVIEW_PROMPT.format(
+                pr_title=pr_title,
+                finding_titles=finding_titles,
+                base=base,
+            )
+
         try:
             output = _invoke_codex(
                 cfg, ctr, prompt, repo,
@@ -520,8 +385,32 @@ def phase_review_loop(
         ]
 
         if verdict == "approve" and not blocking:
+            # Poll CI before permitting merge.
+            ci = wait_for_ci(owner, repo_name, pr_number, ci_timeout, allow_no_ci)
+            LOG.info("  CI status: %s", ci)
+
+            if ci_permits_merge(ci, allow_no_ci):
+                db.update_pr(pr_id, review_rounds=rnd)
+                return REVIEW_APPROVED
+
+            if ci == "failure":
+                # Definite CI failure: collect logs and pass to reviewer next round.
+                ci_evidence = gh_get_failed_ci_logs(owner, repo_name, pr_number)
+                LOG.info(
+                    "  CI failed — collecting evidence for reviewer"
+                    " (%d/%d rounds used, %d remaining)",
+                    rnd, max_rounds, max_rounds - rnd,
+                )
+                continue  # advance rnd, reviewer sees ci_evidence next iteration
+
+            # Uncertain CI (timeout, api_error, no_checks when not allowed):
+            # do not make code changes; preserve the PR for startup_reconcile.
+            LOG.warning(
+                "  CI status %r is uncertain — leaving PR open for startup_reconcile",
+                ci,
+            )
             db.update_pr(pr_id, review_rounds=rnd)
-            return REVIEW_APPROVED
+            return REVIEW_CI_UNCERTAIN
 
         if not blocking:
             # request_changes with no blocking comments is an inconsistent
@@ -576,17 +465,10 @@ def phase_review_loop(
         _git(repo, "add", "-A")
         _git(repo, "commit", "-m", commit_msg)
 
-        if not run_tests(cfg):
-            LOG.error("  Tests failed after applying review feedback")
-            db.update_pr(pr_id, review_rounds=rnd)
-            return REVIEW_FAILED_ERROR
-
-        if not verify_diff(cfg, findings, ctr):
-            LOG.error("  Diff verification rejected after applying review feedback")
-            db.update_pr(pr_id, review_rounds=rnd)
-            return REVIEW_FAILED_ERROR
-
         push_branch(repo, branch)
+
+        # Clear CI evidence: the new push starts a fresh CI run.
+        ci_evidence = None
 
     db.update_pr(pr_id, review_rounds=max_rounds)
     LOG.warning("  Review round budget (%d) exhausted without approval", max_rounds)

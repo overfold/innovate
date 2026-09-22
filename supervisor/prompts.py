@@ -142,6 +142,46 @@ entry with "severity": "blocking".  If verdict is "approve", comments must be
 an empty list.
 """
 
+REVIEW_CI_PROMPT = """\
+Review this pull request as part of an automated maintenance workflow.
+
+PR title: {pr_title}
+Fixing:   {finding_titles}
+
+Run `git diff {base}` in the repository to inspect the complete set of changes.
+
+The most recent CI run failed. Determine whether the failure was caused by
+changes in this diff. If yes, provide blocking review comments explaining what
+must be fixed. If the failure is pre-existing or unrelated to this diff, approve
+the change as you normally would.
+
+CI failure log:
+```
+{ci_logs}
+```
+
+Check for: correctness of the fix, unintended regressions, scope creep
+(changes beyond the stated intent), missing test coverage, remaining
+instances of the same problem.
+
+Return ONLY a JSON object:
+{{
+  "verdict":  "approve|request_changes",
+  "summary":  "<one sentence overall assessment>",
+  "comments": [
+    {{
+      "severity":    "blocking|optional",
+      "file":        "<path or null>",
+      "description": "<what needs to change and why>"
+    }}
+  ]
+}}
+
+Rules: if verdict is "request_changes", comments MUST contain at least one
+entry with "severity": "blocking".  If verdict is "approve", comments must be
+an empty list.
+"""
+
 IMPLEMENT_REVIEW_PROMPT = """\
 Implement the following blocking review comments on this repository.
 Address only these specific comments; do not make any other changes.

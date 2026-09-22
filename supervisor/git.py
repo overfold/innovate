@@ -311,6 +311,68 @@ def gh_merge_pr(owner: str, repo_name: str, pr_number: int) -> None:
     )
 
 
+def gh_get_failed_ci_logs(owner: str, repo_name: str, pr_number: int) -> str:
+    """Return log output from the most recent failed CI run for this PR.
+
+    Fetches the head commit SHA, finds the most recent failed workflow run for
+    that commit, and returns up to 3 000 characters of --log-failed output.
+    Returns "" on any API error (fail-open: callers must not treat "" as success).
+    """
+    r = subprocess.run(
+        [
+            "gh", "pr", "view", str(pr_number),
+            "--repo", f"{owner}/{repo_name}",
+            "--json", "headRefOid",
+        ],
+        capture_output=True, text=True, check=False,
+    )
+    if r.returncode != 0:
+        return ""
+    try:
+        data = json.loads(r.stdout)
+    except json.JSONDecodeError:
+        return ""
+    sha = data.get("headRefOid", "")
+    if not sha:
+        return ""
+
+    r = subprocess.run(
+        [
+            "gh", "run", "list",
+            "--repo", f"{owner}/{repo_name}",
+            "--commit", sha,
+            "--status", "failure",
+            "--json", "databaseId",
+            "--limit", "1",
+        ],
+        capture_output=True, text=True, check=False,
+    )
+    if r.returncode != 0:
+        return ""
+    try:
+        runs = json.loads(r.stdout)
+    except json.JSONDecodeError:
+        return ""
+    if not runs:
+        return ""
+    run_id = runs[0].get("databaseId")
+    if not run_id:
+        return ""
+
+    r = subprocess.run(
+        [
+            "gh", "run", "view", str(run_id),
+            "--repo", f"{owner}/{repo_name}",
+            "--log-failed",
+        ],
+        capture_output=True, text=True, check=False,
+    )
+    if r.returncode != 0:
+        return ""
+    log = r.stdout
+    return log[-3000:] if len(log) > 3000 else log
+
+
 def wait_for_ci(
     owner: str,
     repo_name: str,

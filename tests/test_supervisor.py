@@ -16,6 +16,7 @@ from supervisor.db import DB
 from supervisor.git import GitHubAPIError
 from supervisor.phases import (
     REVIEW_APPROVED,
+    REVIEW_CI_UNCERTAIN,
     REVIEW_DEFERRED_BUDGET,
     REVIEW_FAILED_ERROR,
     REVIEW_PAUSED_BUDGET,
@@ -326,13 +327,11 @@ class TestFixFinding:
              patch(f"{RUNNER_MODULE}.remove_worktree") as rm_wt, \
              patch(f"{RUNNER_MODULE}.phase_validate", return_value="valid"), \
              patch(f"{RUNNER_MODULE}.phase_repair", return_value=True), \
-             patch(f"{RUNNER_MODULE}.phase_verify", return_value=True), \
              patch(f"{RUNNER_MODULE}.push_branch"), \
              patch(f"{RUNNER_MODULE}.gh_create_pr",
                    return_value=(42, "https://gh/42")), \
              patch(f"{RUNNER_MODULE}.phase_review_loop",
                    return_value=REVIEW_APPROVED), \
-             patch(f"{RUNNER_MODULE}.wait_for_ci", return_value="no_checks"), \
              patch(f"{RUNNER_MODULE}.gh_pr_base_sha", return_value="abc1234"), \
              patch(f"{RUNNER_MODULE}.gh_merge_pr"):
 
@@ -356,102 +355,6 @@ class TestFixFinding:
         assert result is False
         rm_wt.assert_called_once()  # cleanup still runs
 
-    def test_worktree_removed_on_verify_failure(self, tmp_path):
-        sup, db, f, wt = self._setup(tmp_path)
-
-        with patch(f"{RUNNER_MODULE}.create_worktree", return_value=wt), \
-             patch(f"{RUNNER_MODULE}.remove_worktree") as rm_wt, \
-             patch(f"{RUNNER_MODULE}.phase_validate", return_value="valid"), \
-             patch(f"{RUNNER_MODULE}.phase_repair", return_value=True), \
-             patch(f"{RUNNER_MODULE}.phase_verify", return_value=False):
-
-            result = sup._fix_finding(db.get_finding(f["id"]), "abc1234")
-
-        assert result is False
-        rm_wt.assert_called_once()
-        assert db.get_finding(f["id"])["status"] == "open"
-
-    def test_setup_failure_raises_and_requeues_without_penalty(self, tmp_path):
-        """setup_cmd failure: finding requeued as open, repair count unchanged, run aborted."""
-        from supervisor.runner import WorktreeSetupError
-        sup, db, f, wt = self._setup(tmp_path)
-        initial_attempts = db.get_finding(f["id"])["repair_attempts"]
-
-        with patch(f"{RUNNER_MODULE}.create_worktree", return_value=wt), \
-             patch(f"{RUNNER_MODULE}.remove_worktree") as rm_wt, \
-             patch(f"{RUNNER_MODULE}.run_setup", return_value=False):
-
-            with pytest.raises(WorktreeSetupError):
-                sup._fix_finding(db.get_finding(f["id"]), "abc1234")
-
-        assert db.get_finding(f["id"])["status"] == "open"
-        assert db.get_finding(f["id"])["repair_attempts"] == initial_attempts
-        assert sup.ctr["consecutive_failures"] == 0
-        rm_wt.assert_called_once()
-
-    def test_setup_success_proceeds_to_validate(self, tmp_path):
-        """When setup_cmd succeeds, the fix cycle continues normally."""
-        sup, db, f, wt = self._setup(tmp_path)
-
-        with patch(f"{RUNNER_MODULE}.create_worktree", return_value=wt), \
-             patch(f"{RUNNER_MODULE}.remove_worktree"), \
-             patch(f"{RUNNER_MODULE}.run_setup", return_value=True), \
-             patch(f"{RUNNER_MODULE}.phase_validate", return_value="valid"), \
-             patch(f"{RUNNER_MODULE}.phase_repair", return_value=False):
-
-            result = sup._fix_finding(db.get_finding(f["id"]), "abc1234")
-
-        assert result is False  # repair failed, but setup didn't block it
-
-    def test_repair_success_then_verify_fail_increments_failures(self, tmp_path):
-        """repair succeeds → verify fails: consecutive_failures must still increment."""
-        sup, db, f, wt = self._setup(tmp_path)
-
-        with patch(f"{RUNNER_MODULE}.create_worktree", return_value=wt), \
-             patch(f"{RUNNER_MODULE}.remove_worktree"), \
-             patch(f"{RUNNER_MODULE}.phase_validate", return_value="valid"), \
-             patch(f"{RUNNER_MODULE}.phase_repair", return_value=True), \
-             patch(f"{RUNNER_MODULE}.phase_verify", return_value=False):
-
-            result = sup._fix_finding(db.get_finding(f["id"]), "abc1234")
-
-        assert result is False
-        assert sup.ctr["consecutive_failures"] == 1
-
-    def test_repeated_repair_succeeds_verify_fails_trips_budget(self, tmp_path):
-        """Repeated repair-succeeds→verify-fails must trip max_consecutive_failures."""
-        db = _db()
-        cfg = _cfg()
-        cfg["budget"]["max_consecutive_failures"] = 3
-        sup = Supervisor(cfg, db)
-        wt = _make_fake_wt(tmp_path)
-
-        for _ in range(3):
-            f = _open_finding(db, title=f"bug {_}")
-
-        findings = db.open_findings()
-        assert len(findings) == 3
-
-        with patch(f"{RUNNER_MODULE}.create_worktree", return_value=wt), \
-             patch(f"{RUNNER_MODULE}.remove_worktree"), \
-             patch(f"{RUNNER_MODULE}.phase_validate", return_value="valid"), \
-             patch(f"{RUNNER_MODULE}.phase_repair", return_value=True), \
-             patch(f"{RUNNER_MODULE}.phase_verify", return_value=False):
-
-            # First two attempts: consecutive_failures 0→1→2, under budget.
-            sup._fix_finding(db.get_finding(findings[0]["id"]), "abc1234")
-            assert sup.ctr["consecutive_failures"] == 1
-            assert not sup._over_budget()
-
-            sup._fix_finding(db.get_finding(findings[1]["id"]), "abc1234")
-            assert sup.ctr["consecutive_failures"] == 2
-            assert not sup._over_budget()
-
-            # Third attempt trips the limit.
-            sup._fix_finding(db.get_finding(findings[2]["id"]), "abc1234")
-            assert sup.ctr["consecutive_failures"] == 3
-            assert sup._over_budget()
-
     def test_pr_record_created_before_push(self, tmp_path):
         """DB PR record (with branch) must exist before push_branch is called."""
         sup, db, f, wt = self._setup(tmp_path)
@@ -465,14 +368,12 @@ class TestFixFinding:
              patch(f"{RUNNER_MODULE}.remove_worktree"), \
              patch(f"{RUNNER_MODULE}.phase_validate", return_value="valid"), \
              patch(f"{RUNNER_MODULE}.phase_repair", return_value=True), \
-             patch(f"{RUNNER_MODULE}.phase_verify", return_value=True), \
              patch(f"{RUNNER_MODULE}.push_branch",
                    side_effect=check_pr_exists_before_push), \
              patch(f"{RUNNER_MODULE}.gh_create_pr",
                    return_value=(1, "https://gh/1")), \
              patch(f"{RUNNER_MODULE}.phase_review_loop",
                    return_value=REVIEW_APPROVED), \
-             patch(f"{RUNNER_MODULE}.wait_for_ci", return_value="no_checks"), \
              patch(f"{RUNNER_MODULE}.gh_pr_base_sha", return_value="abc1234"), \
              patch(f"{RUNNER_MODULE}.gh_merge_pr"):
 
@@ -487,7 +388,6 @@ class TestFixFinding:
              patch(f"{RUNNER_MODULE}.remove_worktree"), \
              patch(f"{RUNNER_MODULE}.phase_validate", return_value="valid"), \
              patch(f"{RUNNER_MODULE}.phase_repair", return_value=True), \
-             patch(f"{RUNNER_MODULE}.phase_verify", return_value=True), \
              patch(f"{RUNNER_MODULE}.push_branch",
                    side_effect=RuntimeError("network error")):
 
@@ -504,7 +404,6 @@ class TestFixFinding:
              patch(f"{RUNNER_MODULE}.remove_worktree"), \
              patch(f"{RUNNER_MODULE}.phase_validate", return_value="valid"), \
              patch(f"{RUNNER_MODULE}.phase_repair", return_value=True), \
-             patch(f"{RUNNER_MODULE}.phase_verify", return_value=True), \
              patch(f"{RUNNER_MODULE}.push_branch"), \
              patch(f"{RUNNER_MODULE}.gh_create_pr",
                    side_effect=Exception("gh error")):
@@ -524,13 +423,11 @@ class TestFixFinding:
              patch(f"{RUNNER_MODULE}.remove_worktree"), \
              patch(f"{RUNNER_MODULE}.phase_validate", return_value="valid"), \
              patch(f"{RUNNER_MODULE}.phase_repair", return_value=True), \
-             patch(f"{RUNNER_MODULE}.phase_verify", return_value=True), \
              patch(f"{RUNNER_MODULE}.push_branch"), \
              patch(f"{RUNNER_MODULE}.gh_create_pr",
                    side_effect=lambda *a, **kw: calls.append(kw) or (1, "u")), \
              patch(f"{RUNNER_MODULE}.phase_review_loop",
                    return_value=REVIEW_APPROVED), \
-             patch(f"{RUNNER_MODULE}.wait_for_ci", return_value="no_checks"), \
              patch(f"{RUNNER_MODULE}.gh_pr_base_sha", return_value="abc1234"), \
              patch(f"{RUNNER_MODULE}.gh_merge_pr"):
 
@@ -545,7 +442,6 @@ class TestFixFinding:
              patch(f"{RUNNER_MODULE}.remove_worktree"), \
              patch(f"{RUNNER_MODULE}.phase_validate", return_value="valid"), \
              patch(f"{RUNNER_MODULE}.phase_repair", return_value=True), \
-             patch(f"{RUNNER_MODULE}.phase_verify", return_value=True), \
              patch(f"{RUNNER_MODULE}.push_branch"), \
              patch(f"{RUNNER_MODULE}.gh_create_pr",
                    return_value=(10, "https://gh/10")), \
@@ -567,7 +463,6 @@ class TestFixFinding:
              patch(f"{RUNNER_MODULE}.remove_worktree"), \
              patch(f"{RUNNER_MODULE}.phase_validate", return_value="valid"), \
              patch(f"{RUNNER_MODULE}.phase_repair", return_value=True), \
-             patch(f"{RUNNER_MODULE}.phase_verify", return_value=True), \
              patch(f"{RUNNER_MODULE}.push_branch"), \
              patch(f"{RUNNER_MODULE}.gh_create_pr",
                    return_value=(11, "https://gh/11")), \
@@ -589,7 +484,6 @@ class TestFixFinding:
              patch(f"{RUNNER_MODULE}.remove_worktree"), \
              patch(f"{RUNNER_MODULE}.phase_validate", return_value="valid"), \
              patch(f"{RUNNER_MODULE}.phase_repair", return_value=True), \
-             patch(f"{RUNNER_MODULE}.phase_verify", return_value=True), \
              patch(f"{RUNNER_MODULE}.push_branch"), \
              patch(f"{RUNNER_MODULE}.gh_create_pr",
                    return_value=(12, "https://gh/12")), \
@@ -604,66 +498,19 @@ class TestFixFinding:
         # Blocked should NOT be retried
         assert db.open_findings() == []
 
-    def test_ci_failure_closes_pr_and_requeues(self, tmp_path):
-        """Definite CI failure → close the PR, then requeue finding."""
+    def test_review_ci_uncertain_leaves_in_progress(self, tmp_path):
+        """REVIEW_CI_UNCERTAIN → leave finding/PR in_progress for startup_reconcile."""
         sup, db, f, wt = self._setup(tmp_path)
 
         with patch(f"{RUNNER_MODULE}.create_worktree", return_value=wt), \
              patch(f"{RUNNER_MODULE}.remove_worktree"), \
              patch(f"{RUNNER_MODULE}.phase_validate", return_value="valid"), \
              patch(f"{RUNNER_MODULE}.phase_repair", return_value=True), \
-             patch(f"{RUNNER_MODULE}.phase_verify", return_value=True), \
              patch(f"{RUNNER_MODULE}.push_branch"), \
              patch(f"{RUNNER_MODULE}.gh_create_pr",
-                   return_value=(13, "https://gh/13")), \
+                   return_value=(15, "https://gh/15")), \
              patch(f"{RUNNER_MODULE}.phase_review_loop",
-                   return_value=REVIEW_APPROVED), \
-             patch(f"{RUNNER_MODULE}.wait_for_ci", return_value="failure"), \
-             patch(f"{RUNNER_MODULE}.gh_close_pr") as mock_close:
-
-            result = sup._fix_finding(db.get_finding(f["id"]), "abc1234")
-
-        assert result is False
-        mock_close.assert_called_once_with("org", "repo", 13)
-        assert db.get_finding(f["id"])["status"] == "open"
-
-    def test_ci_timeout_leaves_in_progress(self, tmp_path):
-        """CI timeout → leave finding/PR in_progress for startup_reconcile."""
-        sup, db, f, wt = self._setup(tmp_path)
-
-        with patch(f"{RUNNER_MODULE}.create_worktree", return_value=wt), \
-             patch(f"{RUNNER_MODULE}.remove_worktree"), \
-             patch(f"{RUNNER_MODULE}.phase_validate", return_value="valid"), \
-             patch(f"{RUNNER_MODULE}.phase_repair", return_value=True), \
-             patch(f"{RUNNER_MODULE}.phase_verify", return_value=True), \
-             patch(f"{RUNNER_MODULE}.push_branch"), \
-             patch(f"{RUNNER_MODULE}.gh_create_pr",
-                   return_value=(13, "https://gh/13")), \
-             patch(f"{RUNNER_MODULE}.phase_review_loop",
-                   return_value=REVIEW_APPROVED), \
-             patch(f"{RUNNER_MODULE}.wait_for_ci", return_value="timeout"):
-
-            result = sup._fix_finding(db.get_finding(f["id"]), "abc1234")
-
-        assert result is False
-        assert db.get_finding(f["id"])["status"] == "in_progress"
-        assert sup.ctr["consecutive_failures"] == 1
-
-    def test_ci_api_error_leaves_in_progress(self, tmp_path):
-        """CI api_error → leave finding/PR in_progress for startup_reconcile."""
-        sup, db, f, wt = self._setup(tmp_path)
-
-        with patch(f"{RUNNER_MODULE}.create_worktree", return_value=wt), \
-             patch(f"{RUNNER_MODULE}.remove_worktree"), \
-             patch(f"{RUNNER_MODULE}.phase_validate", return_value="valid"), \
-             patch(f"{RUNNER_MODULE}.phase_repair", return_value=True), \
-             patch(f"{RUNNER_MODULE}.phase_verify", return_value=True), \
-             patch(f"{RUNNER_MODULE}.push_branch"), \
-             patch(f"{RUNNER_MODULE}.gh_create_pr",
-                   return_value=(13, "https://gh/13")), \
-             patch(f"{RUNNER_MODULE}.phase_review_loop",
-                   return_value=REVIEW_APPROVED), \
-             patch(f"{RUNNER_MODULE}.wait_for_ci", return_value="api_error"):
+                   return_value=REVIEW_CI_UNCERTAIN):
 
             result = sup._fix_finding(db.get_finding(f["id"]), "abc1234")
 
@@ -679,13 +526,11 @@ class TestFixFinding:
              patch(f"{RUNNER_MODULE}.remove_worktree"), \
              patch(f"{RUNNER_MODULE}.phase_validate", return_value="valid"), \
              patch(f"{RUNNER_MODULE}.phase_repair", return_value=True), \
-             patch(f"{RUNNER_MODULE}.phase_verify", return_value=True), \
              patch(f"{RUNNER_MODULE}.push_branch"), \
              patch(f"{RUNNER_MODULE}.gh_create_pr",
                    return_value=(14, "https://gh/14")), \
              patch(f"{RUNNER_MODULE}.phase_review_loop",
                    return_value=REVIEW_APPROVED), \
-             patch(f"{RUNNER_MODULE}.wait_for_ci", return_value="no_checks"), \
              patch(f"{RUNNER_MODULE}.gh_pr_base_sha", return_value="abc1234"), \
              patch(f"{RUNNER_MODULE}.gh_merge_pr",
                    side_effect=Exception("merge conflict")):
@@ -704,13 +549,11 @@ class TestFixFinding:
              patch(f"{RUNNER_MODULE}.remove_worktree"), \
              patch(f"{RUNNER_MODULE}.phase_validate", return_value="valid"), \
              patch(f"{RUNNER_MODULE}.phase_repair", return_value=True), \
-             patch(f"{RUNNER_MODULE}.phase_verify", return_value=True), \
              patch(f"{RUNNER_MODULE}.push_branch"), \
              patch(f"{RUNNER_MODULE}.gh_create_pr",
                    return_value=(42, "https://gh/42")), \
              patch(f"{RUNNER_MODULE}.phase_review_loop",
                    return_value=REVIEW_APPROVED), \
-             patch(f"{RUNNER_MODULE}.wait_for_ci", return_value="no_checks"), \
              patch(f"{RUNNER_MODULE}.gh_pr_base_sha",
                    side_effect=GitHubAPIError("network error")):
 
@@ -728,13 +571,11 @@ class TestFixFinding:
              patch(f"{RUNNER_MODULE}.remove_worktree"), \
              patch(f"{RUNNER_MODULE}.phase_validate", return_value="valid"), \
              patch(f"{RUNNER_MODULE}.phase_repair", return_value=True), \
-             patch(f"{RUNNER_MODULE}.phase_verify", return_value=True), \
              patch(f"{RUNNER_MODULE}.push_branch"), \
              patch(f"{RUNNER_MODULE}.gh_create_pr",
                    return_value=(42, "https://gh/42")), \
              patch(f"{RUNNER_MODULE}.phase_review_loop",
                    return_value=REVIEW_APPROVED), \
-             patch(f"{RUNNER_MODULE}.wait_for_ci", return_value="no_checks"), \
              patch(f"{RUNNER_MODULE}.gh_pr_base_sha",
                    return_value="newhead999"), \
              patch(f"{RUNNER_MODULE}.gh_close_pr") as mock_close:
@@ -827,162 +668,6 @@ class TestPhaseRepair:
         assert "commit" in calls
 
 
-class TestRunSetup:
-    """Tests for the run_setup helper in supervisor.phases."""
-
-    def test_empty_setup_cmd_returns_true(self, tmp_path):
-        from supervisor.phases import run_setup
-        cfg = _cfg()
-        assert run_setup(cfg, tmp_path) is True
-
-    def test_setup_cmd_not_present_returns_true(self, tmp_path):
-        from supervisor.phases import run_setup
-        cfg = _cfg()
-        # _cfg() already has no setup_cmd key; verify the absence is handled
-        assert run_setup(cfg, tmp_path) is True
-
-    # ── helpers ──────────────────────────────────────────────────────────────
-
-    def _mock_clean_run(self, sha="abc1234"):
-        """Return subprocess.run side_effect for a fully successful setup."""
-        return [
-            MagicMock(returncode=0, stdout=f"{sha}\n", stderr=""),  # rev-parse HEAD (before)
-            MagicMock(returncode=0, stdout="", stderr=""),            # setup cmd
-            MagicMock(returncode=0, stdout=f"{sha}\n", stderr=""),  # rev-parse HEAD (after)
-            MagicMock(returncode=0, stdout="", stderr=""),            # git status
-        ]
-
-    @staticmethod
-    def _git_repo(path):
-        """Init a git repo with one commit at *path* and return the HEAD sha."""
-        import subprocess as _sp
-        _sp.run(["git", "init"], cwd=str(path), check=True, capture_output=True)
-        _sp.run(["git", "config", "user.email", "t@t.com"], cwd=str(path),
-                check=True, capture_output=True)
-        _sp.run(["git", "config", "user.name", "T"], cwd=str(path),
-                check=True, capture_output=True)
-        _sp.run(["git", "commit", "--allow-empty", "-m", "init"], cwd=str(path),
-                check=True, capture_output=True)
-        return _sp.run(["git", "rev-parse", "HEAD"], cwd=str(path),
-                       check=True, capture_output=True, text=True).stdout.strip()
-
-    # ── tests ─────────────────────────────────────────────────────────────────
-
-    def test_successful_setup_returns_true(self, tmp_path):
-        from supervisor.phases import run_setup
-        cfg = _cfg()
-        cfg["verify"]["setup_cmd"] = "true"
-        with patch("supervisor.phases.subprocess.run") as mock_run:
-            mock_run.side_effect = self._mock_clean_run()
-            assert run_setup(cfg, tmp_path) is True
-
-    def test_failing_setup_returns_false(self, tmp_path):
-        from supervisor.phases import run_setup
-        cfg = _cfg()
-        cfg["verify"]["setup_cmd"] = "false"
-        with patch("supervisor.phases.subprocess.run") as mock_run:
-            mock_run.side_effect = [
-                MagicMock(returncode=0, stdout="abc1234\n", stderr=""),  # rev-parse (before)
-                MagicMock(returncode=1, stdout="", stderr=""),            # setup fails
-            ]
-            assert run_setup(cfg, tmp_path) is False
-
-    def test_setup_runs_in_worktree_directory(self, tmp_path):
-        """Setup command is invoked with cwd=wt_path."""
-        from supervisor.phases import run_setup
-        cfg = _cfg()
-        cfg["verify"]["setup_cmd"] = "true"
-        with patch("supervisor.phases.subprocess.run") as mock_run:
-            mock_run.side_effect = self._mock_clean_run()
-            run_setup(cfg, tmp_path)
-        # call index 1 is the setup command (0 = rev-parse HEAD before)
-        setup_call_kwargs = mock_run.call_args_list[1][1]
-        assert setup_call_kwargs["cwd"] == str(tmp_path)
-
-    def test_failing_setup_logs_output(self, tmp_path, caplog):
-        import logging
-        from supervisor.phases import run_setup
-        cfg = _cfg()
-        cfg["verify"]["setup_cmd"] = "false"
-        with patch("supervisor.phases.subprocess.run") as mock_run:
-            mock_run.side_effect = [
-                MagicMock(returncode=0, stdout="abc1234\n", stderr=""),
-                MagicMock(returncode=1, stdout="stdout msg\n", stderr="stderr msg\n"),
-            ]
-            with caplog.at_level(logging.ERROR, logger="supervisor"):
-                run_setup(cfg, tmp_path)
-        assert any("Setup command failed" in r.message for r in caplog.records)
-
-    def test_git_status_failure_returns_false(self, tmp_path):
-        """If git status exits non-zero after setup, run_setup fails closed."""
-        from supervisor.phases import run_setup
-        cfg = _cfg()
-        cfg["verify"]["setup_cmd"] = "true"
-        with patch("supervisor.phases.subprocess.run") as mock_run:
-            mock_run.side_effect = [
-                MagicMock(returncode=0, stdout="abc1234\n", stderr=""),   # rev-parse (before)
-                MagicMock(returncode=0, stdout="", stderr=""),             # setup cmd
-                MagicMock(returncode=0, stdout="abc1234\n", stderr=""),   # rev-parse (after)
-                MagicMock(returncode=128, stdout="", stderr="fatal: not a git repo\n"),
-            ]
-            result = run_setup(cfg, tmp_path)
-        assert result is False
-
-    def test_setup_changed_head_returns_false(self, tmp_path):
-        """setup_cmd that moves HEAD (e.g. accidental commit) is rejected."""
-        from supervisor.phases import run_setup
-        cfg = _cfg()
-        cfg["verify"]["setup_cmd"] = "true"
-        with patch("supervisor.phases.subprocess.run") as mock_run:
-            mock_run.side_effect = [
-                MagicMock(returncode=0, stdout="aaa111\n", stderr=""),  # rev-parse (before)
-                MagicMock(returncode=0, stdout="", stderr=""),            # setup cmd
-                MagicMock(returncode=0, stdout="bbb222\n", stderr=""),  # rev-parse (after) — changed!
-                MagicMock(returncode=0, stdout="", stderr=""),            # git status (unreached)
-            ]
-            result = run_setup(cfg, tmp_path)
-        assert result is False
-
-    def test_setup_changed_head_logs_shas(self, tmp_path, caplog):
-        """Changed-HEAD error message includes before/after SHAs."""
-        import logging
-        from supervisor.phases import run_setup
-        cfg = _cfg()
-        cfg["verify"]["setup_cmd"] = "true"
-        with patch("supervisor.phases.subprocess.run") as mock_run:
-            mock_run.side_effect = [
-                MagicMock(returncode=0, stdout="aaa111bbb222ccc333\n", stderr=""),
-                MagicMock(returncode=0, stdout="", stderr=""),
-                MagicMock(returncode=0, stdout="ddd444eee555fff666\n", stderr=""),
-                MagicMock(returncode=0, stdout="", stderr=""),
-            ]
-            with caplog.at_level(logging.ERROR, logger="supervisor"):
-                run_setup(cfg, tmp_path)
-        assert any("changed HEAD" in r.message for r in caplog.records)
-
-    def test_dirty_worktree_after_setup_returns_false(self, tmp_path):
-        """setup_cmd that leaves non-ignored files returns False (patch contamination)."""
-        self._git_repo(tmp_path)
-        cfg = _cfg()
-        cfg["verify"]["setup_cmd"] = "echo dirty > new_file.txt"
-        from supervisor.phases import run_setup
-        assert run_setup(cfg, tmp_path) is False
-
-    def test_gitignored_files_after_setup_are_allowed(self, tmp_path):
-        """setup_cmd that only creates gitignored files is fine (no patch contamination)."""
-        import subprocess
-        self._git_repo(tmp_path)
-        (tmp_path / ".gitignore").write_text("node_modules/\n")
-        subprocess.run(["git", "add", ".gitignore"], cwd=str(tmp_path), check=True,
-                       capture_output=True)
-        subprocess.run(["git", "commit", "-m", "add gitignore"], cwd=str(tmp_path),
-                       check=True, capture_output=True)
-        cfg = _cfg()
-        cfg["verify"]["setup_cmd"] = "mkdir -p node_modules && echo ok > node_modules/pkg.js"
-        from supervisor.phases import run_setup
-        assert run_setup(cfg, tmp_path) is True
-
-
 class TestPhaseReviewLoop:
     """Review loop outcome constants."""
 
@@ -1009,8 +694,9 @@ class TestPhaseReviewLoop:
              patch("supervisor.phases.full_diff", return_value="diff"), \
              patch("supervisor.phases.parse_json",
                    return_value={"verdict": "approve", "summary": "ok",
-                                 "comments": []}):
-            outcome = phase_review_loop(cfg, db, pr_id, [f], "branch", ctr)
+                                 "comments": []}), \
+             patch("supervisor.phases.wait_for_ci", return_value="success"):
+            outcome = phase_review_loop(cfg, db, pr_id, 1, [f], "branch", ctr)
 
         assert outcome == REVIEW_APPROVED
 
@@ -1031,11 +717,9 @@ class TestPhaseReviewLoop:
              patch("supervisor.phases.run_codex", return_value=""), \
              patch("supervisor.phases.full_diff",
                    side_effect=["diff_before", "diff_after"]), \
-             patch("supervisor.phases.run_tests", return_value=True), \
-             patch("supervisor.phases.verify_diff", return_value=True), \
              patch("supervisor.phases.push_branch"), \
              patch("supervisor.phases._git"):
-            outcome = phase_review_loop(cfg, db, pr_id, [f], "branch", ctr)
+            outcome = phase_review_loop(cfg, db, pr_id, 1, [f], "branch", ctr)
 
         assert outcome == REVIEW_PAUSED_BUDGET
 
@@ -1048,7 +732,7 @@ class TestPhaseReviewLoop:
         ctr = {"codex_calls": 100, "consecutive_failures": 0}  # already at limit
 
         # full_diff would fail without a real repo; budget check fires before it
-        outcome = phase_review_loop(cfg, db, pr_id, [f], "branch", ctr)
+        outcome = phase_review_loop(cfg, db, pr_id, 1, [f], "branch", ctr)
 
         assert outcome == REVIEW_DEFERRED_BUDGET
 
@@ -1063,7 +747,7 @@ class TestPhaseReviewLoop:
         with patch("supervisor.phases.run_codex",
                    side_effect=CodexError("boom")), \
              patch("supervisor.phases.full_diff", return_value="diff"):
-            outcome = phase_review_loop(cfg, db, pr_id, [f], "branch", ctr)
+            outcome = phase_review_loop(cfg, db, pr_id, 1, [f], "branch", ctr)
 
         assert outcome == REVIEW_FAILED_ERROR
 
@@ -1178,7 +862,6 @@ class TestGitHubAPIFailures:
              patch(f"{RUNNER_MODULE}.remove_worktree"), \
              patch(f"{RUNNER_MODULE}.phase_validate", return_value="valid"), \
              patch(f"{RUNNER_MODULE}.phase_repair", return_value=True), \
-             patch(f"{RUNNER_MODULE}.phase_verify", return_value=True), \
              patch(f"{RUNNER_MODULE}.push_branch"), \
              patch(f"{RUNNER_MODULE}.gh_create_pr",
                    return_value=(10, "https://gh/10")), \
@@ -1202,7 +885,6 @@ class TestGitHubAPIFailures:
              patch(f"{RUNNER_MODULE}.remove_worktree"), \
              patch(f"{RUNNER_MODULE}.phase_validate", return_value="valid"), \
              patch(f"{RUNNER_MODULE}.phase_repair", return_value=True), \
-             patch(f"{RUNNER_MODULE}.phase_verify", return_value=True), \
              patch(f"{RUNNER_MODULE}.push_branch"), \
              patch(f"{RUNNER_MODULE}.gh_create_pr",
                    return_value=(12, "https://gh/12")), \
@@ -1466,13 +1148,11 @@ class TestRunOnceReturnValues:
              patch(f"{RUNNER_MODULE}.remove_worktree"), \
              patch(f"{RUNNER_MODULE}.phase_validate", return_value="valid"), \
              patch(f"{RUNNER_MODULE}.phase_repair", return_value=True), \
-             patch(f"{RUNNER_MODULE}.phase_verify", return_value=True), \
              patch(f"{RUNNER_MODULE}.push_branch"), \
              patch(f"{RUNNER_MODULE}.gh_create_pr",
                    return_value=(77, "https://gh/77")), \
              patch(f"{RUNNER_MODULE}.phase_review_loop",
                    return_value=REVIEW_APPROVED), \
-             patch(f"{RUNNER_MODULE}.wait_for_ci", return_value="no_checks"), \
              patch(f"{RUNNER_MODULE}.gh_pr_base_sha", return_value="abc1234"), \
              patch(f"{RUNNER_MODULE}.gh_merge_pr"):
             # Record 3 clean audits for the second pass to hit exhaustion
@@ -1485,31 +1165,6 @@ class TestRunOnceReturnValues:
         assert call_count["n"] == 2
         # Finding is fixed
         assert db.get_finding(f["id"])["status"] == "fixed"
-
-    def test_setup_failure_aborts_run_with_setup_error(self, tmp_path):
-        """run_setup returning False causes run_once to return 'setup_error'."""
-        db = _db()
-        f = _open_finding(db)
-        wt = tmp_path / "wt"
-        wt.mkdir()
-
-        sup = Supervisor(_cfg(), db)
-        sup.startup_reconcile = lambda: None
-
-        with patch(f"{RUNNER_MODULE}.create_audit_worktree",
-                   side_effect=lambda repo, main: wt), \
-             patch(f"{RUNNER_MODULE}.remove_audit_worktree") as rm_awt, \
-             patch(f"{RUNNER_MODULE}.current_commit", return_value="abc1234"), \
-             patch(f"{RUNNER_MODULE}.phase_audit", return_value=1), \
-             patch(f"{RUNNER_MODULE}.create_worktree", return_value=wt), \
-             patch(f"{RUNNER_MODULE}.remove_worktree"), \
-             patch(f"{RUNNER_MODULE}.run_setup", return_value=False):
-
-            result = sup.run_once()
-
-        assert result == "setup_error"
-        # Audit worktree still cleaned up despite the abort
-        rm_awt.assert_called_once()
 
 
 # ── exhaustion logic ───────────────────────────────────────────────────────────
@@ -1739,7 +1394,7 @@ class TestReviewLoopProtocol:
         with patch("supervisor.phases.parse_json", return_value=optional_only), \
              patch("supervisor.phases.run_codex", return_value="") as mock_codex, \
              patch("supervisor.phases.full_diff", return_value="diff"):
-            outcome = phase_review_loop(cfg, db, pr_id, [f], "branch", ctr)
+            outcome = phase_review_loop(cfg, db, pr_id, 1, [f], "branch", ctr)
 
         assert outcome == REVIEW_FAILED_ERROR
         # Only one Codex call: the review itself; no implement call.
@@ -1755,8 +1410,9 @@ class TestReviewLoopProtocol:
         with patch("supervisor.phases.parse_json",
                    return_value={"verdict": "approve", "summary": "ok", "comments": []}), \
              patch("supervisor.phases.run_codex", return_value=""), \
-             patch("supervisor.phases.full_diff", return_value="diff"):
-            outcome = phase_review_loop(cfg, db, pr_id, [f], "branch", ctr)
+             patch("supervisor.phases.full_diff", return_value="diff"), \
+             patch("supervisor.phases.wait_for_ci", return_value="success"):
+            outcome = phase_review_loop(cfg, db, pr_id, 1, [f], "branch", ctr)
 
         assert outcome == REVIEW_APPROVED
 
@@ -1988,11 +1644,9 @@ class TestValidationStateMachine:
              patch(f"{RUNNER_MODULE}.remove_worktree"), \
              patch(f"{RUNNER_MODULE}.phase_validate", return_value="valid"), \
              patch(f"{RUNNER_MODULE}.phase_repair", side_effect=record_repair), \
-             patch(f"{RUNNER_MODULE}.phase_verify", return_value=True), \
              patch(f"{RUNNER_MODULE}.push_branch"), \
              patch(f"{RUNNER_MODULE}.gh_create_pr", return_value=(1, "u")), \
              patch(f"{RUNNER_MODULE}.phase_review_loop", return_value=REVIEW_APPROVED), \
-             patch(f"{RUNNER_MODULE}.wait_for_ci", return_value="no_checks"), \
              patch(f"{RUNNER_MODULE}.gh_pr_base_sha", return_value="abc1234"), \
              patch(f"{RUNNER_MODULE}.gh_merge_pr"):
             sup._fix_finding(db.get_finding(f["id"]), "abc1234")
@@ -2069,11 +1723,9 @@ class TestValidationStateMachine:
              patch(f"{RUNNER_MODULE}.remove_worktree"), \
              patch(f"{RUNNER_MODULE}.phase_validate") as mock_val, \
              patch(f"{RUNNER_MODULE}.phase_repair", return_value=True), \
-             patch(f"{RUNNER_MODULE}.phase_verify", return_value=True), \
              patch(f"{RUNNER_MODULE}.push_branch"), \
              patch(f"{RUNNER_MODULE}.gh_create_pr", return_value=(1, "u")), \
              patch(f"{RUNNER_MODULE}.phase_review_loop", return_value=REVIEW_APPROVED), \
-             patch(f"{RUNNER_MODULE}.wait_for_ci", return_value="no_checks"), \
              patch(f"{RUNNER_MODULE}.gh_pr_base_sha", return_value="abc1234"), \
              patch(f"{RUNNER_MODULE}.gh_merge_pr"):
             sup._fix_finding(db.get_finding(f["id"]), "abc1234")
@@ -2095,11 +1747,9 @@ class TestValidationStateMachine:
              patch(f"{RUNNER_MODULE}.remove_worktree"), \
              patch(f"{RUNNER_MODULE}.phase_validate", return_value="valid") as mock_val, \
              patch(f"{RUNNER_MODULE}.phase_repair", return_value=True), \
-             patch(f"{RUNNER_MODULE}.phase_verify", return_value=True), \
              patch(f"{RUNNER_MODULE}.push_branch"), \
              patch(f"{RUNNER_MODULE}.gh_create_pr", return_value=(1, "u")), \
              patch(f"{RUNNER_MODULE}.phase_review_loop", return_value=REVIEW_APPROVED), \
-             patch(f"{RUNNER_MODULE}.wait_for_ci", return_value="no_checks"), \
              patch(f"{RUNNER_MODULE}.gh_pr_base_sha", return_value="newhead1"), \
              patch(f"{RUNNER_MODULE}.gh_merge_pr"):
             sup._fix_finding(db.get_finding(f["id"]), "newhead1")
@@ -2262,11 +1912,9 @@ class TestValidationPersistence:
              patch(f"{RUNNER_MODULE}.remove_worktree"), \
              patch(f"{RUNNER_MODULE}.phase_validate") as mock_val, \
              patch(f"{RUNNER_MODULE}.phase_repair", return_value=True), \
-             patch(f"{RUNNER_MODULE}.phase_verify", return_value=True), \
              patch(f"{RUNNER_MODULE}.push_branch"), \
              patch(f"{RUNNER_MODULE}.gh_create_pr", return_value=(1, "u")), \
              patch(f"{RUNNER_MODULE}.phase_review_loop", return_value=REVIEW_APPROVED), \
-             patch(f"{RUNNER_MODULE}.wait_for_ci", return_value="no_checks"), \
              patch(f"{RUNNER_MODULE}.gh_pr_base_sha", return_value="abc1234"), \
              patch(f"{RUNNER_MODULE}.gh_merge_pr"):
             result = sup._fix_finding(db.get_finding(f["id"]), "abc1234")
@@ -2294,11 +1942,9 @@ class TestValidationPersistence:
              patch(f"{RUNNER_MODULE}.remove_worktree"), \
              patch(f"{RUNNER_MODULE}.phase_validate", return_value="valid") as mock_val, \
              patch(f"{RUNNER_MODULE}.phase_repair", return_value=True), \
-             patch(f"{RUNNER_MODULE}.phase_verify", return_value=True), \
              patch(f"{RUNNER_MODULE}.push_branch"), \
              patch(f"{RUNNER_MODULE}.gh_create_pr", return_value=(1, "u")), \
              patch(f"{RUNNER_MODULE}.phase_review_loop", return_value=REVIEW_APPROVED), \
-             patch(f"{RUNNER_MODULE}.wait_for_ci", return_value="no_checks"), \
              patch(f"{RUNNER_MODULE}.gh_pr_base_sha", return_value="newhead2"), \
              patch(f"{RUNNER_MODULE}.gh_merge_pr"):
             result = sup._fix_finding(db.get_finding(f["id"]), "newhead2")
@@ -2382,22 +2028,6 @@ class TestValidationPhaseDistinction:
         assert result is False
         mock_val.assert_not_called()
         assert db.get_finding(f["id"])["status"] == "stale"
-
-    def test_invalid_finding_does_not_reach_verify(self, tmp_path):
-        """Invalid validation terminates before verify is called."""
-        db = _db()
-        f = _open_finding(db)
-        sup = Supervisor(_cfg(), db)
-        wt = tmp_path / "wt"
-        wt.mkdir()
-
-        with patch(f"{RUNNER_MODULE}.create_worktree", return_value=wt), \
-             patch(f"{RUNNER_MODULE}.remove_worktree"), \
-             patch(f"{RUNNER_MODULE}.phase_validate", return_value="invalid"), \
-             patch(f"{RUNNER_MODULE}.phase_verify") as mock_verify:
-            sup._fix_finding(db.get_finding(f["id"]), "abc1234")
-
-        mock_verify.assert_not_called()
 
 
 # ── per-stage model configuration ─────────────────────────────────────────────
@@ -2495,22 +2125,6 @@ class TestPerStageModel:
 
         assert mock_codex.call_args.kwargs["model"] == "o1"
 
-    def test_verify_uses_stage_model(self, tmp_path):
-        from supervisor.phases import verify_diff
-
-        cfg = self._cfg_with_stage_model("verify", "o1-mini")
-        cfg["repo"]["path"] = str(tmp_path)
-        cfg["repo"]["base_sha"] = "base"
-        finding = {"title": "bug", "description": "desc"}
-
-        with patch("supervisor.phases.run_codex", return_value="") as mock_codex, \
-             patch("supervisor.phases.full_diff", return_value="diff"), \
-             patch("supervisor.phases.parse_json",
-                   return_value={"verdict": "approve", "reason": "", "issues": []}):
-            verify_diff(cfg, [finding], self._ctr())
-
-        assert mock_codex.call_args.kwargs["model"] == "o1-mini"
-
     def test_review_uses_stage_model_for_review_call(self):
         from supervisor.phases import phase_review_loop
 
@@ -2525,8 +2139,9 @@ class TestPerStageModel:
              patch("supervisor.phases.full_diff", return_value="diff"), \
              patch("supervisor.phases.parse_json",
                    return_value={"verdict": "approve", "summary": "ok",
-                                 "comments": []}):
-            phase_review_loop(cfg, db, pr_id, [f], "branch", ctr)
+                                 "comments": []}), \
+             patch("supervisor.phases.wait_for_ci", return_value="success"):
+            phase_review_loop(cfg, db, pr_id, 1, [f], "branch", ctr)
 
         assert mock_codex.call_args.kwargs["model"] == "o3-mini"
 
@@ -2558,11 +2173,9 @@ class TestPerStageModel:
              patch("supervisor.phases.full_diff",
                    side_effect=["diff_before", "diff_after"]), \
              patch("supervisor.phases.parse_json", return_value=request_changes), \
-             patch("supervisor.phases.run_tests", return_value=True), \
-             patch("supervisor.phases.verify_diff", return_value=True), \
              patch("supervisor.phases.push_branch"), \
              patch("supervisor.phases._git"):
-            phase_review_loop(cfg, db, pr_id, [f], "branch", ctr)
+            phase_review_loop(cfg, db, pr_id, 1, [f], "branch", ctr)
 
         # Both the review call and the implement call must use the review model.
         assert all(m == "o3-mini" for m in call_models), call_models
@@ -2735,10 +2348,10 @@ class TestModelConfigValidation:
         assert self._run_validate({"repair_model": ""}, tmp_path) is None
 
     def test_multiple_invalid_stage_models_all_reported(self, tmp_path):
-        msg = self._run_validate({"audit_model": 1, "verify_model": False}, tmp_path)
+        msg = self._run_validate({"audit_model": 1, "review_model": False}, tmp_path)
         assert msg is not None
         assert "codex.audit_model" in msg
-        assert "codex.verify_model" in msg
+        assert "codex.review_model" in msg
 
 
 # ── managed-clone / _resolve_repo_path ────────────────────────────────────────
@@ -3039,12 +2652,10 @@ class TestRepairCommand:
              patch(f"{RUNNER_MODULE}.remove_worktree"), \
              patch(f"{RUNNER_MODULE}.phase_validate", return_value="valid"), \
              patch(f"{RUNNER_MODULE}.phase_repair", return_value=True), \
-             patch(f"{RUNNER_MODULE}.phase_verify", return_value=True), \
              patch(f"{RUNNER_MODULE}.push_branch"), \
              patch(f"{RUNNER_MODULE}.gh_create_pr", return_value=(1, "u")), \
              patch(f"{RUNNER_MODULE}.phase_review_loop",
                    return_value=REVIEW_APPROVED), \
-             patch(f"{RUNNER_MODULE}.wait_for_ci", return_value="no_checks"), \
              patch(f"{RUNNER_MODULE}.gh_pr_base_sha", return_value="abc1234"), \
              patch(f"{RUNNER_MODULE}.gh_merge_pr"):
             result = sup.run_repair()
@@ -3114,12 +2725,10 @@ class TestRepairCommand:
              patch(f"{RUNNER_MODULE}.remove_worktree"), \
              patch(f"{RUNNER_MODULE}.phase_validate", return_value="valid"), \
              patch(f"{RUNNER_MODULE}.phase_repair", side_effect=fake_repair), \
-             patch(f"{RUNNER_MODULE}.phase_verify", return_value=True), \
              patch(f"{RUNNER_MODULE}.push_branch"), \
              patch(f"{RUNNER_MODULE}.gh_create_pr", return_value=(1, "u")), \
              patch(f"{RUNNER_MODULE}.phase_review_loop",
                    return_value=REVIEW_APPROVED), \
-             patch(f"{RUNNER_MODULE}.wait_for_ci", return_value="no_checks"), \
              patch(f"{RUNNER_MODULE}.gh_pr_base_sha", return_value="abc1234"), \
              patch(f"{RUNNER_MODULE}.gh_merge_pr"):
             result = sup.run_repair()
@@ -3192,12 +2801,10 @@ class TestRepairCommand:
              patch(f"{RUNNER_MODULE}.remove_worktree"), \
              patch(f"{RUNNER_MODULE}.phase_validate", return_value="valid"), \
              patch(f"{RUNNER_MODULE}.phase_repair", return_value=True), \
-             patch(f"{RUNNER_MODULE}.phase_verify", return_value=True), \
              patch(f"{RUNNER_MODULE}.push_branch"), \
              patch(f"{RUNNER_MODULE}.gh_create_pr", return_value=(1, "u")), \
              patch(f"{RUNNER_MODULE}.phase_review_loop",
                    return_value=REVIEW_APPROVED), \
-             patch(f"{RUNNER_MODULE}.wait_for_ci", return_value="no_checks"), \
              patch(f"{RUNNER_MODULE}.gh_pr_base_sha", return_value="abc1234"), \
              patch(f"{RUNNER_MODULE}.gh_merge_pr"):
             result = sup.run_repair()
@@ -3238,12 +2845,10 @@ class TestRepairCommand:
              patch(f"{RUNNER_MODULE}.remove_worktree"), \
              patch(f"{RUNNER_MODULE}.phase_validate", return_value="valid"), \
              patch(f"{RUNNER_MODULE}.phase_repair", return_value=True), \
-             patch(f"{RUNNER_MODULE}.phase_verify", return_value=True), \
              patch(f"{RUNNER_MODULE}.push_branch"), \
              patch(f"{RUNNER_MODULE}.gh_create_pr", return_value=(1, "u")), \
              patch(f"{RUNNER_MODULE}.phase_review_loop",
                    return_value=REVIEW_APPROVED), \
-             patch(f"{RUNNER_MODULE}.wait_for_ci", return_value="no_checks"), \
              patch(f"{RUNNER_MODULE}.gh_pr_base_sha", return_value="headB"), \
              patch(f"{RUNNER_MODULE}.gh_merge_pr"):
             result = sup.run_repair()
@@ -3258,3 +2863,147 @@ class TestRepairCommand:
         # After revalidation confirms the finding is still valid at headB,
         # it is reopened and repaired.
         assert db.get_finding(f["id"])["status"] == "fixed"
+
+
+# ── CI integration tests ───────────────────────────────────────────────────────
+
+class TestCIIntegration:
+    """Regression tests for the unified reviewer+CI loop in phase_review_loop."""
+
+    def _db_and_cfg(self):
+        db = _db()
+        pr_id = db.create_pr("branch")
+        db.update_pr(pr_id, pr_number=1, pr_url="u")
+        return db, pr_id, _cfg()
+
+    def _ctr(self):
+        return {"codex_calls": 0, "consecutive_failures": 0}
+
+    def test_review_approval_ci_success_merges(self):
+        """review approve + CI success → REVIEW_APPROVED."""
+        from supervisor.phases import phase_review_loop
+
+        db, pr_id, cfg = self._db_and_cfg()
+        f = _open_finding(db)
+        ctr = self._ctr()
+
+        with patch("supervisor.phases.parse_json",
+                   return_value={"verdict": "approve", "summary": "ok", "comments": []}), \
+             patch("supervisor.phases.run_codex", return_value=""), \
+             patch("supervisor.phases.full_diff", return_value="diff"), \
+             patch("supervisor.phases.wait_for_ci", return_value="success"):
+            outcome = phase_review_loop(cfg, db, pr_id, 1, [f], "branch", ctr)
+
+        assert outcome == REVIEW_APPROVED
+
+    def test_ci_failure_reviewer_gets_evidence_then_merges(self):
+        """approve → CI failure → reviewer gets CI evidence → approve → CI success → REVIEW_APPROVED."""
+        from supervisor.phases import phase_review_loop
+
+        db, pr_id, cfg = self._db_and_cfg()
+        cfg["budget"]["max_review_rounds"] = 3
+        f = _open_finding(db)
+        ctr = self._ctr()
+
+        ci_calls = {"n": 0}
+        codex_calls = {"n": 0}
+
+        def fake_ci(*args, **kwargs):
+            ci_calls["n"] += 1
+            return "failure" if ci_calls["n"] == 1 else "success"
+
+        def fake_codex(*args, **kwargs):
+            codex_calls["n"] += 1
+            return ""
+
+        with patch("supervisor.phases.parse_json",
+                   return_value={"verdict": "approve", "summary": "ok", "comments": []}), \
+             patch("supervisor.phases.run_codex", side_effect=fake_codex), \
+             patch("supervisor.phases.full_diff", return_value="diff"), \
+             patch("supervisor.phases.wait_for_ci", side_effect=fake_ci), \
+             patch("supervisor.phases.gh_get_failed_ci_logs", return_value="::error:: test failed"):
+            outcome = phase_review_loop(cfg, db, pr_id, 1, [f], "branch", ctr)
+
+        assert outcome == REVIEW_APPROVED
+        assert ci_calls["n"] == 2  # first failure, then success
+
+    def test_ci_driven_edits_require_fresh_review(self):
+        """After implementing review feedback, ci_evidence is cleared so next round is a fresh review."""
+        from supervisor.phases import phase_review_loop
+
+        db, pr_id, cfg = self._db_and_cfg()
+        cfg["budget"]["max_review_rounds"] = 3
+        f = _open_finding(db)
+        ctr = self._ctr()
+
+        review_prompts = []
+        parse_responses = [
+            # Round 1: request_changes (blocking)
+            {"verdict": "request_changes", "summary": "fix it",
+             "comments": [{"severity": "blocking", "description": "bad code"}]},
+            # Round 2: approve (after implementing feedback)
+            {"verdict": "approve", "summary": "ok", "comments": []},
+        ]
+        parse_call = {"n": 0}
+
+        def fake_parse(output):
+            resp = parse_responses[min(parse_call["n"], len(parse_responses) - 1)]
+            parse_call["n"] += 1
+            return resp
+
+        with patch("supervisor.phases.parse_json", side_effect=fake_parse), \
+             patch("supervisor.phases.run_codex", return_value=""), \
+             patch("supervisor.phases.full_diff",
+                   side_effect=["diff1", "diff2", "diff3"]), \
+             patch("supervisor.phases.push_branch"), \
+             patch("supervisor.phases._git"), \
+             patch("supervisor.phases.wait_for_ci", return_value="success"):
+            outcome = phase_review_loop(cfg, db, pr_id, 1, [f], "branch", ctr)
+
+        # Round 1 requests changes; round 2 approves; CI passes.
+        assert outcome == REVIEW_APPROVED
+
+    def test_repeated_ci_rounds_exhaust_budget_and_block(self):
+        """CI keeps failing → rounds exhausted → REVIEW_PAUSED_BUDGET."""
+        from supervisor.phases import phase_review_loop
+
+        db, pr_id, cfg = self._db_and_cfg()
+        cfg["budget"]["max_review_rounds"] = 2
+        f = _open_finding(db)
+        ctr = self._ctr()
+
+        with patch("supervisor.phases.parse_json",
+                   return_value={"verdict": "approve", "summary": "ok", "comments": []}), \
+             patch("supervisor.phases.run_codex", return_value=""), \
+             patch("supervisor.phases.full_diff", return_value="diff"), \
+             patch("supervisor.phases.wait_for_ci", return_value="failure"), \
+             patch("supervisor.phases.gh_get_failed_ci_logs", return_value="error log"):
+            outcome = phase_review_loop(cfg, db, pr_id, 1, [f], "branch", ctr)
+
+        # Both rounds approved then hit CI failure; budget exhausted.
+        assert outcome == REVIEW_PAUSED_BUDGET
+
+    def test_uncertain_ci_state_preserves_pr_no_code_changes(self):
+        """CI timeout/api_error → REVIEW_CI_UNCERTAIN; no code changes made."""
+        from supervisor.phases import phase_review_loop
+
+        db, pr_id, cfg = self._db_and_cfg()
+        f = _open_finding(db)
+        ctr = self._ctr()
+
+        git_calls = []
+
+        def track_git(repo, *args, **kwargs):
+            git_calls.append(args)
+
+        with patch("supervisor.phases.parse_json",
+                   return_value={"verdict": "approve", "summary": "ok", "comments": []}), \
+             patch("supervisor.phases.run_codex", return_value=""), \
+             patch("supervisor.phases.full_diff", return_value="diff"), \
+             patch("supervisor.phases.wait_for_ci", return_value="timeout"), \
+             patch("supervisor.phases._git", side_effect=track_git):
+            outcome = phase_review_loop(cfg, db, pr_id, 1, [f], "branch", ctr)
+
+        assert outcome == REVIEW_CI_UNCERTAIN
+        # No git commits or pushes should have been made.
+        assert not any("commit" in str(c) for c in git_calls)
