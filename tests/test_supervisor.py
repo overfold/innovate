@@ -3278,6 +3278,21 @@ class TestResumePausedReviews:
         assert sup.db.get_pr(pr_id)["status"] == "ci_paused"
         assert sup.ctr["consecutive_failures"] == 1
 
+    def test_ci_failure_branch_fetch_fails_leaves_paused(self, tmp_path):
+        """CI failure → create_branch_worktree raises (fetch fails) → ci_paused, failure bump, phase_review_loop not called."""
+        sup, f, pr_id = self._sup_with_paused_pr(33)
+        with patch(f"{RUNNER_MODULE}.gh_pr_base_sha", return_value="abc1234"), \
+             patch(f"{RUNNER_MODULE}.wait_for_ci", return_value="failure"), \
+             patch(f"{RUNNER_MODULE}.gh_get_failed_ci_logs", return_value="::error::"), \
+             patch(f"{RUNNER_MODULE}.create_branch_worktree",
+                   side_effect=subprocess.CalledProcessError(1, "git fetch")) as mock_wt, \
+             patch(f"{RUNNER_MODULE}.phase_review_loop") as mock_review:
+            sup._resume_paused_reviews("abc1234")
+        mock_wt.assert_called_once()
+        mock_review.assert_not_called()
+        assert sup.db.get_pr(pr_id)["status"] == "ci_paused"
+        assert sup.ctr["consecutive_failures"] == 1
+
     def test_ci_failure_empty_logs_leaves_paused_no_failure_count(self):
         """CI failure but logs == '' (no failed runs) → leave ci_paused, no failure bump."""
         sup, f, pr_id = self._sup_with_paused_pr(24)

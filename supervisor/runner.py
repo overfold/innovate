@@ -654,6 +654,13 @@ class Supervisor:
                     wt_cfg, db, pr_id, pr_number, [dict(finding)], branch, self.ctr,
                     initial_ci_evidence=logs,
                 )
+            except subprocess.CalledProcessError as exc:
+                LOG.warning(
+                    "  Branch fetch failed for PR #%d: %s — leaving ci_paused",
+                    pr_number, exc,
+                )
+                self.ctr["consecutive_failures"] += 1
+                continue
             finally:
                 if wt_path is not None:
                     remove_branch_worktree(repo, wt_path)

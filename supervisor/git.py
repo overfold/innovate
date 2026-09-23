@@ -89,8 +89,15 @@ def remove_worktree(repo: Path, branch: str, wt_path: Path) -> None:
 
 
 def create_branch_worktree(repo: Path, branch: str) -> Path:
-    """Check out an existing remote branch into a fresh temporary worktree."""
-    _git(repo, "fetch", "origin", branch, check=False)
+    """Check out an existing remote branch into a fresh temporary worktree.
+
+    Raises subprocess.CalledProcessError if the fetch fails so callers never
+    proceed with stale or absent local branch state.
+    """
+    _git(repo, "fetch", "origin", branch)  # fail-closed: raises on network/auth error
+    # Force-reset the local tracking ref to the just-fetched remote state so an
+    # accidentally lingering local branch cannot shadow the fetch result.
+    _git(repo, "branch", "-f", branch, f"origin/{branch}")
     wt_dir = Path(tempfile.mkdtemp(prefix="maintain-wt-"))
     _git(repo, "worktree", "add", str(wt_dir), branch)
     return wt_dir
