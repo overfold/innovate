@@ -336,7 +336,12 @@ def phase_review_loop(
     # Log output from a prior failed CI run, supplied to the reviewer next round.
     ci_evidence: str | None = initial_ci_evidence
 
-    for rnd in range(1, max_rounds + 1):
+    # Resume from the persisted round count so the lifetime budget is shared
+    # across all runs (including ci_paused retries).
+    pr_row = db.get_pr(pr_id)
+    rounds_already_used = pr_row["review_rounds"] if pr_row else 0
+
+    for rnd in range(rounds_already_used + 1, max_rounds + 1):
         LOG.info("  Review round %d/%d", rnd, max_rounds)
 
         if ctr["codex_calls"] >= codex_budget:

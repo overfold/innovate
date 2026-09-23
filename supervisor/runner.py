@@ -534,7 +534,7 @@ class Supervisor:
             else:  # error
                 self.ctr["consecutive_failures"] += 1
 
-    def _resume_paused_reviews(self, head: str) -> None:
+    def _resume_paused_reviews(self, head: str) -> bool:
         """Drive ci_paused PRs through the full review/CI loop.
 
         Called at the start of each pass after HEAD is established.  A
@@ -546,6 +546,9 @@ class Supervisor:
           the evidence so the reviewer can request repairs or confirm the
           failure is unrelated again (which itself returns REVIEW_CI_UNCERTAIN,
           keeping the PR in ci_paused for another pass).
+
+        Returns True if a PR was merged (caller must refetch HEAD and restart
+        the sweep), False otherwise.
         """
         db = self.db
         cfg = self.cfg
@@ -561,9 +564,10 @@ class Supervisor:
             and db.get_pr(f["pr_id"])["status"] == "ci_paused"
         ]
         if not paused_findings:
-            return
+            return False
 
         LOG.info("Resuming %d ci_paused PR(s)…", len(paused_findings))
+        merged = False
 
         for finding in paused_findings:
             if self._over_budget():
@@ -592,7 +596,11 @@ class Supervisor:
                     try:
                         gh_close_pr(owner, repo_name, pr_number)
                     except GitHubAPIError as exc:
-                        LOG.warning("  Failed to close PR #%d: %s", pr_number, exc)
+                        LOG.warning(
+                            "  Failed to close PR #%d: %s — leaving for next reconcile",
+                            pr_number, exc,
+                        )
+                        self.ctr["consecutive_failures"] += 1
                         continue
                     db.update_pr(pr_id, status="closed")
                     db.mark_finding(finding["id"], "open")
@@ -610,7 +618,7 @@ class Supervisor:
                 db.mark_finding(finding["id"], "fixed", pr_id=pr_id)
                 self.ctr["fixes_applied"] += 1
                 self.ctr["consecutive_failures"] = 0
-                continue
+                return True  # restart sweep at new HEAD
 
             if ci != "failure":
                 LOG.warning("  CI status %r is uncertain — leaving ci_paused", ci)
@@ -657,8 +665,13 @@ class Supervisor:
                 if base_oid != head:
                     try:
                         gh_close_pr(owner, repo_name, pr_number)
-                    except GitHubAPIError:
-                        pass
+                    except GitHubAPIError as exc:
+                        LOG.warning(
+                            "  Failed to close PR #%d: %s — leaving for next reconcile",
+                            pr_number, exc,
+                        )
+                        self.ctr["consecutive_failures"] += 1
+                        continue
                     db.update_pr(pr_id, status="closed")
                     db.mark_finding(finding["id"], "open")
                     continue
@@ -672,6 +685,7 @@ class Supervisor:
                 db.mark_finding(finding["id"], "fixed", pr_id=pr_id)
                 self.ctr["fixes_applied"] += 1
                 self.ctr["consecutive_failures"] = 0
+                return True  # restart sweep at new HEAD
 
             elif outcome == REVIEW_CI_UNCERTAIN:
                 db.update_pr(pr_id, status="ci_paused")
@@ -680,7 +694,12 @@ class Supervisor:
                 try:
                     gh_close_pr(owner, repo_name, pr_number)
                 except GitHubAPIError as exc:
-                    LOG.warning("  Failed to close PR #%d: %s", pr_number, exc)
+                    LOG.warning(
+                        "  Failed to close PR #%d: %s — leaving for next reconcile",
+                        pr_number, exc,
+                    )
+                    self.ctr["consecutive_failures"] += 1
+                    continue
                 db.update_pr(pr_id, status="closed")
                 db.mark_finding(finding["id"], "open")
                 self.ctr["consecutive_failures"] += 1
@@ -689,7 +708,11 @@ class Supervisor:
                 try:
                     gh_close_pr(owner, repo_name, pr_number)
                 except GitHubAPIError as exc:
-                    LOG.warning("  Failed to close PR #%d: %s", pr_number, exc)
+                    LOG.warning(
+                        "  Failed to close PR #%d: %s — leaving for next reconcile",
+                        pr_number, exc,
+                    )
+                    continue
                 db.update_pr(pr_id, status="closed")
                 db.mark_finding(
                     finding["id"], "blocked", pr_id=pr_id,
@@ -700,6 +723,8 @@ class Supervisor:
             elif outcome == REVIEW_DEFERRED_BUDGET:
                 db.update_pr(pr_id, status="deferred")
                 db.mark_finding(finding["id"], "deferred", pr_id=pr_id)
+
+        return merged
 
     def _revalidate_stale_rejected(self, head: str, audit_cfg: dict) -> None:
         """Revalidate rejected findings recorded at a different HEAD.
@@ -788,44 +813,51 @@ class Supervisor:
                 last_head = head
                 audit_cfg = {**cfg, "repo": {**cfg["repo"], "path": str(audit_wt)}}
 
-                self._resume_paused_reviews(head)
-                if self._over_budget():
-                    return "budget"
-
-                for area in areas:
+                merged_this_pass = self._resume_paused_reviews(head)
+                if merged_this_pass:
+                    LOG.info(
+                        "ci_paused PR merged — restarting sweep from freshly"
+                        " fetched origin/%s",
+                        main,
+                    )
+                else:
                     if self._over_budget():
                         return "budget"
 
-                    streak = self.db.clean_audit_streak(
-                        area["name"], budget["max_audits_per_area"], head
-                    )
-                    if streak >= budget["max_audits_per_area"]:
-                        LOG.info(
-                            "Area %-20s exhausted (%d clean audits at %s)",
-                            area["name"], streak, head[:7],
+                    for area in areas:
+                        if self._over_budget():
+                            return "budget"
+
+                        streak = self.db.clean_audit_streak(
+                            area["name"], budget["max_audits_per_area"], head
                         )
-                        continue
+                        if streak >= budget["max_audits_per_area"]:
+                            LOG.info(
+                                "Area %-20s exhausted (%d clean audits at %s)",
+                                area["name"], streak, head[:7],
+                            )
+                            continue
 
-                    new = phase_audit(audit_cfg, self.db, area, self.ctr)
-                    total_new += new
+                        new = phase_audit(audit_cfg, self.db, area, self.ctr)
+                        total_new += new
 
-                    if self._over_budget():
-                        return "budget"
+                        if self._over_budget():
+                            return "budget"
 
-                    outcome = self._fix_queue(
-                        self.db.open_findings(area["name"]), head
-                    )
-                    if outcome == "budget":
-                        return outcome
-                    if outcome == "merged":
-                        merged_this_pass = True
-                        break
+                        outcome = self._fix_queue(
+                            self.db.open_findings(area["name"]), head
+                        )
+                        if outcome == "budget":
+                            return outcome
+                        if outcome == "merged":
+                            merged_this_pass = True
+                            break
 
-                # Revalidate blocked findings from an earlier HEAD.
-                # Skip when a merge happened this pass — the sweep will restart
-                # at a fresh HEAD and revalidate on that pass instead.
-                if not merged_this_pass:
-                    self._revalidate_stale_blocked(head, audit_cfg)
+                    # Revalidate blocked findings from an earlier HEAD.
+                    # Skip when a merge happened this pass — the sweep will restart
+                    # at a fresh HEAD and revalidate on that pass instead.
+                    if not merged_this_pass:
+                        self._revalidate_stale_blocked(head, audit_cfg)
 
             finally:
                 remove_audit_worktree(repo, audit_wt)
@@ -893,9 +925,17 @@ class Supervisor:
             cfg["repo"]["name"],
         )
 
+        def _has_paused_reviews() -> bool:
+            return any(
+                f["pr_id"] and self.db.get_pr(f["pr_id"])
+                and self.db.get_pr(f["pr_id"])["status"] == "ci_paused"
+                for f in self.db.in_progress_findings()
+            )
+
         if (not self.db.open_findings()
                 and not self.db.blocked_findings()
-                and not self.db.any_rejected_findings()):
+                and not self.db.any_rejected_findings()
+                and not _has_paused_reviews()):
             print("No queued findings to repair.")
             return "done"
 
@@ -914,23 +954,30 @@ class Supervisor:
                 head = current_commit(audit_wt)
                 audit_cfg = {**cfg, "repo": {**cfg["repo"], "path": str(audit_wt)}}
 
-                self._resume_paused_reviews(head)
-                if self._over_budget():
-                    return "budget"
+                merged_this_pass = self._resume_paused_reviews(head)
+                if merged_this_pass:
+                    LOG.info(
+                        "ci_paused PR merged — restarting from freshly"
+                        " fetched origin/%s",
+                        main,
+                    )
+                else:
+                    if self._over_budget():
+                        return "budget"
 
-                # Revalidate rejected findings from an earlier HEAD before
-                # loading the queue: any that are still valid are reopened
-                # immediately so they are picked up by open_findings() below.
-                self._revalidate_stale_rejected(head, audit_cfg)
+                    # Revalidate rejected findings from an earlier HEAD before
+                    # loading the queue: any that are still valid are reopened
+                    # immediately so they are picked up by open_findings() below.
+                    self._revalidate_stale_rejected(head, audit_cfg)
 
-                findings = self.db.open_findings()
-                outcome = self._fix_queue(findings, head)
-                if outcome == "budget":
-                    return outcome
-                merged_this_pass = (outcome == "merged")
+                    findings = self.db.open_findings()
+                    outcome = self._fix_queue(findings, head)
+                    if outcome == "budget":
+                        return outcome
+                    merged_this_pass = (outcome == "merged")
 
-                if not merged_this_pass:
-                    self._revalidate_stale_blocked(head, audit_cfg)
+                    if not merged_this_pass:
+                        self._revalidate_stale_blocked(head, audit_cfg)
 
             finally:
                 remove_audit_worktree(repo, audit_wt)

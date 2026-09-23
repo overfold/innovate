@@ -3177,44 +3177,61 @@ class TestResumePausedReviews:
         db.mark_finding(f["id"], "in_progress", pr_id=pr_id)
         return sup, f, pr_id
 
-    def test_no_paused_prs_is_noop(self):
-        """_resume_paused_reviews does nothing when there are no ci_paused PRs."""
+    def test_no_paused_prs_returns_false(self):
+        """_resume_paused_reviews returns False and does nothing when no ci_paused PRs."""
         db = _db()
         sup = Supervisor(_cfg(), db)
         _open_finding(db)  # open, not in_progress
         with patch(f"{RUNNER_MODULE}.wait_for_ci") as mock_ci:
-            sup._resume_paused_reviews("abc1234")
+            result = sup._resume_paused_reviews("abc1234")
         mock_ci.assert_not_called()
+        assert result is False
 
-    def test_ci_passes_base_fresh_merges(self):
-        """CI success + base fresh → merge, mark fixed."""
+    def test_ci_passes_base_fresh_merges_returns_true(self):
+        """CI success + base fresh → merge, mark fixed, return True."""
         sup, f, pr_id = self._sup_with_paused_pr(20)
         with patch(f"{RUNNER_MODULE}.wait_for_ci", return_value="success"), \
              patch(f"{RUNNER_MODULE}.gh_pr_base_sha", return_value="abc1234"), \
              patch(f"{RUNNER_MODULE}.gh_merge_pr") as mock_merge:
-            sup._resume_paused_reviews("abc1234")
+            result = sup._resume_paused_reviews("abc1234")
         mock_merge.assert_called_once_with("org", "repo", 20)
+        assert result is True
         assert sup.db.get_finding(f["id"])["status"] == "fixed"
         assert sup.db.get_pr(pr_id)["status"] == "merged"
 
-    def test_ci_passes_base_advanced_closes_and_requeues(self):
-        """CI success + base advanced → close PR, requeue finding."""
+    def test_ci_passes_base_advanced_closes_and_requeues_returns_false(self):
+        """CI success + base advanced → close PR, requeue finding, return False."""
         sup, f, pr_id = self._sup_with_paused_pr(21)
         with patch(f"{RUNNER_MODULE}.wait_for_ci", return_value="success"), \
              patch(f"{RUNNER_MODULE}.gh_pr_base_sha", return_value="different_sha"), \
              patch(f"{RUNNER_MODULE}.gh_close_pr") as mock_close, \
              patch(f"{RUNNER_MODULE}.gh_merge_pr") as mock_merge:
-            sup._resume_paused_reviews("abc1234")
+            result = sup._resume_paused_reviews("abc1234")
         mock_close.assert_called_once_with("org", "repo", 21)
         mock_merge.assert_not_called()
+        assert result is False
         assert sup.db.get_finding(f["id"])["status"] == "open"
         assert sup.db.get_pr(pr_id)["status"] == "closed"
 
-    def test_ci_uncertain_leaves_paused(self):
-        """Uncertain CI leaves PR ci_paused for the next run."""
+    def test_ci_passes_base_advanced_close_fails_preserves_db(self):
+        """CI success + base advanced + gh_close_pr fails → DB left untouched."""
+        sup, f, pr_id = self._sup_with_paused_pr(30)
+        with patch(f"{RUNNER_MODULE}.wait_for_ci", return_value="success"), \
+             patch(f"{RUNNER_MODULE}.gh_pr_base_sha", return_value="different_sha"), \
+             patch(f"{RUNNER_MODULE}.gh_close_pr", side_effect=GitHubAPIError("net")):
+            result = sup._resume_paused_reviews("abc1234")
+        assert result is False
+        # DB must stay in ci_paused / in_progress — not closed / open
+        assert sup.db.get_pr(pr_id)["status"] == "ci_paused"
+        assert sup.db.get_finding(f["id"])["status"] == "in_progress"
+        assert sup.ctr["consecutive_failures"] == 1
+
+    def test_ci_uncertain_leaves_paused_returns_false(self):
+        """Uncertain CI leaves PR ci_paused and returns False."""
         sup, f, pr_id = self._sup_with_paused_pr(22)
         with patch(f"{RUNNER_MODULE}.wait_for_ci", return_value="timeout"):
-            sup._resume_paused_reviews("abc1234")
+            result = sup._resume_paused_reviews("abc1234")
+        assert result is False
         assert sup.db.get_finding(f["id"])["status"] == "in_progress"
         assert sup.db.get_pr(pr_id)["status"] == "ci_paused"
 
@@ -3236,8 +3253,8 @@ class TestResumePausedReviews:
         assert sup.db.get_pr(pr_id)["status"] == "ci_paused"
         assert sup.ctr["consecutive_failures"] == 0
 
-    def test_ci_failure_review_loop_approved_merges(self, tmp_path):
-        """CI failure → logs retrieved → review loop returns REVIEW_APPROVED → merge."""
+    def test_ci_failure_review_loop_approved_merges_returns_true(self, tmp_path):
+        """CI failure → logs → REVIEW_APPROVED → merge → return True."""
         sup, f, pr_id = self._sup_with_paused_pr(25)
         wt = tmp_path / "wt"
         wt.mkdir()
@@ -3248,8 +3265,9 @@ class TestResumePausedReviews:
              patch(f"{RUNNER_MODULE}.phase_review_loop", return_value=REVIEW_APPROVED), \
              patch(f"{RUNNER_MODULE}.gh_pr_base_sha", return_value="abc1234"), \
              patch(f"{RUNNER_MODULE}.gh_merge_pr") as mock_merge:
-            sup._resume_paused_reviews("abc1234")
+            result = sup._resume_paused_reviews("abc1234")
         mock_merge.assert_called_once_with("org", "repo", 25)
+        assert result is True
         assert sup.db.get_finding(f["id"])["status"] == "fixed"
 
     def test_ci_failure_review_loop_ci_uncertain_leaves_paused(self, tmp_path):
@@ -3266,7 +3284,7 @@ class TestResumePausedReviews:
         assert sup.db.get_pr(pr_id)["status"] == "ci_paused"
 
     def test_ci_failure_review_loop_failed_error_closes_and_requeues(self, tmp_path):
-        """CI failure → review loop returns REVIEW_FAILED_ERROR → close PR, requeue."""
+        """CI failure → REVIEW_FAILED_ERROR → close PR, requeue."""
         sup, f, pr_id = self._sup_with_paused_pr(27)
         wt = tmp_path / "wt"
         wt.mkdir()
@@ -3280,8 +3298,23 @@ class TestResumePausedReviews:
         assert sup.db.get_finding(f["id"])["status"] == "open"
         assert sup.db.get_pr(pr_id)["status"] == "closed"
 
+    def test_ci_failure_review_loop_failed_error_close_fails_preserves_db(self, tmp_path):
+        """REVIEW_FAILED_ERROR + gh_close_pr fails → DB left untouched (fail-closed)."""
+        sup, f, pr_id = self._sup_with_paused_pr(31)
+        wt = tmp_path / "wt"
+        wt.mkdir()
+        with patch(f"{RUNNER_MODULE}.wait_for_ci", return_value="failure"), \
+             patch(f"{RUNNER_MODULE}.gh_get_failed_ci_logs", return_value="::error::"), \
+             patch(f"{RUNNER_MODULE}.create_branch_worktree", return_value=wt), \
+             patch(f"{RUNNER_MODULE}.remove_branch_worktree"), \
+             patch(f"{RUNNER_MODULE}.phase_review_loop", return_value=REVIEW_FAILED_ERROR), \
+             patch(f"{RUNNER_MODULE}.gh_close_pr", side_effect=GitHubAPIError("net")):
+            sup._resume_paused_reviews("abc1234")
+        assert sup.db.get_pr(pr_id)["status"] == "ci_paused"
+        assert sup.db.get_finding(f["id"])["status"] == "in_progress"
+
     def test_ci_failure_review_loop_paused_budget_blocks(self, tmp_path):
-        """CI failure → review loop returns REVIEW_PAUSED_BUDGET → close PR, mark blocked."""
+        """CI failure → REVIEW_PAUSED_BUDGET → close PR, mark blocked."""
         sup, f, pr_id = self._sup_with_paused_pr(28)
         wt = tmp_path / "wt"
         wt.mkdir()
@@ -3295,8 +3328,23 @@ class TestResumePausedReviews:
         assert sup.db.get_finding(f["id"])["status"] == "blocked"
         assert sup.db.get_pr(pr_id)["status"] == "closed"
 
+    def test_ci_failure_review_loop_paused_budget_close_fails_preserves_db(self, tmp_path):
+        """REVIEW_PAUSED_BUDGET + gh_close_pr fails → DB left untouched (fail-closed)."""
+        sup, f, pr_id = self._sup_with_paused_pr(32)
+        wt = tmp_path / "wt"
+        wt.mkdir()
+        with patch(f"{RUNNER_MODULE}.wait_for_ci", return_value="failure"), \
+             patch(f"{RUNNER_MODULE}.gh_get_failed_ci_logs", return_value="::error::"), \
+             patch(f"{RUNNER_MODULE}.create_branch_worktree", return_value=wt), \
+             patch(f"{RUNNER_MODULE}.remove_branch_worktree"), \
+             patch(f"{RUNNER_MODULE}.phase_review_loop", return_value=REVIEW_PAUSED_BUDGET), \
+             patch(f"{RUNNER_MODULE}.gh_close_pr", side_effect=GitHubAPIError("net")):
+            sup._resume_paused_reviews("abc1234")
+        assert sup.db.get_pr(pr_id)["status"] == "ci_paused"
+        assert sup.db.get_finding(f["id"])["status"] == "in_progress"
+
     def test_ci_failure_review_loop_deferred_budget_defers(self, tmp_path):
-        """CI failure → review loop returns REVIEW_DEFERRED_BUDGET → defer PR and finding."""
+        """CI failure → REVIEW_DEFERRED_BUDGET → defer PR and finding."""
         sup, f, pr_id = self._sup_with_paused_pr(29)
         wt = tmp_path / "wt"
         wt.mkdir()
@@ -3308,3 +3356,101 @@ class TestResumePausedReviews:
             sup._resume_paused_reviews("abc1234")
         assert sup.db.get_finding(f["id"])["status"] == "deferred"
         assert sup.db.get_pr(pr_id)["status"] == "deferred"
+
+
+# ── review_rounds cumulativity ────────────────────────────────────────────────
+
+class TestPhaseReviewLoopCumulativeRounds:
+    """Regression tests: review_rounds is cumulative across ci_paused retries."""
+
+    def _db_and_cfg(self):
+        from tests.test_supervisor import _db, _cfg
+        db = _db()
+        cfg = _cfg()
+        cfg["budget"]["max_review_rounds"] = 3
+        cfg["verify"]["ci_wait_timeout"] = 0
+        cfg["verify"]["allow_no_ci"] = False
+        return db, cfg
+
+    def _make_pr_with_rounds(self, db, rounds_used: int):
+        """Return (pr_id, finding) with review_rounds already set."""
+        f = _open_finding(db)
+        pr_id = db.create_pr("maint/correctness/ts")
+        db.update_pr(pr_id, pr_number=10, branch="fix/b",
+                     pr_url="https://gh/10", review_rounds=rounds_used, status="ci_paused")
+        db.mark_finding(f["id"], "in_progress", pr_id=pr_id)
+        return pr_id, f
+
+    def test_rounds_budget_exhausted_returns_paused_budget(self):
+        """When review_rounds already == max_review_rounds, loop body never runs."""
+        from supervisor.phases import phase_review_loop, REVIEW_PAUSED_BUDGET
+
+        db, cfg = self._db_and_cfg()
+        pr_id, f = self._make_pr_with_rounds(db, rounds_used=3)
+        ctr = {"codex_calls": 0, "consecutive_failures": 0}
+
+        with patch("supervisor.phases.run_codex") as mock_codex:
+            outcome = phase_review_loop(
+                cfg, db, pr_id, 10, [dict(f)], "fix/b", ctr,
+            )
+
+        mock_codex.assert_not_called()
+        assert outcome == REVIEW_PAUSED_BUDGET
+
+    def test_partial_rounds_used_continues_from_next_round(self):
+        """With 2 of 3 rounds used, loop starts at round 3 and can still approve."""
+        from supervisor.phases import phase_review_loop, REVIEW_APPROVED
+
+        db, cfg = self._db_and_cfg()
+        pr_id, f = self._make_pr_with_rounds(db, rounds_used=2)
+        ctr = {"codex_calls": 0, "consecutive_failures": 0}
+
+        with patch("supervisor.phases.parse_json",
+                   return_value={"verdict": "approve", "summary": "ok", "comments": []}), \
+             patch("supervisor.phases.run_codex", return_value=""), \
+             patch("supervisor.phases.full_diff", return_value="diff"), \
+             patch("supervisor.phases.wait_for_ci", return_value="success"):
+            outcome = phase_review_loop(
+                cfg, db, pr_id, 10, [dict(f)], "fix/b", ctr,
+            )
+
+        assert outcome == REVIEW_APPROVED
+
+
+# ── run_repair early-exit with ci_paused ─────────────────────────────────────
+
+class TestRunRepairCIPausedEarlyExit:
+    """run_repair must not exit early when ci_paused work is the only remaining work."""
+
+    def test_run_repair_does_not_exit_when_only_ci_paused(self, tmp_path):
+        """When open/blocked/rejected findings are all absent but a ci_paused PR exists,
+        run_repair proceeds to _resume_paused_reviews rather than returning 'done'."""
+        db = _db()
+        sup = Supervisor(_cfg(), db)
+        f = _open_finding(db)
+        pr_id = db.create_pr("maint/correctness/ts")
+        db.update_pr(pr_id, pr_number=40, branch="fix/b",
+                     pr_url="https://gh/40", status="ci_paused")
+        db.mark_finding(f["id"], "in_progress", pr_id=pr_id)
+
+        audit_wt = tmp_path / "wt"
+        audit_wt.mkdir()
+
+        resume_called = {"n": 0}
+
+        def fake_resume(head):
+            resume_called["n"] += 1
+            return False  # no merge, so loop exits
+
+        with patch(f"{RUNNER_MODULE}.create_audit_worktree", return_value=audit_wt), \
+             patch(f"{RUNNER_MODULE}.remove_audit_worktree"), \
+             patch(f"{RUNNER_MODULE}.current_commit", return_value="abc1234"), \
+             patch.object(sup, "_resume_paused_reviews", side_effect=fake_resume), \
+             patch.object(sup, "_revalidate_stale_rejected"), \
+             patch.object(sup, "_revalidate_stale_blocked"), \
+             patch.object(sup, "_fix_queue", return_value="done"), \
+             patch(f"{RUNNER_MODULE}.Supervisor.startup_reconcile"):
+            result = sup.run_repair()
+
+        assert resume_called["n"] >= 1, "_resume_paused_reviews was never called"
+        assert result == "done"
