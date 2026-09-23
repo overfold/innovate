@@ -15,12 +15,22 @@ Focus: correctness, security, reliability, tests, documentation accuracy, dead c
 | [GitHub CLI](https://cli.github.com) | `brew install gh` or `apt install gh` |
 | Git | already present on most systems |
 
-Authenticate both CLIs before running:
+Authenticate Codex and GitHub before running. Maintain uses both the `gh` CLI and plain Git over HTTPS, so Git must also be configured to use GitHub CLI credentials:
 
 ```bash
 codex login          # or set OPENAI_API_KEY
-gh auth login
+gh auth login        # or set GH_TOKEN
+gh auth setup-git    # let plain git fetch/push use gh authentication
 ```
+
+If you use `GH_TOKEN`, `gh auth login` is not necessary because the environment token is used automatically. You can verify it and configure Git with:
+
+```bash
+gh auth status
+gh auth setup-git
+```
+
+`GH_TOKEN` authenticates `gh` itself; `gh auth setup-git` is still required for Maintain's ordinary `git push` operations when using an HTTPS remote.
 
 ---
 
