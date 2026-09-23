@@ -577,34 +577,41 @@ class Supervisor:
             pr_number = pr_row["pr_number"]
             branch = pr_row["branch"]
 
-            ci = wait_for_ci(owner, repo_name, pr_number, ci_wait, allow_no_ci)
-            LOG.info("  ci_paused PR #%d: CI is now %s", pr_number, ci)
-
-            if ci_permits_merge(ci, allow_no_ci):
+            # Base-freshness gate — must pass before any CI inspection, log
+            # collection, or branch modification.  A stale PR must be closed
+            # and requeued rather than reviewed against a different base.
+            try:
+                base_oid = gh_pr_base_sha(owner, repo_name, pr_number)
+            except GitHubAPIError as exc:
+                LOG.warning(
+                    "  Cannot verify base freshness for PR #%d: %s"
+                    " — leaving ci_paused",
+                    pr_number, exc,
+                )
+                self.ctr["consecutive_failures"] += 1
+                continue
+            if base_oid != head:
+                LOG.warning(
+                    "  Base advanced for PR #%d — closing and requeueing",
+                    pr_number,
+                )
                 try:
-                    base_oid = gh_pr_base_sha(owner, repo_name, pr_number)
+                    gh_close_pr(owner, repo_name, pr_number)
                 except GitHubAPIError as exc:
                     LOG.warning(
-                        "  Cannot verify base freshness for PR #%d: %s"
-                        " — leaving ci_paused",
+                        "  Failed to close PR #%d: %s — leaving for next reconcile",
                         pr_number, exc,
                     )
                     self.ctr["consecutive_failures"] += 1
                     continue
-                if base_oid != head:
-                    LOG.warning("  Base advanced — closing PR #%d and requeueing", pr_number)
-                    try:
-                        gh_close_pr(owner, repo_name, pr_number)
-                    except GitHubAPIError as exc:
-                        LOG.warning(
-                            "  Failed to close PR #%d: %s — leaving for next reconcile",
-                            pr_number, exc,
-                        )
-                        self.ctr["consecutive_failures"] += 1
-                        continue
-                    db.update_pr(pr_id, status="closed")
-                    db.mark_finding(finding["id"], "open")
-                    continue
+                db.update_pr(pr_id, status="closed")
+                db.mark_finding(finding["id"], "open")
+                continue
+
+            ci = wait_for_ci(owner, repo_name, pr_number, ci_wait, allow_no_ci)
+            LOG.info("  ci_paused PR #%d: CI is now %s", pr_number, ci)
+
+            if ci_permits_merge(ci, allow_no_ci):
                 try:
                     gh_merge_pr(owner, repo_name, pr_number)
                 except Exception as exc:

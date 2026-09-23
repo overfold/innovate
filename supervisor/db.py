@@ -58,8 +58,8 @@ CREATE TABLE IF NOT EXISTS prs (
     pr_number     INTEGER,
     pr_url        TEXT,
     -- open | ci_paused | deferred | merged | closed | failed
-    -- 'ci_paused': review approved but CI result was uncertain (timeout/api_error);
-    --              startup_reconcile re-polls CI on next run.
+    -- 'ci_paused': reviewer approved but CI was still red at the time;
+    --              _resume_paused_reviews() re-checks on the next run.
     status        TEXT    NOT NULL DEFAULT 'open',
     created       TEXT    NOT NULL DEFAULT (datetime('now')),
     merged        TEXT,

@@ -3187,58 +3187,92 @@ class TestResumePausedReviews:
         mock_ci.assert_not_called()
         assert result is False
 
-    def test_ci_passes_base_fresh_merges_returns_true(self):
-        """CI success + base fresh → merge, mark fixed, return True."""
+    def test_base_advanced_closes_before_ci_check(self):
+        """Base advanced → close + requeue immediately, no CI poll or log collection."""
         sup, f, pr_id = self._sup_with_paused_pr(20)
-        with patch(f"{RUNNER_MODULE}.wait_for_ci", return_value="success"), \
-             patch(f"{RUNNER_MODULE}.gh_pr_base_sha", return_value="abc1234"), \
-             patch(f"{RUNNER_MODULE}.gh_merge_pr") as mock_merge:
-            result = sup._resume_paused_reviews("abc1234")
-        mock_merge.assert_called_once_with("org", "repo", 20)
-        assert result is True
-        assert sup.db.get_finding(f["id"])["status"] == "fixed"
-        assert sup.db.get_pr(pr_id)["status"] == "merged"
-
-    def test_ci_passes_base_advanced_closes_and_requeues_returns_false(self):
-        """CI success + base advanced → close PR, requeue finding, return False."""
-        sup, f, pr_id = self._sup_with_paused_pr(21)
-        with patch(f"{RUNNER_MODULE}.wait_for_ci", return_value="success"), \
-             patch(f"{RUNNER_MODULE}.gh_pr_base_sha", return_value="different_sha"), \
+        with patch(f"{RUNNER_MODULE}.gh_pr_base_sha", return_value="different_sha"), \
              patch(f"{RUNNER_MODULE}.gh_close_pr") as mock_close, \
-             patch(f"{RUNNER_MODULE}.gh_merge_pr") as mock_merge:
+             patch(f"{RUNNER_MODULE}.wait_for_ci") as mock_ci, \
+             patch(f"{RUNNER_MODULE}.gh_get_failed_ci_logs") as mock_logs, \
+             patch(f"{RUNNER_MODULE}.create_branch_worktree") as mock_wt:
             result = sup._resume_paused_reviews("abc1234")
-        mock_close.assert_called_once_with("org", "repo", 21)
-        mock_merge.assert_not_called()
+        mock_close.assert_called_once_with("org", "repo", 20)
+        mock_ci.assert_not_called()
+        mock_logs.assert_not_called()
+        mock_wt.assert_not_called()
         assert result is False
         assert sup.db.get_finding(f["id"])["status"] == "open"
         assert sup.db.get_pr(pr_id)["status"] == "closed"
 
-    def test_ci_passes_base_advanced_close_fails_preserves_db(self):
-        """CI success + base advanced + gh_close_pr fails → DB left untouched."""
+    def test_base_sha_fetch_fails_leaves_paused(self):
+        """gh_pr_base_sha failure → leave ci_paused, increment failures, no CI poll."""
+        sup, f, pr_id = self._sup_with_paused_pr(33)
+        with patch(f"{RUNNER_MODULE}.gh_pr_base_sha",
+                   side_effect=GitHubAPIError("timeout")), \
+             patch(f"{RUNNER_MODULE}.wait_for_ci") as mock_ci:
+            result = sup._resume_paused_reviews("abc1234")
+        mock_ci.assert_not_called()
+        assert result is False
+        assert sup.db.get_pr(pr_id)["status"] == "ci_paused"
+        assert sup.ctr["consecutive_failures"] == 1
+
+    def test_base_advanced_close_fails_preserves_db(self):
+        """Base advanced + gh_close_pr fails → DB left untouched (fail-closed)."""
         sup, f, pr_id = self._sup_with_paused_pr(30)
-        with patch(f"{RUNNER_MODULE}.wait_for_ci", return_value="success"), \
-             patch(f"{RUNNER_MODULE}.gh_pr_base_sha", return_value="different_sha"), \
+        with patch(f"{RUNNER_MODULE}.gh_pr_base_sha", return_value="different_sha"), \
              patch(f"{RUNNER_MODULE}.gh_close_pr", side_effect=GitHubAPIError("net")):
             result = sup._resume_paused_reviews("abc1234")
         assert result is False
-        # DB must stay in ci_paused / in_progress — not closed / open
         assert sup.db.get_pr(pr_id)["status"] == "ci_paused"
         assert sup.db.get_finding(f["id"])["status"] == "in_progress"
         assert sup.ctr["consecutive_failures"] == 1
 
+    def test_ci_passes_base_fresh_merges_returns_true(self):
+        """Base fresh + CI success → merge, mark fixed, return True."""
+        sup, f, pr_id = self._sup_with_paused_pr(21)
+        with patch(f"{RUNNER_MODULE}.gh_pr_base_sha", return_value="abc1234"), \
+             patch(f"{RUNNER_MODULE}.wait_for_ci", return_value="success"), \
+             patch(f"{RUNNER_MODULE}.gh_merge_pr") as mock_merge:
+            result = sup._resume_paused_reviews("abc1234")
+        mock_merge.assert_called_once_with("org", "repo", 21)
+        assert result is True
+        assert sup.db.get_finding(f["id"])["status"] == "fixed"
+        assert sup.db.get_pr(pr_id)["status"] == "merged"
+
     def test_ci_uncertain_leaves_paused_returns_false(self):
-        """Uncertain CI leaves PR ci_paused and returns False."""
+        """Base fresh + uncertain CI leaves PR ci_paused and returns False."""
         sup, f, pr_id = self._sup_with_paused_pr(22)
-        with patch(f"{RUNNER_MODULE}.wait_for_ci", return_value="timeout"):
+        with patch(f"{RUNNER_MODULE}.gh_pr_base_sha", return_value="abc1234"), \
+             patch(f"{RUNNER_MODULE}.wait_for_ci", return_value="timeout"):
             result = sup._resume_paused_reviews("abc1234")
         assert result is False
         assert sup.db.get_finding(f["id"])["status"] == "in_progress"
         assert sup.db.get_pr(pr_id)["status"] == "ci_paused"
 
+    def test_ci_failure_stale_base_closes_not_reviews(self):
+        """Regression: stale base + CI failure → close/requeue, no logs/review/checkout."""
+        sup, f, pr_id = self._sup_with_paused_pr(34)
+        with patch(f"{RUNNER_MODULE}.gh_pr_base_sha", return_value="stale_sha"), \
+             patch(f"{RUNNER_MODULE}.gh_close_pr") as mock_close, \
+             patch(f"{RUNNER_MODULE}.wait_for_ci") as mock_ci, \
+             patch(f"{RUNNER_MODULE}.gh_get_failed_ci_logs") as mock_logs, \
+             patch(f"{RUNNER_MODULE}.phase_review_loop") as mock_review, \
+             patch(f"{RUNNER_MODULE}.create_branch_worktree") as mock_wt:
+            result = sup._resume_paused_reviews("abc1234")
+        mock_close.assert_called_once_with("org", "repo", 34)
+        mock_ci.assert_not_called()
+        mock_logs.assert_not_called()
+        mock_review.assert_not_called()
+        mock_wt.assert_not_called()
+        assert result is False
+        assert sup.db.get_finding(f["id"])["status"] == "open"
+        assert sup.db.get_pr(pr_id)["status"] == "closed"
+
     def test_ci_failure_log_retrieval_fails_leaves_paused(self):
-        """CI failure but log retrieval returns None → leave ci_paused, count failure."""
+        """Base fresh + CI failure but log retrieval returns None → leave ci_paused."""
         sup, f, pr_id = self._sup_with_paused_pr(23)
-        with patch(f"{RUNNER_MODULE}.wait_for_ci", return_value="failure"), \
+        with patch(f"{RUNNER_MODULE}.gh_pr_base_sha", return_value="abc1234"), \
+             patch(f"{RUNNER_MODULE}.wait_for_ci", return_value="failure"), \
              patch(f"{RUNNER_MODULE}.gh_get_failed_ci_logs", return_value=None):
             sup._resume_paused_reviews("abc1234")
         assert sup.db.get_pr(pr_id)["status"] == "ci_paused"
@@ -3247,7 +3281,8 @@ class TestResumePausedReviews:
     def test_ci_failure_empty_logs_leaves_paused_no_failure_count(self):
         """CI failure but logs == '' (no failed runs) → leave ci_paused, no failure bump."""
         sup, f, pr_id = self._sup_with_paused_pr(24)
-        with patch(f"{RUNNER_MODULE}.wait_for_ci", return_value="failure"), \
+        with patch(f"{RUNNER_MODULE}.gh_pr_base_sha", return_value="abc1234"), \
+             patch(f"{RUNNER_MODULE}.wait_for_ci", return_value="failure"), \
              patch(f"{RUNNER_MODULE}.gh_get_failed_ci_logs", return_value=""):
             sup._resume_paused_reviews("abc1234")
         assert sup.db.get_pr(pr_id)["status"] == "ci_paused"
@@ -3275,7 +3310,8 @@ class TestResumePausedReviews:
         sup, f, pr_id = self._sup_with_paused_pr(26)
         wt = tmp_path / "wt"
         wt.mkdir()
-        with patch(f"{RUNNER_MODULE}.wait_for_ci", return_value="failure"), \
+        with patch(f"{RUNNER_MODULE}.gh_pr_base_sha", return_value="abc1234"), \
+             patch(f"{RUNNER_MODULE}.wait_for_ci", return_value="failure"), \
              patch(f"{RUNNER_MODULE}.gh_get_failed_ci_logs", return_value="::error::"), \
              patch(f"{RUNNER_MODULE}.create_branch_worktree", return_value=wt), \
              patch(f"{RUNNER_MODULE}.remove_branch_worktree"), \
@@ -3288,7 +3324,8 @@ class TestResumePausedReviews:
         sup, f, pr_id = self._sup_with_paused_pr(27)
         wt = tmp_path / "wt"
         wt.mkdir()
-        with patch(f"{RUNNER_MODULE}.wait_for_ci", return_value="failure"), \
+        with patch(f"{RUNNER_MODULE}.gh_pr_base_sha", return_value="abc1234"), \
+             patch(f"{RUNNER_MODULE}.wait_for_ci", return_value="failure"), \
              patch(f"{RUNNER_MODULE}.gh_get_failed_ci_logs", return_value="::error::"), \
              patch(f"{RUNNER_MODULE}.create_branch_worktree", return_value=wt), \
              patch(f"{RUNNER_MODULE}.remove_branch_worktree"), \
@@ -3303,7 +3340,8 @@ class TestResumePausedReviews:
         sup, f, pr_id = self._sup_with_paused_pr(31)
         wt = tmp_path / "wt"
         wt.mkdir()
-        with patch(f"{RUNNER_MODULE}.wait_for_ci", return_value="failure"), \
+        with patch(f"{RUNNER_MODULE}.gh_pr_base_sha", return_value="abc1234"), \
+             patch(f"{RUNNER_MODULE}.wait_for_ci", return_value="failure"), \
              patch(f"{RUNNER_MODULE}.gh_get_failed_ci_logs", return_value="::error::"), \
              patch(f"{RUNNER_MODULE}.create_branch_worktree", return_value=wt), \
              patch(f"{RUNNER_MODULE}.remove_branch_worktree"), \
@@ -3318,7 +3356,8 @@ class TestResumePausedReviews:
         sup, f, pr_id = self._sup_with_paused_pr(28)
         wt = tmp_path / "wt"
         wt.mkdir()
-        with patch(f"{RUNNER_MODULE}.wait_for_ci", return_value="failure"), \
+        with patch(f"{RUNNER_MODULE}.gh_pr_base_sha", return_value="abc1234"), \
+             patch(f"{RUNNER_MODULE}.wait_for_ci", return_value="failure"), \
              patch(f"{RUNNER_MODULE}.gh_get_failed_ci_logs", return_value="::error::"), \
              patch(f"{RUNNER_MODULE}.create_branch_worktree", return_value=wt), \
              patch(f"{RUNNER_MODULE}.remove_branch_worktree"), \
@@ -3333,7 +3372,8 @@ class TestResumePausedReviews:
         sup, f, pr_id = self._sup_with_paused_pr(32)
         wt = tmp_path / "wt"
         wt.mkdir()
-        with patch(f"{RUNNER_MODULE}.wait_for_ci", return_value="failure"), \
+        with patch(f"{RUNNER_MODULE}.gh_pr_base_sha", return_value="abc1234"), \
+             patch(f"{RUNNER_MODULE}.wait_for_ci", return_value="failure"), \
              patch(f"{RUNNER_MODULE}.gh_get_failed_ci_logs", return_value="::error::"), \
              patch(f"{RUNNER_MODULE}.create_branch_worktree", return_value=wt), \
              patch(f"{RUNNER_MODULE}.remove_branch_worktree"), \
@@ -3348,7 +3388,8 @@ class TestResumePausedReviews:
         sup, f, pr_id = self._sup_with_paused_pr(29)
         wt = tmp_path / "wt"
         wt.mkdir()
-        with patch(f"{RUNNER_MODULE}.wait_for_ci", return_value="failure"), \
+        with patch(f"{RUNNER_MODULE}.gh_pr_base_sha", return_value="abc1234"), \
+             patch(f"{RUNNER_MODULE}.wait_for_ci", return_value="failure"), \
              patch(f"{RUNNER_MODULE}.gh_get_failed_ci_logs", return_value="::error::"), \
              patch(f"{RUNNER_MODULE}.create_branch_worktree", return_value=wt), \
              patch(f"{RUNNER_MODULE}.remove_branch_worktree"), \
