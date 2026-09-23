@@ -88,6 +88,26 @@ def remove_worktree(repo: Path, branch: str, wt_path: Path) -> None:
     _git(repo, "branch", "-D", branch, check=False)
 
 
+def create_branch_worktree(repo: Path, branch: str) -> Path:
+    """Check out an existing remote branch into a fresh temporary worktree.
+
+    Raises subprocess.CalledProcessError if the fetch fails so callers never
+    proceed with stale or absent local branch state.
+    """
+    _git(repo, "fetch", "origin", branch)  # fail-closed: raises on network/auth error
+    # Force-reset the local tracking ref to the just-fetched remote state so an
+    # accidentally lingering local branch cannot shadow the fetch result.
+    _git(repo, "branch", "-f", branch, f"origin/{branch}")
+    wt_dir = Path(tempfile.mkdtemp(prefix="maintain-wt-"))
+    _git(repo, "worktree", "add", str(wt_dir), branch)
+    return wt_dir
+
+
+def remove_branch_worktree(repo: Path, wt_path: Path) -> None:
+    """Remove a branch worktree without deleting the underlying branch."""
+    _git(repo, "worktree", "remove", "--force", str(wt_path), check=False)
+
+
 def push_branch(repo: Path, branch: str) -> None:
     """Push with up to 5 attempts and exponential back-off."""
     for attempt, delay in enumerate([0, 2, 4, 8, 16], start=1):
@@ -288,8 +308,10 @@ def gh_ci_status(owner: str, repo_name: str, pr_number: int) -> str:
     if not checks:
         return "no_checks"
     buckets = {c.get("bucket") for c in checks}
-    if "fail" in buckets or "cancel" in buckets:
+    if "fail" in buckets:
         return "failure"
+    if "cancel" in buckets:
+        return "api_error"
     if "pending" in buckets:
         return "pending"
     if buckets <= {"pass", "skipping"}:
@@ -309,6 +331,83 @@ def gh_merge_pr(owner: str, repo_name: str, pr_number: int) -> None:
         capture_output=True,
         text=True,
     )
+
+
+def gh_get_failed_ci_logs(owner: str, repo_name: str, pr_number: int) -> str | None:
+    """Return log output from all failed CI runs for the current PR head.
+
+    Returns None on any API or parse failure (fail-closed: callers must treat
+    None as an infrastructure error, not as an absence of CI evidence).
+    Returns "" if the API call succeeded but no failed runs were found.
+    Returns concatenated log output (up to 6 000 chars total) on success.
+    """
+    r = subprocess.run(
+        [
+            "gh", "pr", "view", str(pr_number),
+            "--repo", f"{owner}/{repo_name}",
+            "--json", "headRefOid",
+        ],
+        capture_output=True, text=True, check=False,
+    )
+    if r.returncode != 0:
+        return None
+    try:
+        data = json.loads(r.stdout)
+    except json.JSONDecodeError:
+        return None
+    sha = data.get("headRefOid", "")
+    if not sha:
+        return None
+
+    r = subprocess.run(
+        [
+            "gh", "run", "list",
+            "--repo", f"{owner}/{repo_name}",
+            "--commit", sha,
+            "--status", "failure",
+            "--json", "databaseId",
+        ],
+        capture_output=True, text=True, check=False,
+    )
+    if r.returncode != 0:
+        return None
+    try:
+        runs = json.loads(r.stdout)
+    except json.JSONDecodeError:
+        return None
+    if not runs:
+        return ""
+
+    cap = 6000
+    parts: list[str] = []
+    used = 0
+    for entry in runs:
+        if used >= cap:
+            break
+        run_id = entry.get("databaseId")
+        if not run_id:
+            continue
+        r = subprocess.run(
+            [
+                "gh", "run", "view", str(run_id),
+                "--repo", f"{owner}/{repo_name}",
+                "--log-failed",
+            ],
+            capture_output=True, text=True, check=False,
+        )
+        if r.returncode != 0:
+            continue
+        chunk = f"=== run {run_id} ===\n{r.stdout}"
+        remaining = cap - used
+        if len(chunk) > remaining:
+            chunk = chunk[-remaining:]
+        parts.append(chunk)
+        used += len(chunk)
+
+    if parts:
+        return "\n".join(parts)
+    # runs were listed but every log-fetch call failed — infrastructure error
+    return None
 
 
 def wait_for_ci(

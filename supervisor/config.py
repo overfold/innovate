@@ -26,12 +26,9 @@ DEFAULT_CONFIG: dict[str, Any] = {
         "revalidate_model": None,
         "validate_model": None,
         "repair_model": None,
-        "verify_model": None,
         "review_model": None,
     },
     "verify": {
-        "setup_cmd": "",
-        "test_cmd": "",
         "ci_wait_timeout": 600,
         "allow_no_ci": False,
     },
