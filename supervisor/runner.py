@@ -431,6 +431,11 @@ class Supervisor:
                 return False
 
             # outcome == REVIEW_APPROVED — CI already passed inside phase_review_loop.
+            # Persist this before any further external calls so a crash after
+            # approval resumes at freshness/merge instead of consuming another
+            # review round or opening a replacement PR.
+            db.update_pr(pr_id, status="review_approved")
+
             # Freshness gate: reject if the base branch has advanced since we
             # audited (the patch was never tested against the new commits).
             try:
@@ -625,6 +630,10 @@ class Supervisor:
                         remove_branch_worktree(repo, wt_path)
 
             if outcome == REVIEW_APPROVED:
+                # Persist approval before freshness/merge so a crash here does
+                # not replay an already-consumed review round.
+                db.update_pr(pr_id, status="review_approved")
+
                 # Re-check immediately before merge in case the base moved while
                 # review or CI was running.
                 try:
