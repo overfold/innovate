@@ -251,8 +251,8 @@ class TestStartupReconcile:
 
         assert sup.db.get_finding(f["id"])["status"] == "open"
 
-    def test_in_progress_open_pr_closed_and_requeued(self):
-        """Open PR on restart is closed and finding requeued."""
+    def test_in_progress_open_pr_preserved_for_resume(self):
+        """Open PR on restart stays linked to the finding for crash recovery."""
         sup = self._sup()
         f = _open_finding(sup.db)
         pr_id = sup.db.create_pr("maint/correctness/ts")
@@ -263,8 +263,10 @@ class TestStartupReconcile:
              patch(f"{RUNNER_MODULE}.gh_close_pr") as mock_close:
             sup.startup_reconcile()
 
-        mock_close.assert_called_once_with("org", "repo", 9)
-        assert sup.db.get_finding(f["id"])["status"] == "open"
+        mock_close.assert_not_called()
+        assert sup.db.get_finding(f["id"])["status"] == "in_progress"
+        assert sup.db.get_finding(f["id"])["pr_id"] == pr_id
+        assert sup.db.get_pr(pr_id)["status"] == "open"
 
     # --- PR creation gap ---
 
@@ -283,10 +285,10 @@ class TestStartupReconcile:
             sup.startup_reconcile()
 
         mock_find.assert_called_once_with("org", "repo", "maint/correctness/20240101")
-        # pr_number should now be recorded
+        # pr_number should now be recorded and the existing PR preserved.
         assert sup.db.get_pr(pr_id)["pr_number"] == 55
-        # open PR closed and finding requeued
-        assert sup.db.get_finding(f["id"])["status"] == "open"
+        assert sup.db.get_finding(f["id"])["status"] == "in_progress"
+        assert sup.db.get_pr(pr_id)["status"] == "open"
 
     def test_crash_after_pr_create_github_not_found(self):
         """Branch recorded but GitHub finds no matching PR: requeue without orphan."""
@@ -3108,6 +3110,92 @@ class TestStartupReconcileCIPaused:
         # The PR should be marked ci_paused, not plain open
         prs = db.recent_prs(1)
         assert prs[0]["status"] == "ci_paused"
+
+
+# ── open-PR crash recovery ────────────────────────────────────────────────────
+
+class TestResumeOpenReviews:
+    """Crash recovery resumes an existing open PR instead of replacing it."""
+
+    def _sup_with_open_pr(self, pr_number: int = 50, status: str = "open"):
+        db = _db()
+        sup = Supervisor(_cfg(), db)
+        f = _open_finding(db)
+        pr_id = db.create_pr("maint/correctness/original")
+        db.update_pr(
+            pr_id,
+            pr_number=pr_number,
+            pr_url=f"https://gh/{pr_number}",
+            status=status,
+        )
+        db.mark_finding(f["id"], "in_progress", pr_id=pr_id)
+        return sup, f, pr_id
+
+    def test_open_pr_resumes_existing_branch_and_merges(self, tmp_path):
+        sup, f, pr_id = self._sup_with_open_pr(50)
+        wt = tmp_path / "wt"
+        wt.mkdir()
+
+        with patch(f"{RUNNER_MODULE}.gh_pr_base_sha", return_value="abc1234"), \
+             patch(f"{RUNNER_MODULE}.create_branch_worktree", return_value=wt) as mock_wt, \
+             patch(f"{RUNNER_MODULE}.remove_branch_worktree"), \
+             patch(f"{RUNNER_MODULE}.phase_review_loop", return_value=REVIEW_APPROVED), \
+             patch(f"{RUNNER_MODULE}.gh_merge_pr") as mock_merge, \
+             patch(f"{RUNNER_MODULE}.gh_create_pr") as mock_create:
+            result = sup._resume_open_reviews("abc1234")
+
+        assert result is True
+        mock_wt.assert_called_once_with(Path("/fake/repo"), "maint/correctness/original")
+        mock_create.assert_not_called()
+        mock_merge.assert_called_once_with("org", "repo", 50)
+        assert sup.db.get_finding(f["id"])["status"] == "fixed"
+        assert sup.db.get_pr(pr_id)["status"] == "merged"
+
+    def test_review_approved_crash_state_skips_review_and_retries_merge(self):
+        sup, f, pr_id = self._sup_with_open_pr(51, status="review_approved")
+
+        with patch(f"{RUNNER_MODULE}.gh_pr_base_sha", return_value="abc1234"), \
+             patch(f"{RUNNER_MODULE}.phase_review_loop") as mock_review, \
+             patch(f"{RUNNER_MODULE}.create_branch_worktree") as mock_wt, \
+             patch(f"{RUNNER_MODULE}.gh_merge_pr") as mock_merge:
+            result = sup._resume_open_reviews("abc1234")
+
+        assert result is True
+        mock_review.assert_not_called()
+        mock_wt.assert_not_called()
+        mock_merge.assert_called_once_with("org", "repo", 51)
+        assert sup.db.get_finding(f["id"])["status"] == "fixed"
+        assert sup.db.get_pr(pr_id)["status"] == "merged"
+
+    def test_merge_failure_persists_review_approved_for_next_run(self, tmp_path):
+        sup, f, pr_id = self._sup_with_open_pr(52)
+        wt = tmp_path / "wt"
+        wt.mkdir()
+
+        with patch(f"{RUNNER_MODULE}.gh_pr_base_sha", return_value="abc1234"), \
+             patch(f"{RUNNER_MODULE}.create_branch_worktree", return_value=wt), \
+             patch(f"{RUNNER_MODULE}.remove_branch_worktree"), \
+             patch(f"{RUNNER_MODULE}.phase_review_loop", return_value=REVIEW_APPROVED), \
+             patch(f"{RUNNER_MODULE}.gh_merge_pr", side_effect=RuntimeError("network")):
+            result = sup._resume_open_reviews("abc1234")
+
+        assert result is False
+        assert sup.db.get_finding(f["id"])["status"] == "in_progress"
+        assert sup.db.get_pr(pr_id)["status"] == "review_approved"
+
+    def test_stale_open_pr_is_closed_and_requeued(self):
+        sup, f, pr_id = self._sup_with_open_pr(53)
+
+        with patch(f"{RUNNER_MODULE}.gh_pr_base_sha", return_value="new-head"), \
+             patch(f"{RUNNER_MODULE}.gh_close_pr") as mock_close, \
+             patch(f"{RUNNER_MODULE}.phase_review_loop") as mock_review:
+            result = sup._resume_open_reviews("abc1234")
+
+        assert result is False
+        mock_close.assert_called_once_with("org", "repo", 53)
+        mock_review.assert_not_called()
+        assert sup.db.get_finding(f["id"])["status"] == "open"
+        assert sup.db.get_pr(pr_id)["status"] == "closed"
 
 
 # ── gh_get_failed_ci_logs ─────────────────────────────────────────────────────

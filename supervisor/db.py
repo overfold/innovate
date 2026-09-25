@@ -57,7 +57,7 @@ CREATE TABLE IF NOT EXISTS prs (
     branch        TEXT    NOT NULL,
     pr_number     INTEGER,
     pr_url        TEXT,
-    -- open | ci_paused | deferred | merged | closed | failed
+    -- open | review_approved | ci_paused | deferred | merged | closed | failed
     -- 'ci_paused': reviewer approved but CI was still red at the time;
     --              _resume_paused_reviews() re-checks on the next run.
     status        TEXT    NOT NULL DEFAULT 'open',

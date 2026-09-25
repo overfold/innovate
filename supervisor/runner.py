@@ -91,7 +91,8 @@ class Supervisor:
         Called at the start of every run_once() to recover from a previous crash
         or unexpected termination.
 
-        in_progress: reconcile against actual GitHub PR state.
+        in_progress: reconcile against actual GitHub PR state.  Existing open
+                     PRs are preserved and resumed after HEAD is established.
         deferred: Codex budget ran out mid-review — the existing PR is closed so
                   the next run retries from a clean branch.
 
@@ -196,20 +197,11 @@ class Supervisor:
             elif state == "closed":
                 db.update_pr(pr_row["id"], status="closed")
                 db.mark_finding(finding["id"], "open")
-            elif pr_row["status"] == "ci_paused":
-                pass  # handled by _resume_paused_reviews after HEAD is established
-            else:  # open (unexpected) — close and requeue for a clean retry
-                try:
-                    gh_close_pr(owner, repo_name, pr_number)
-                except GitHubAPIError as exc:
-                    LOG.warning(
-                        "  Failed to close PR #%d — leaving in_progress"
-                        " for next reconcile: %s",
-                        pr_number, exc,
-                    )
-                    continue
-                db.update_pr(pr_row["id"], status="closed")
-                db.mark_finding(finding["id"], "open")
+            else:  # open — resume the existing PR after HEAD is established
+                LOG.info(
+                    "  Preserving open PR #%d for crash recovery (status=%s)",
+                    pr_number, pr_row["status"],
+                )
 
     def _fix_finding(self, finding: sqlite3.Row, current_head: str) -> bool:
         """Full repair→PR→review→CI→merge cycle for one finding.
@@ -439,6 +431,11 @@ class Supervisor:
                 return False
 
             # outcome == REVIEW_APPROVED — CI already passed inside phase_review_loop.
+            # Persist this before any further external calls so a crash after
+            # approval resumes at freshness/merge instead of consuming another
+            # review round or opening a replacement PR.
+            db.update_pr(pr_id, status="review_approved")
+
             # Freshness gate: reject if the base branch has advanced since we
             # audited (the patch was never tested against the new commits).
             try:
@@ -533,6 +530,193 @@ class Supervisor:
                 self.db.refresh_blocked_head(finding["id"], head)
             else:  # error
                 self.ctr["consecutive_failures"] += 1
+
+    def _resume_open_reviews(self, head: str) -> bool:
+        """Resume ordinary in-progress PRs that survived a previous crash.
+
+        PR creation is an external side effect, so once a PR exists we keep its
+        branch and continue the persisted review state instead of closing it and
+        starting the same finding again on a new timestamped branch.
+
+        A PR whose review already approved the code is merged directly after the
+        normal freshness check.  Otherwise the review loop resumes from its
+        persisted review_rounds count.
+
+        Returns True if a PR was merged (caller must refetch HEAD and restart
+        the sweep), False otherwise.
+        """
+        db = self.db
+        cfg = self.cfg
+        owner = cfg["repo"]["owner"]
+        repo_name = cfg["repo"]["name"]
+        repo = Path(cfg["repo"]["path"]).resolve()
+
+        resumable = [
+            f for f in db.in_progress_findings()
+            if f["pr_id"] and db.get_pr(f["pr_id"])
+            and db.get_pr(f["pr_id"])["status"] in ("open", "review_approved")
+            and db.get_pr(f["pr_id"])["pr_number"]
+        ]
+        if not resumable:
+            return False
+
+        LOG.info("Resuming %d open PR(s) after crash…", len(resumable))
+
+        for finding in resumable:
+            if self._over_budget():
+                break
+
+            pr_row = db.get_pr(finding["pr_id"])
+            pr_id = pr_row["id"]
+            pr_number = pr_row["pr_number"]
+            branch = pr_row["branch"]
+
+            # The base must still match the HEAD this pass is operating on.
+            try:
+                base_oid = gh_pr_base_sha(owner, repo_name, pr_number)
+            except GitHubAPIError as exc:
+                LOG.warning(
+                    "  Cannot verify base freshness for PR #%d: %s"
+                    " — leaving in_progress",
+                    pr_number, exc,
+                )
+                self.ctr["consecutive_failures"] += 1
+                continue
+            if base_oid != head:
+                LOG.warning(
+                    "  Base advanced for PR #%d — closing and requeueing",
+                    pr_number,
+                )
+                try:
+                    gh_close_pr(owner, repo_name, pr_number)
+                except GitHubAPIError as exc:
+                    LOG.warning(
+                        "  Failed to close PR #%d: %s — leaving for next reconcile",
+                        pr_number, exc,
+                    )
+                    self.ctr["consecutive_failures"] += 1
+                    continue
+                db.update_pr(pr_id, status="closed")
+                db.mark_finding(finding["id"], "open")
+                continue
+
+            if pr_row["status"] == "review_approved":
+                outcome = REVIEW_APPROVED
+            else:
+                wt_path = None
+                try:
+                    wt_path = create_branch_worktree(repo, branch)
+                    wt_cfg = {
+                        **cfg,
+                        "repo": {
+                            **cfg["repo"],
+                            "path": str(wt_path),
+                            "base_sha": head,
+                        },
+                    }
+                    outcome = phase_review_loop(
+                        wt_cfg, db, pr_id, pr_number,
+                        [dict(finding)], branch, self.ctr,
+                    )
+                except subprocess.CalledProcessError as exc:
+                    LOG.warning(
+                        "  Branch fetch failed for PR #%d: %s — leaving in_progress",
+                        pr_number, exc,
+                    )
+                    self.ctr["consecutive_failures"] += 1
+                    continue
+                finally:
+                    if wt_path is not None:
+                        remove_branch_worktree(repo, wt_path)
+
+            if outcome == REVIEW_APPROVED:
+                # Persist approval before freshness/merge so a crash here does
+                # not replay an already-consumed review round.
+                db.update_pr(pr_id, status="review_approved")
+
+                # Re-check immediately before merge in case the base moved while
+                # review or CI was running.
+                try:
+                    base_oid = gh_pr_base_sha(owner, repo_name, pr_number)
+                except GitHubAPIError as exc:
+                    LOG.warning(
+                        "  Cannot verify base freshness for PR #%d: %s"
+                        " — leaving review_approved",
+                        pr_number, exc,
+                    )
+                    self.ctr["consecutive_failures"] += 1
+                    continue
+                if base_oid != head:
+                    try:
+                        gh_close_pr(owner, repo_name, pr_number)
+                    except GitHubAPIError as exc:
+                        LOG.warning(
+                            "  Failed to close PR #%d: %s — leaving for next reconcile",
+                            pr_number, exc,
+                        )
+                        self.ctr["consecutive_failures"] += 1
+                        continue
+                    db.update_pr(pr_id, status="closed")
+                    db.mark_finding(finding["id"], "open")
+                    continue
+                try:
+                    gh_merge_pr(owner, repo_name, pr_number)
+                except Exception as exc:
+                    LOG.warning(
+                        "  Merge uncertain for PR #%d: %s — leaving review_approved",
+                        pr_number, exc,
+                    )
+                    db.update_pr(pr_id, status="review_approved")
+                    self.ctr["consecutive_failures"] += 1
+                    continue
+                db.update_pr(
+                    pr_id,
+                    status="merged",
+                    merged=datetime.now(timezone.utc).isoformat(),
+                )
+                db.mark_finding(finding["id"], "fixed", pr_id=pr_id)
+                self.ctr["fixes_applied"] += 1
+                self.ctr["consecutive_failures"] = 0
+                return True
+
+            if outcome == REVIEW_CI_UNCERTAIN:
+                db.update_pr(pr_id, status="ci_paused")
+
+            elif outcome == REVIEW_FAILED_ERROR:
+                try:
+                    gh_close_pr(owner, repo_name, pr_number)
+                except GitHubAPIError as exc:
+                    LOG.warning(
+                        "  Failed to close PR #%d: %s — leaving for next reconcile",
+                        pr_number, exc,
+                    )
+                    self.ctr["consecutive_failures"] += 1
+                    continue
+                db.update_pr(pr_id, status="closed")
+                db.mark_finding(finding["id"], "open")
+                self.ctr["consecutive_failures"] += 1
+
+            elif outcome == REVIEW_PAUSED_BUDGET:
+                try:
+                    gh_close_pr(owner, repo_name, pr_number)
+                except GitHubAPIError as exc:
+                    LOG.warning(
+                        "  Failed to close PR #%d: %s — leaving for next reconcile",
+                        pr_number, exc,
+                    )
+                    continue
+                db.update_pr(pr_id, status="closed")
+                db.mark_finding(
+                    finding["id"], "blocked", pr_id=pr_id,
+                    reason="review rounds exhausted after crash recovery",
+                    head=head,
+                )
+
+            elif outcome == REVIEW_DEFERRED_BUDGET:
+                db.update_pr(pr_id, status="deferred")
+                db.mark_finding(finding["id"], "deferred", pr_id=pr_id)
+
+        return False
 
     def _resume_paused_reviews(self, head: str) -> bool:
         """Drive ci_paused PRs through the full review/CI loop.
@@ -828,9 +1012,11 @@ class Supervisor:
                 audit_cfg = {**cfg, "repo": {**cfg["repo"], "path": str(audit_wt)}}
 
                 merged_this_pass = self._resume_paused_reviews(head)
+                if not merged_this_pass:
+                    merged_this_pass = self._resume_open_reviews(head)
                 if merged_this_pass:
                     LOG.info(
-                        "ci_paused PR merged — restarting sweep from freshly"
+                        "Recovered PR merged — restarting sweep from freshly"
                         " fetched origin/%s",
                         main,
                     )
@@ -939,17 +1125,18 @@ class Supervisor:
             cfg["repo"]["name"],
         )
 
-        def _has_paused_reviews() -> bool:
+        def _has_resumable_reviews() -> bool:
             return any(
                 f["pr_id"] and self.db.get_pr(f["pr_id"])
-                and self.db.get_pr(f["pr_id"])["status"] == "ci_paused"
+                and self.db.get_pr(f["pr_id"])["status"]
+                    in ("open", "review_approved", "ci_paused")
                 for f in self.db.in_progress_findings()
             )
 
         if (not self.db.open_findings()
                 and not self.db.blocked_findings()
                 and not self.db.any_rejected_findings()
-                and not _has_paused_reviews()):
+                and not _has_resumable_reviews()):
             print("No queued findings to repair.")
             return "done"
 
@@ -969,9 +1156,11 @@ class Supervisor:
                 audit_cfg = {**cfg, "repo": {**cfg["repo"], "path": str(audit_wt)}}
 
                 merged_this_pass = self._resume_paused_reviews(head)
+                if not merged_this_pass:
+                    merged_this_pass = self._resume_open_reviews(head)
                 if merged_this_pass:
                     LOG.info(
-                        "ci_paused PR merged — restarting from freshly"
+                        "Recovered PR merged — restarting from freshly"
                         " fetched origin/%s",
                         main,
                     )
