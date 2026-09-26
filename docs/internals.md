@@ -96,7 +96,7 @@ Findings are deduplicated by a SHA-256 fingerprint of `area + file_path + title`
 
 Clean-audit exhaustion is tied to the HEAD commit the audit ran against.
 
-When a PR is merged, maintain immediately restarts the sweep from a freshly fetched `origin/<default_branch>`. An area's streak resets to zero if the most-recent audit was at an older commit, ensuring merged code is always re-audited before any area is declared exhausted.
+When a PR is merged, maintain immediately refreshes from `origin/<default_branch>` and resumes the sweep at the next configured audit area, wrapping after the final area. The round-robin cursor is persisted in the state database so a run-budget stop does not return scheduling to the first area. An area's streak resets to zero if the most-recent audit was at an older commit, ensuring merged code is always re-audited before any area is declared exhausted.
 
 `run_once()` stops and reports one of three terminal states:
 

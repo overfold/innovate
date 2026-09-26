@@ -45,6 +45,8 @@ LOG = logging.getLogger("supervisor")
 
 
 class Supervisor:
+    _AUDIT_CURSOR_KEY = "audit_cursor"
+
     def __init__(self, cfg: dict, db: DB) -> None:
         self.cfg = cfg
         self.db = db
@@ -53,6 +55,28 @@ class Supervisor:
             "fixes_applied": 0,
             "consecutive_failures": 0,
         }
+
+    def _ordered_audit_areas(self, areas: list[dict]) -> list[dict]:
+        """Return one full area cycle beginning at the persisted cursor."""
+        cursor = self.db.get(self._AUDIT_CURSOR_KEY)
+        start = next(
+            (i for i, area in enumerate(areas) if area["name"] == cursor),
+            0,
+        )
+        return areas[start:] + areas[:start]
+
+    def _advance_audit_cursor(self, area_name: str) -> None:
+        """Persist the area that should be audited after *area_name*."""
+        areas: list[dict] = self.cfg["audit_areas"]
+        index = next(
+            (i for i, area in enumerate(areas) if area["name"] == area_name),
+            None,
+        )
+        if index is not None:
+            self.db.put(
+                self._AUDIT_CURSOR_KEY,
+                areas[(index + 1) % len(areas)]["name"],
+            )
 
     def _over_budget(self) -> bool:
         b = self.cfg["budget"]
@@ -194,6 +218,7 @@ class Supervisor:
             if state == "merged":
                 db.update_pr(pr_row["id"], status="merged")
                 db.mark_finding(finding["id"], "fixed", pr_id=pr_row["id"])
+                self._advance_audit_cursor(finding["area"])
             elif state == "closed":
                 db.update_pr(pr_row["id"], status="closed")
                 db.mark_finding(finding["id"], "open")
@@ -490,6 +515,7 @@ class Supervisor:
 
             self.ctr["fixes_applied"] += 1
             self.ctr["consecutive_failures"] = 0
+            self._advance_audit_cursor(f["area"])
             return True
 
         finally:
@@ -677,6 +703,7 @@ class Supervisor:
                 db.mark_finding(finding["id"], "fixed", pr_id=pr_id)
                 self.ctr["fixes_applied"] += 1
                 self.ctr["consecutive_failures"] = 0
+                self._advance_audit_cursor(finding["area"])
                 return True
 
             if outcome == REVIEW_CI_UNCERTAIN:
@@ -809,6 +836,7 @@ class Supervisor:
                 db.mark_finding(finding["id"], "fixed", pr_id=pr_id)
                 self.ctr["fixes_applied"] += 1
                 self.ctr["consecutive_failures"] = 0
+                self._advance_audit_cursor(finding["area"])
                 return True  # restart sweep at new HEAD
 
             if ci != "failure":
@@ -883,6 +911,7 @@ class Supervisor:
                 db.mark_finding(finding["id"], "fixed", pr_id=pr_id)
                 self.ctr["fixes_applied"] += 1
                 self.ctr["consecutive_failures"] = 0
+                self._advance_audit_cursor(finding["area"])
                 return True  # restart sweep at new HEAD
 
             elif outcome == REVIEW_CI_UNCERTAIN:
@@ -1024,7 +1053,7 @@ class Supervisor:
                     if self._over_budget():
                         return "budget"
 
-                    for area in areas:
+                    for area in self._ordered_audit_areas(areas):
                         if self._over_budget():
                             return "budget"
 
@@ -1036,6 +1065,7 @@ class Supervisor:
                                 "Area %-20s exhausted (%d clean audits at %s)",
                                 area["name"], streak, head[:7],
                             )
+                            self._advance_audit_cursor(area["name"])
                             continue
 
                         new = phase_audit(audit_cfg, self.db, area, self.ctr)
@@ -1052,6 +1082,7 @@ class Supervisor:
                         if outcome == "merged":
                             merged_this_pass = True
                             break
+                        self._advance_audit_cursor(area["name"])
 
                     # Revalidate blocked findings from an earlier HEAD.
                     # Skip when a merge happened this pass — the sweep will restart

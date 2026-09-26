@@ -421,35 +421,37 @@ class TestRunOnceReturnValues:
         assert row["blocked_at_head"] == "abc1234"
 
     def test_merge_triggers_sweep_restart(self, tmp_path):
-        """A successful fix+merge should cause a second pass (restart)."""
+        """A merge refreshes HEAD and resumes at the next audit area."""
         db = _db()
         f = _open_finding(db)
         wt = tmp_path / "wt"
         wt.mkdir()
         call_count = {"n": 0}
+        audited = []
+
+        cfg = _cfg()
+        cfg["audit_areas"] = [
+            {"name": "correctness", "description": "bugs"},
+            {"name": "security", "description": "vulnerabilities"},
+            {"name": "reliability", "description": "failures"},
+        ]
 
         def make_audit_wt():
             call_count["n"] += 1
             return wt
 
-        sup = Supervisor(_cfg(), db)
+        sup = Supervisor(cfg, db)
         sup.startup_reconcile = lambda: None
 
-        # First pass: one open finding → gets fixed → merge returns True
-        # Second pass: no open findings, area is exhausted → returns exhausted
-        pass_counter = {"n": 0}
-
         def fake_audit(cfg, db_, area, ctr):
-            pass_counter["n"] += 1
-            if pass_counter["n"] == 1:
-                # Finding already in DB from before; return 0 new
-                return 0
+            audited.append(area["name"])
             return 0
 
         with patch(f"{RUNNER_MODULE}.create_audit_worktree",
                    side_effect=lambda repo, main: make_audit_wt()), \
              patch(f"{RUNNER_MODULE}.remove_audit_worktree"), \
-             patch(f"{RUNNER_MODULE}.current_commit", return_value="abc1234"), \
+             patch(f"{RUNNER_MODULE}.current_commit",
+                   side_effect=["abc1234", "def5678"]), \
              patch(f"{RUNNER_MODULE}.phase_audit", side_effect=fake_audit), \
              patch(f"{RUNNER_MODULE}.create_worktree", return_value=wt), \
              patch(f"{RUNNER_MODULE}.remove_worktree"), \
@@ -462,13 +464,59 @@ class TestRunOnceReturnValues:
                    return_value=REVIEW_APPROVED), \
              patch(f"{RUNNER_MODULE}.gh_pr_base_sha", return_value="abc1234"), \
              patch(f"{RUNNER_MODULE}.gh_merge_pr"):
-            # Record 3 clean audits for the second pass to hit exhaustion
-            for _ in range(3):
-                run_id = db.start_audit("correctness", "abc1234")
-                db.finish_audit(run_id, 0, 0)
             result = sup.run_once()
 
         # create_audit_worktree called twice: once per pass
         assert call_count["n"] == 2
+        assert result == "done"
+        assert audited[:2] == ["correctness", "security"]
         # Finding is fixed
+        assert db.get_finding(f["id"])["status"] == "fixed"
+
+    def test_audit_cursor_persists_across_run_budget_restart(self, tmp_path):
+        """A run stopped after a merge resumes its next invocation at N+1."""
+        db = _db()
+        f = _open_finding(db)
+        wt = tmp_path / "wt"
+        wt.mkdir()
+        audited = []
+
+        cfg = _cfg()
+        cfg["audit_areas"] = [
+            {"name": "correctness", "description": "bugs"},
+            {"name": "security", "description": "vulnerabilities"},
+            {"name": "reliability", "description": "failures"},
+        ]
+        cfg["budget"]["max_fixes_per_run"] = 1
+
+        def fake_audit(cfg_, db_, area, ctr):
+            audited.append(area["name"])
+            return 0
+
+        with patch(f"{RUNNER_MODULE}.create_audit_worktree", return_value=wt), \
+             patch(f"{RUNNER_MODULE}.remove_audit_worktree"), \
+             patch(f"{RUNNER_MODULE}.current_commit",
+                   side_effect=["abc1234", "def5678", "def5678"]), \
+             patch(f"{RUNNER_MODULE}.phase_audit", side_effect=fake_audit), \
+             patch(f"{RUNNER_MODULE}.create_worktree", return_value=wt), \
+             patch(f"{RUNNER_MODULE}.remove_worktree"), \
+             patch(f"{RUNNER_MODULE}.phase_validate", return_value="valid"), \
+             patch(f"{RUNNER_MODULE}.phase_repair", return_value=True), \
+             patch(f"{RUNNER_MODULE}.push_branch"), \
+             patch(f"{RUNNER_MODULE}.gh_create_pr",
+                   return_value=(78, "https://gh/78")), \
+             patch(f"{RUNNER_MODULE}.phase_review_loop",
+                   return_value=REVIEW_APPROVED), \
+             patch(f"{RUNNER_MODULE}.gh_pr_base_sha", return_value="abc1234"), \
+             patch(f"{RUNNER_MODULE}.gh_merge_pr"):
+            first = Supervisor(cfg, db)
+            first.startup_reconcile = lambda: None
+            assert first.run_once() == "budget"
+            assert db.get("audit_cursor") == "security"
+
+            restarted = Supervisor(cfg, db)
+            restarted.startup_reconcile = lambda: None
+            assert restarted.run_once() == "done"
+
+        assert audited[:2] == ["correctness", "security"]
         assert db.get_finding(f["id"])["status"] == "fixed"
