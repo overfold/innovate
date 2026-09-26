@@ -1,0 +1,53 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+cd "$repo_root"
+
+started_at=$SECONDS
+echo "[setup] Checking system prerequisites"
+
+packages=()
+command -v python3 >/dev/null 2>&1 || packages+=(python3 python3-venv)
+command -v git >/dev/null 2>&1 || packages+=(git)
+command -v gh >/dev/null 2>&1 || packages+=(gh)
+command -v npm >/dev/null 2>&1 || packages+=(npm)
+
+if ((${#packages[@]})); then
+  sudo apt-get update
+  sudo apt-get install -y "${packages[@]}"
+fi
+
+if ! python3 -c 'import sys; raise SystemExit(sys.version_info < (3, 11))'; then
+  echo "[setup] Python 3.11 or newer is required" >&2
+  exit 1
+fi
+
+if ! command -v codex >/dev/null 2>&1; then
+  echo "[setup] Installing Codex CLI"
+  npm install --global @openai/codex
+fi
+
+echo "[setup] Preparing Python environment"
+if [[ ! -x .venv/bin/python ]]; then
+  if ! python3 -m venv .venv; then
+    sudo apt-get update
+    sudo apt-get install -y python3-venv
+    python3 -m venv .venv
+  fi
+fi
+.venv/bin/python -m pip install --disable-pip-version-check -e '.[dev]'
+
+profile_marker="# maintain repository virtual environment"
+if ! grep -Fqx "$profile_marker" "$HOME/.bash_profile" 2>/dev/null; then
+  cat >> "$HOME/.bash_profile" <<EOF
+
+$profile_marker
+if [[ "\${PWD}" == "$repo_root" || "\${PWD}" == "$repo_root/"* ]]; then
+  export VIRTUAL_ENV="$repo_root/.venv"
+  export PATH="\$VIRTUAL_ENV/bin:\$PATH"
+fi
+EOF
+fi
+
+echo "[setup] Ready in $((SECONDS - started_at))s"

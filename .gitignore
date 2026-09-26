@@ -1,4 +1,7 @@
 .maintain.db
+.venv/
+.amp/portals/*
 __pycache__/
 *.pyc
+*.egg-info/
 config.local.toml

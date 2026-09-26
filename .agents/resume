@@ -1,0 +1,8 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+if command -v gh >/dev/null 2>&1 && gh auth status >/dev/null 2>&1; then
+  echo "[resume] GitHub authentication is ready"
+else
+  echo "[resume] GitHub authentication is not configured"
+fi
